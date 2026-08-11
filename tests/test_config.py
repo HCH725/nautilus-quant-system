@@ -26,6 +26,21 @@ class ConfigTests(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
 
+    def test_omitted_backtest_start_remains_backward_compatible(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = load_config(self.write_config(root, {}), root)
+            self.assertIsNone(config.backtest_start)
+
+    def test_formal_config_pins_download_backtest_and_dataset_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        config = load_config(root / "config/market_data.json", root)
+        self.assertEqual(config.start.isoformat(), "2022-01-01T00:00:00+00:00")
+        assert config.backtest_start is not None
+        self.assertEqual(config.backtest_start.isoformat(), "2022-07-01T00:00:00+00:00")
+        self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"))
+        self.assertEqual(config.datasets, ("trade", "mark", "index", "funding"))
+
     def test_rejects_unknown_dataset(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -46,6 +61,38 @@ class ConfigTests(unittest.TestCase):
             path = self.write_config(root, {"start": "2021-01-01T00:00:00"})
             with self.assertRaisesRegex(ValueError, "timezone"):
                 load_config(path, root)
+
+    def test_parses_explicit_backtest_start(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_config(
+                root,
+                {
+                    "start": "2022-01-01T00:00:00Z",
+                    "backtest_start": "2022-07-01T00:00:00Z",
+                },
+            )
+            config = load_config(path, root)
+            self.assertEqual(config.start.isoformat(), "2022-01-01T00:00:00+00:00")
+            assert config.backtest_start is not None
+            self.assertEqual(config.backtest_start.isoformat(), "2022-07-01T00:00:00+00:00")
+
+    def test_rejects_naive_or_pre_download_backtest_start(self):
+        for backtest_start, error in (
+            ("2022-07-01T00:00:00", "timezone"),
+            ("2021-12-31T23:59:59Z", "before download start"),
+        ):
+            with self.subTest(backtest_start=backtest_start), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = self.write_config(
+                    root,
+                    {
+                        "start": "2022-01-01T00:00:00Z",
+                        "backtest_start": backtest_start,
+                    },
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    load_config(path, root)
 
     def test_rejects_non_ascii_lowercase_or_bare_usdt_symbols(self):
         for symbol in ("比特USDT", "btcUSDT", "USDT"):

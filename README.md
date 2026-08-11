@@ -8,7 +8,8 @@
 ## 範圍
 
 - Symbols：`BTCUSDT`、`ETHUSDT`、`BNBUSDT`、`SOLUSDT`
-- 歷史起點：`2022-08-01T00:00:00Z`
+- 資料下載起點：`2022-01-01T00:00:00Z`
+- 回測起點：`2022-07-01T00:00:00Z`；`2022-01-01 → 2022-06-30` 僅作策略指標 warm-up，不計入回測績效
 - Intervals：`5m`、`15m`、`30m`、`1h`、`4h`、`1d`、`1w`
 - Data：trade、mark、index klines 與 funding rate；不包含 premium index klines
 - 邊界：只同步前一個完整 UTC 日；週線只到最後一個完整 Monday boundary
@@ -75,7 +76,7 @@ uv sync --dev
   --now 2026-08-11T00:00:00Z
 ```
 
-驗收面是 4 symbols × 7 intervals × 3 bar datasets = 84 bar streams，另加每個 symbol 一條 funding stream，共 88 streams、8 instruments。2026-08-11 實跑 readback 為 83,364 bars、180 funding events，且未出現 Premium instrument/stream；相同窗口第二輪的 instrument/bar/funding writes 全為 0。這只證明 bounded 全矩陣，不表示 `2022-08-01 → D-1` 已回填。
+驗收面是 4 symbols × 7 intervals × 3 bar datasets = 84 bar streams，另加每個 symbol 一條 funding stream，共 88 streams、8 instruments。2026-08-11 實跑 readback 為 83,364 bars、180 funding events，且未出現 Premium instrument/stream；相同窗口第二輪的 instrument/bar/funding writes 全為 0。這只證明 bounded 全矩陣，不表示 `2022-01-01 → D-1` 已回填。
 
 ## OS-native 排程
 

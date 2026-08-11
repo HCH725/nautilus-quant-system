@@ -30,6 +30,7 @@ class MarketDataConfig:
     chunk_days: int
     catalog_path: Path
     funding_path: Path
+    backtest_start: datetime | None = None
 
 
 def load_config(path: Path, project_root: Path) -> MarketDataConfig:
@@ -56,6 +57,14 @@ def load_config(path: Path, project_root: Path) -> MarketDataConfig:
     if parsed_start.tzinfo is None:
         raise ValueError("start must include a timezone")
     start = parsed_start.astimezone(UTC)
+    backtest_start = None
+    if raw.get("backtest_start") is not None:
+        parsed_backtest_start = datetime.fromisoformat(raw["backtest_start"].replace("Z", "+00:00"))
+        if parsed_backtest_start.tzinfo is None:
+            raise ValueError("backtest_start must include a timezone")
+        backtest_start = parsed_backtest_start.astimezone(UTC)
+        if backtest_start < start:
+            raise ValueError("backtest_start cannot be before download start")
     chunk_days = int(raw["chunk_days"])
     if chunk_days < 1:
         raise ValueError("chunk_days must be positive")
@@ -75,4 +84,5 @@ def load_config(path: Path, project_root: Path) -> MarketDataConfig:
         chunk_days=chunk_days,
         catalog_path=catalog_path,
         funding_path=funding_path,
+        backtest_start=backtest_start,
     )
