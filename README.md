@@ -85,3 +85,13 @@ Preflight、failure recovery、evidence 與未來 scheduler 操作見 [`ops/RUNB
 ## 安全邊界
 
 目前只有 data foundation，沒有策略、execution client、API key 或真實資金路徑。安裝與資料 smoke 通過不代表 production trading ready。
+
+API key、token、憑證與個人資料不得寫入 repository；應放在受保護的環境檔或作業系統 Keychain，程式只讀環境變數。Repository 以三層降低誤傳風險：敏感檔 `.gitignore`、版本化的 pre-commit／pre-push fail-closed 掃描，以及 GitHub secret scanning／push protection。Clone 後啟用本機 hooks：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Hooks 只回報安全檔案路徑、行號與類型；敏感或 credential-shaped 路徑改顯示不可逆 fingerprint，不輸出疑似 secret。Hooks 會檢查已知 provider key、敏感 label、未知高熵字串、常見 email／臺灣手機／身分證格式，並預設拒絕所有 binary blob，避免壓縮檔、Office 文件或資料庫夾帶未掃描資料。不得以 `--no-verify` 繞過。
+
+任何掃描器仍無法理解所有姓名、地址、未知識別碼或語境，一旦懷疑 key 曾進入 Git 歷史，必須立即撤銷／輪替，不能只刪檔或補一次 commit。若未來確實需要公開 binary asset，必須先建立窄範圍 allowlist 與對應內容檢查，不可直接放寬全部 binary。
