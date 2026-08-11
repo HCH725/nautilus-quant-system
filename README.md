@@ -57,6 +57,8 @@ uv sync --dev
 - resume 前逐 `BarType` 驗證 configured start 到目前 tail 的完整序列
 - UTC D-1／完整週線邊界
 - duplicate、gap、tail completeness 與 precision fail-closed
+- Binance 高週期內部缺口只在完整、連續的官方 `1m` REST 資料可用時按 OHLC(V) 聚合；每條成功 stream 回報 `reconstructed` 數量與 `reconstructed_open_ms`，後續失敗的 run report 仍保留已 readback 的 `reconstructed_chunks`
+- `1m` 本身不完整、缺口位於 head/tail，或單一 chunk 需重建超過一天時仍 fail-closed，不填假資料
 - Catalog 寫後 readback
 - cross-process `flock` single writer
 - 每次完成或失敗的 JSON run evidence（`var/runs/`）

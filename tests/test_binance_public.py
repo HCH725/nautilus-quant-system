@@ -5,6 +5,7 @@ import unittest
 from nautilus_quant.binance_public import (
     BinancePublicClient,
     Kline,
+    _internal_gap_starts,
     endpoint_request,
     normalize_kline,
     paginate_klines,
@@ -89,6 +90,79 @@ class BinancePublicTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "gap"):
             validate_contiguous(rows, 300_000)
+
+    def test_internal_gap_reconstructs_from_complete_one_minute_rows(self):
+        calls = []
+
+        class Client(BinancePublicClient):
+            def request_json(self, path, params) -> list[object] | dict[str, object]:
+                calls.append((path, params["interval"], params["startTime"], params["endTime"]))
+                if params["interval"] == "15m":
+                    return [
+                        [0, "1", "2", "0.5", "1.5", "0", 899_999],
+                        [1_800_000, "3", "4", "2.5", "3.5", "0", 2_699_999],
+                    ]
+                return [
+                    [
+                        open_ms,
+                        str(100 + index),
+                        str(110 + index),
+                        str(90 - index),
+                        str(101 + index),
+                        "99",
+                        open_ms + 59_999,
+                    ]
+                    for index, open_ms in enumerate(range(900_000, 1_800_000, 60_000))
+                ]
+
+        rows = Client(request_delay=0).klines("mark", "BTCUSDT", "15m", 0, 2_700_000, 900_000)
+
+        self.assertEqual([row.open_ms for row in rows], [0, 900_000, 1_800_000])
+        self.assertEqual(
+            (rows[1].open, rows[1].high, rows[1].low, rows[1].close, rows[1].volume),
+            ("100", "124", "76", "115", "0"),
+        )
+        self.assertEqual(rows[1].source_interval, "1m")
+        self.assertEqual([call[1] for call in calls], ["15m", "1m"])
+
+    def test_reconstruction_rejects_incomplete_one_minute_rows(self):
+        class Client(BinancePublicClient):
+            def request_json(self, path, params) -> list[object] | dict[str, object]:
+                if params["interval"] == "15m":
+                    return [
+                        [0, "1", "2", "0.5", "1.5", "0", 899_999],
+                        [1_800_000, "3", "4", "2.5", "3.5", "0", 2_699_999],
+                    ]
+                return [
+                    [open_ms, "1", "2", "0.5", "1.5", "0", open_ms + 59_999]
+                    for open_ms in range(900_000, 1_740_000, 60_000)
+                ]
+
+        with self.assertRaisesRegex(ValueError, "incomplete one-minute reconstruction"):
+            Client(request_delay=0).klines("mark", "BTCUSDT", "15m", 0, 2_700_000, 900_000)
+
+    def test_reconstruction_rejects_more_than_one_day_of_missing_minutes(self):
+        class Client(BinancePublicClient):
+            def request_json(self, path, params) -> list[object] | dict[str, object]:
+                if params["interval"] == "1m":
+                    raise AssertionError("oversized reconstruction must fail before a one-minute request")
+                second_open_ms = 98 * 900_000
+                return [
+                    [0, "1", "2", "0.5", "1.5", "0", 899_999],
+                    [second_open_ms, "3", "4", "2.5", "3.5", "0", second_open_ms + 899_999],
+                ]
+
+        with self.assertRaisesRegex(ValueError, "reconstruction window too large"):
+            Client(request_delay=0).klines("mark", "BTCUSDT", "15m", 0, 99 * 900_000, 900_000)
+
+    def test_internal_gap_scan_stops_at_reconstruction_budget(self):
+        rows = [
+            Kline(0, 60_000, "1", "1", "1", "1", "0"),
+            Kline(1_442 * 60_000, 1_443 * 60_000, "1", "1", "1", "1", "0"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "reconstruction window too large"):
+            _internal_gap_starts(rows, 60_000)
 
 
 if __name__ == "__main__":

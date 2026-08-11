@@ -97,6 +97,30 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(second["written"], 0)
             self.assertEqual(len(client.calls), 1)
 
+    def test_bar_stream_reports_one_minute_reconstruction_count(self):
+        rows = [
+            Kline(0, 300_000, "100", "101", "99", "100.5", "1"),
+            Kline(300_000, 600_000, "100.5", "102", "100", "101", "2", source_interval="1m"),
+        ]
+        with TemporaryDirectory() as tmp:
+            result = sync_bar_stream(
+                client=FakeClient(rows),
+                catalog=ParquetDataCatalog(tmp),
+                symbol="BTCUSDT",
+                instrument_id="BTCUSDT-PERP.BINANCE",
+                dataset="trade",
+                interval="5m",
+                price_type="LAST",
+                price_precision=2,
+                size_precision=3,
+                start_ms=0,
+                end_ms=600_000,
+                chunk_days=30,
+            )
+
+        self.assertEqual(result["reconstructed"], 1)
+        self.assertEqual(result["reconstructed_open_ms"], [300_000])
+
     def test_existing_catalog_internal_gap_is_rejected_before_resume(self):
         with TemporaryDirectory() as tmp:
             catalog = ParquetDataCatalog(tmp)

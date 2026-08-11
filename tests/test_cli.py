@@ -2,10 +2,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 import json
 import unittest
 
+from nautilus_quant.binance_public import BinancePublicClient
 from nautilus_quant.cli import main
 
 
@@ -29,6 +32,81 @@ def write_valid_config(project: Path) -> Path:
 
 
 class CliTests(unittest.TestCase):
+    def test_failure_report_retains_read_back_reconstruction_across_resume(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw.update({"intervals": ["15m"], "chunk_days": 1})
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            start_ms = 1_609_459_200_000
+            step_ms = 15 * 60_000
+            day_ms = 24 * 60 * 60_000
+            missing_ms = start_ms + step_ms
+            calls = []
+            test_case = self
+
+            class LaterFailureClient(BinancePublicClient):
+                def __init__(self):
+                    super().__init__(request_delay=0)
+
+                def request_json(self, path: str, params: dict[str, object]) -> list[object] | dict[str, object]:
+                    interval = str(params["interval"])
+                    cursor_ms = int(cast(int, params["startTime"]))
+                    calls.append((path, interval, cursor_ms))
+                    if cursor_ms >= start_ms + day_ms:
+                        raise RuntimeError("later chunk failed")
+                    if interval == "1m":
+                        test_case.assertEqual(cursor_ms, missing_ms)
+                        return [
+                            [open_ms, "1", "2", "0.5", "1.5", "1", open_ms + 59_999]
+                            for open_ms in range(missing_ms, missing_ms + step_ms, 60_000)
+                        ]
+                    test_case.assertEqual(interval, "15m")
+                    end_ms = int(cast(int, params["endTime"])) + 1
+                    return [
+                        [open_ms, "1", "2", "0.5", "1.5", "1", open_ms + step_ms - 1]
+                        for open_ms in range(cursor_ms, end_ms, step_ms)
+                        if open_ms != missing_ms
+                    ]
+
+            async def load_perpetuals(_symbols):
+                return [SimpleNamespace(id="BTCUSDT-PERP.BINANCE", price_precision=2, size_precision=3)]
+
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.service.BinancePublicClient", return_value=LaterFailureClient()),
+                patch("nautilus_quant.service.load_perpetuals", side_effect=load_perpetuals),
+                patch("nautilus_quant.service.ensure_instruments", return_value=0),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                args = ["sync", "--config", str(config), "--now", "2021-01-03T00:00:00Z"]
+                self.assertEqual(main(args), 1)
+                self.assertEqual(main(args), 1)
+
+            reports = sorted((project / "var/runs").glob("sync-*.json"))
+            self.assertEqual(len(reports), 2)
+            first = json.loads(reports[0].read_text(encoding="utf-8"))
+            second = json.loads(reports[1].read_text(encoding="utf-8"))
+            expected = [{
+                "dataset": "trade",
+                "symbol": "BTCUSDT",
+                "interval": "15m",
+                "bar_type": "BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL",
+                "reconstructed_open_ms": [missing_ms],
+            }]
+            self.assertEqual(first["reconstructed_chunks"], expected)
+            self.assertEqual(second["reconstructed_chunks"], [])
+            self.assertEqual(
+                json.loads(reports[0].read_text(encoding="utf-8"))["reconstructed_chunks"],
+                expected,
+            )
+            self.assertEqual(
+                [(interval, cursor_ms) for _path, interval, cursor_ms in calls],
+                [("15m", start_ms), ("1m", missing_ms), ("15m", start_ms + day_ms), ("15m", start_ms + day_ms)],
+            )
+
     def test_sync_config_failure_writes_fail_report(self):
         with TemporaryDirectory() as tmp:
             project = Path(tmp)

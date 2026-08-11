@@ -207,6 +207,7 @@ def run_sync(
     progress({"event": "instruments", "writes": instrument_writes, "count": len(perpetuals) + 2 * len(config.symbols)})
 
     results: list[dict[str, object]] = []
+    reconstruction_evidence: list[dict[str, object]] = []
     bar_datasets = tuple(dataset for dataset in config.datasets if dataset != "funding")
     ordered_intervals = tuple(sorted(config.intervals, key=interval_millis, reverse=True))
     for symbol in config.symbols:
@@ -230,21 +231,29 @@ def run_sync(
             for interval in ordered_intervals:
                 start_ms = to_millis(align_start(interval, config.start))
                 end_ms = to_millis(target_end(interval, now))
-                result = sync_bar_stream(
-                    client=client,
-                    catalog=catalog,
-                    symbol=symbol,
-                    instrument_id=instrument_id,
-                    dataset=dataset,
-                    interval=interval,
-                    price_type=price_type,
-                    price_precision=price_precision,
-                    size_precision=size_precision,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    chunk_days=config.chunk_days,
-                    max_chunks=max_chunks,
-                )
+                try:
+                    result = sync_bar_stream(
+                        client=client,
+                        catalog=catalog,
+                        symbol=symbol,
+                        instrument_id=instrument_id,
+                        dataset=dataset,
+                        interval=interval,
+                        price_type=price_type,
+                        price_precision=price_precision,
+                        size_precision=size_precision,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        chunk_days=config.chunk_days,
+                        max_chunks=max_chunks,
+                        reconstruction_evidence=reconstruction_evidence,
+                    )
+                except BaseException as exc:
+                    exc.sync_evidence = {
+                        "bar_streams": results,
+                        "reconstructed_chunks": reconstruction_evidence,
+                    }
+                    raise
                 result.update({"dataset": dataset, "symbol": symbol, "interval": interval})
                 results.append(result)
                 progress({"event": "bar_stream", **result})
@@ -255,14 +264,22 @@ def run_sync(
         start_ms = to_millis(config.start)
         for symbol in config.symbols:
             instrument_id = f"{symbol}-PERP.BINANCE"
-            result = sync_funding_stream(
-                client=client,
-                store=FundingJsonStore(config.funding_path / f"{instrument_id}.jsonl"),
-                symbol=symbol,
-                instrument_id=instrument_id,
-                start_ms=start_ms,
-                end_ms=end_ms,
-            )
+            try:
+                result = sync_funding_stream(
+                    client=client,
+                    store=FundingJsonStore(config.funding_path / f"{instrument_id}.jsonl"),
+                    symbol=symbol,
+                    instrument_id=instrument_id,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+            except BaseException as exc:
+                exc.sync_evidence = {
+                    "bar_streams": results,
+                    "funding_streams": funding_results,
+                    "reconstructed_chunks": reconstruction_evidence,
+                }
+                raise
             result.update({"dataset": "funding", "symbol": symbol})
             funding_results.append(result)
             progress({"event": "funding_stream", **result})

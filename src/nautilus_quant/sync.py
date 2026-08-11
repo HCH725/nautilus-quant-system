@@ -76,18 +76,24 @@ def sync_bar_stream(
     end_ms: int,
     chunk_days: int,
     max_chunks: int | None = None,
-) -> dict[str, int | str]:
+    reconstruction_evidence: list[dict[str, object]] | None = None,
+) -> dict[str, int | str | list[int]]:
     bar_type = bar_type_string(instrument_id, interval, price_type)
     step_ms = interval_millis(interval)
     last_ns = _validated_catalog_tail(catalog, bar_type, start_ms, step_ms)
     cursor = max(start_ms, last_ns // 1_000_000 if last_ns is not None else start_ms)
     chunk_steps = max(1, chunk_days * 86_400_000 // step_ms)
     written = 0
+    reconstructed = 0
+    reconstructed_open_ms: list[int] = []
     chunks = 0
 
     while cursor < end_ms and (max_chunks is None or chunks < max_chunks):
         chunk_end = min(end_ms, cursor + chunk_steps * step_ms)
         rows = client.klines(dataset, symbol, interval, cursor, chunk_end, step_ms)
+        reconstructed_rows = [row for row in rows if row.source_interval == "1m"]
+        reconstructed += len(reconstructed_rows)
+        reconstructed_open_ms.extend(row.open_ms for row in reconstructed_rows)
         chunks += 1
         if not rows:
             raise ValueError(f"missing {dataset}/{symbol}/{interval} data at {cursor}")
@@ -119,12 +125,22 @@ def sync_bar_stream(
             last_close_ms=rows[-1].close_ms,
             step_ms=step_ms,
         )
+        if reconstructed_rows and reconstruction_evidence is not None:
+            reconstruction_evidence.append({
+                "dataset": dataset,
+                "symbol": symbol,
+                "interval": interval,
+                "bar_type": bar_type,
+                "reconstructed_open_ms": [row.open_ms for row in reconstructed_rows],
+            })
         written += len(bars)
         cursor = rows[-1].close_ms
 
     return {
         "bar_type": bar_type,
         "written": written,
+        "reconstructed": reconstructed,
+        "reconstructed_open_ms": reconstructed_open_ms,
         "chunks": chunks,
         "cursor_ms": cursor,
         "complete": cursor >= end_ms,

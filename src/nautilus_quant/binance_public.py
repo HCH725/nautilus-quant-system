@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 import json
 import time
 from typing import Callable, Iterable, Iterator
@@ -14,6 +15,9 @@ _ENDPOINTS = {
     "index": "/fapi/v1/indexPriceKlines",
     "premium": "/fapi/v1/premiumIndexKlines",
 }
+# ponytail: one day bounds REST fallback cost and prevents hiding long
+# outages. Add an official archive adapter before raising this ceiling.
+_MAX_RECONSTRUCTION_MINUTES = 1_440
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,7 @@ class Kline:
     low: str
     close: str
     volume: str
+    source_interval: str | None = None
 
 
 def endpoint_request(dataset: str, symbol: str, interval: str, start_ms: int, end_ms: int) -> tuple[str, dict[str, object]]:
@@ -91,6 +96,42 @@ def validate_contiguous(rows: Iterable[Kline], interval_ms: int) -> None:
             if row.open_ms != previous.open_ms + interval_ms:
                 raise ValueError(f"kline gap: {previous.open_ms} -> {row.open_ms}")
         previous = row
+
+
+def _internal_gap_starts(rows: list[Kline], interval_ms: int) -> list[int]:
+    missing: list[int] = []
+    for previous, row in zip(rows, rows[1:], strict=False):
+        for open_ms in range(previous.open_ms + interval_ms, row.open_ms, interval_ms):
+            if (len(missing) + 1) * interval_ms // 60_000 > _MAX_RECONSTRUCTION_MINUTES:
+                raise ValueError(
+                    f"reconstruction window too large: "
+                    f"{(len(missing) + 1) * interval_ms // 60_000} minutes",
+                )
+            missing.append(open_ms)
+    return missing
+
+
+def _aggregate_klines(dataset: str, rows: list[Kline], open_ms: int, interval_ms: int) -> Kline:
+    expected_rows = interval_ms // 60_000
+    if (
+        interval_ms % 60_000
+        or len(rows) != expected_rows
+        or not rows
+        or rows[0].open_ms != open_ms
+        or rows[-1].close_ms != open_ms + interval_ms
+    ):
+        raise ValueError(f"incomplete one-minute reconstruction at {open_ms}")
+    validate_contiguous(rows, 60_000)
+    return Kline(
+        open_ms=open_ms,
+        close_ms=open_ms + interval_ms,
+        open=rows[0].open,
+        high=max(rows, key=lambda row: Decimal(row.high)).high,
+        low=min(rows, key=lambda row: Decimal(row.low)).low,
+        close=rows[-1].close,
+        volume=str(sum((Decimal(row.volume) for row in rows), start=Decimal())) if dataset == "trade" else "0",
+        source_interval="1m",
+    )
 
 
 class BinancePublicClient:
@@ -163,6 +204,12 @@ class BinancePublicClient:
             return payload
 
         rows = [normalize_kline(dataset, row, interval_ms) for row in paginate_klines(fetch, start_ms, end_ms, interval_ms)]
+        if interval != "1m":
+            gap_starts = _internal_gap_starts(rows, interval_ms)
+            for open_ms in gap_starts:
+                one_minute_rows = self.klines(dataset, symbol, "1m", open_ms, open_ms + interval_ms, 60_000)
+                rows.append(_aggregate_klines(dataset, one_minute_rows, open_ms, interval_ms))
+            rows.sort(key=lambda row: row.open_ms)
         validate_contiguous(rows, interval_ms)
         return rows
 

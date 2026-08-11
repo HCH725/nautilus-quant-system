@@ -74,6 +74,9 @@ def _emit_failure(
     }
     if catalog_path is not None and funding_path is not None:
         report.update({"catalog_path": str(catalog_path), "funding_path": str(funding_path)})
+    evidence = getattr(exc, "sync_evidence", None)
+    if isinstance(evidence, dict):
+        report.update(evidence)
     if persist:
         report["report_path"] = str(write_report(report, run_dir))
     print(json.dumps(report, sort_keys=True), file=sys.stderr, flush=True)
