@@ -151,6 +151,70 @@ class CliTests(unittest.TestCase):
             self.assertIn("config path must stay within the project root", report["error"])
             self.assertFalse((external / "var/runs").exists())
 
+    def test_status_ignores_report_for_different_config_scope_same_paths(self):
+        for field, value in (
+            ("start", "2022-08-01T00:00:00Z"),
+            ("symbols", ["ETHUSDT"]),
+            ("intervals", ["15m"]),
+            ("datasets", ["mark"]),
+        ):
+            with self.subTest(field=field), TemporaryDirectory() as tmp:
+                project = Path(tmp)
+                config = write_valid_config(project)
+
+                with (
+                    patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                    patch("nautilus_quant.cli.run_sync", side_effect=RuntimeError("old scope failed")),
+                    redirect_stdout(StringIO()),
+                    redirect_stderr(StringIO()),
+                ):
+                    self.assertEqual(main(["sync", "--config", str(config)]), 1)
+
+                raw = json.loads(config.read_text(encoding="utf-8"))
+                raw[field] = value
+                config.write_text(json.dumps(raw), encoding="utf-8")
+                output = StringIO()
+
+                with patch("nautilus_quant.cli.PROJECT_ROOT", project), redirect_stdout(output):
+                    result = main(["status", "--config", str(config)])
+
+                event = json.loads(output.getvalue())
+                self.assertEqual(result, 0)
+                self.assertEqual(event["status"], "NO_RUN")
+                self.assertIsNone(event["latest_report"])
+
+    def test_sync_success_report_persists_scope_and_is_visible_to_status(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            expected_scope = {
+                "base_url": "https://fapi.binance.com",
+                "start": "2021-01-01T00:00:00+00:00",
+                "symbols": ["BTCUSDT"],
+                "intervals": ["5m"],
+                "datasets": ["trade"],
+            }
+            report = {
+                "status": "PASS",
+                "catalog_path": str((project / "data/catalog").resolve()),
+                "funding_path": str((project / "data/funding").resolve()),
+            }
+
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.cli.run_sync", return_value=report),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(main(["sync", "--config", str(config)]), 0)
+
+            output = StringIO()
+            with patch("nautilus_quant.cli.PROJECT_ROOT", project), redirect_stdout(output):
+                self.assertEqual(main(["status", "--config", str(config)]), 0)
+
+            event = json.loads(output.getvalue())
+            self.assertEqual(event["status"], "PASS")
+            self.assertEqual(event["latest_report"]["config_scope"], expected_scope)
+
     def test_status_ignores_latest_report_for_different_data_paths(self):
         with TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -205,6 +269,54 @@ class CliTests(unittest.TestCase):
                 "status": "UNKNOWN",
                 "catalog_path": "data/catalog",
                 "funding_path": "data/funding",
+            },
+            {
+                "status": "FAIL",
+                "catalog_path": "data/catalog",
+                "funding_path": "data/funding",
+                "config_scope": None,
+            },
+            {
+                "status": "FAIL",
+                "catalog_path": "data/catalog",
+                "funding_path": "data/funding",
+                "config_scope": {},
+            },
+            {
+                "status": "FAIL",
+                "catalog_path": "data/catalog",
+                "funding_path": "data/funding",
+                "config_scope": {
+                    "base_url": "https://fapi.binance.com",
+                    "start": "not-a-timestamp",
+                    "symbols": ["BTCUSDT"],
+                    "intervals": ["5m"],
+                    "datasets": ["trade"],
+                },
+            },
+            {
+                "status": "FAIL",
+                "catalog_path": "data/catalog",
+                "funding_path": "data/funding",
+                "config_scope": {
+                    "base_url": "https://fapi.binance.com",
+                    "start": "2022-08-01T00:00:00+00:00",
+                    "symbols": ["BTCUSDT"],
+                    "intervals": ["5m"],
+                    "datasets": ["bogus"],
+                },
+            },
+            {
+                "status": "FAIL",
+                "catalog_path": "data/catalog",
+                "funding_path": "data/funding",
+                "config_scope": {
+                    "base_url": "https://fapi.binance.com",
+                    "start": "2022-08-01T00:00:00+00:00",
+                    "symbols": ["USDT"],
+                    "intervals": ["5m"],
+                    "datasets": ["trade"],
+                },
             },
         ):
             with self.subTest(invalid=invalid), TemporaryDirectory() as tmp:

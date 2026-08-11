@@ -40,6 +40,14 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "timezone"):
                 load_config(path, root)
 
+    def test_rejects_non_ascii_lowercase_or_bare_usdt_symbols(self):
+        for symbol in ("比特USDT", "btcUSDT", "USDT"):
+            with self.subTest(symbol=symbol), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = self.write_config(root, {"symbols": [symbol]})
+                with self.assertRaisesRegex(ValueError, "symbols"):
+                    load_config(path, root)
+
     def test_rejects_config_path_outside_project(self):
         with TemporaryDirectory() as project_tmp, TemporaryDirectory() as outside_tmp:
             root = Path(project_tmp)

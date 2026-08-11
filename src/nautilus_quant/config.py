@@ -10,6 +10,16 @@ from .timebound import UTC, interval_millis
 _ALLOWED_DATASETS = {"trade", "mark", "index", "premium", "funding"}
 
 
+def valid_binance_usdt_symbol(value: str) -> bool:
+    return (
+        len(value) > len("USDT")
+        and value.isascii()
+        and value.isupper()
+        and value.isalnum()
+        and value.endswith("USDT")
+    )
+
+
 @dataclass(frozen=True)
 class MarketDataConfig:
     base_url: str
@@ -40,7 +50,7 @@ def load_config(path: Path, project_root: Path) -> MarketDataConfig:
     for interval in intervals:
         interval_millis(interval)
     symbols = tuple(raw["symbols"])
-    if not symbols or len(symbols) != len(set(symbols)) or any(not s.endswith("USDT") or not s.isalnum() for s in symbols):
+    if not symbols or len(symbols) != len(set(symbols)) or any(not valid_binance_usdt_symbol(s) for s in symbols):
         raise ValueError("symbols must be non-empty, unique Binance USDT symbols")
     parsed_start = datetime.fromisoformat(raw["start"].replace("Z", "+00:00"))
     if parsed_start.tzinfo is None:
