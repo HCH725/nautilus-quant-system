@@ -6,7 +6,9 @@
 
 核心執行不依賴 Hermes、LLM、Dashboard 或聊天平台。
 
-## 固定位置
+## 維護者固定部署位置
+
+以下為目前維護者在 macOS 外接碟上的固定拓樸，不是通用安裝預設；其他環境必須同步調整本文件與 `ops/ai.nautilus.quant.data-sync.plist` 內的絕對路徑，並重新完成所有驗活關卡。
 
 ```text
 repo       /Volumes/ExpansionDrive/nautilus-system

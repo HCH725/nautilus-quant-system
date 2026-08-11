@@ -38,9 +38,11 @@
 ## 安裝與測試
 
 ```bash
-/Volumes/ExpansionDrive/.nautilus-tools/uv-0.11.33/bin/uv sync --dev
+uv sync --dev
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+以上命令應從 clone 後的 repository root 執行。`ops/RUNBOOK.md` 與 `ops/ai.nautilus.quant.data-sync.plist` 記錄目前維護者在 macOS 外接碟上的固定部署拓樸，不是通用安裝路徑；其他環境必須先調整絕對路徑，且不得直接載入尚未驗活的 launchd 草稿。
 
 ## 同步與狀態
 
