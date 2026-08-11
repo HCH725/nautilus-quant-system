@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .timebound import UTC, interval_millis
 
-_ALLOWED_DATASETS = {"trade", "mark", "index", "premium", "funding"}
+_ALLOWED_DATASETS = {"trade", "mark", "index", "funding"}
 
 
 def valid_binance_usdt_symbol(value: str) -> bool:

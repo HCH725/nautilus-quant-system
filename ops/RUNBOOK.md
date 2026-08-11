@@ -86,10 +86,10 @@ Full-scope bounded matrix 使用固定兩週窗口，週線因此至少有兩根
 ```bash
 .venv/bin/nautilus-data sync \
   --config config/bounded_matrix.json \
-  --now 2026-08-10T12:00:00Z
+  --now 2026-08-11T00:00:00Z
 .venv/bin/python scripts/verify_smoke.py \
   --config config/bounded_matrix.json \
-  --now 2026-08-10T12:00:00Z
+  --now 2026-08-11T00:00:00Z
 ```
 
-必須同時滿足：112 bar streams、4 funding streams、12 instruments、所有 stream 完整 readback；第二次相同同步的 instrument/bar/funding writes 全為 0。Funding 沒有 kline interval，不得為湊 `4 × 7 × 5` 而重複抓七次。
+必須同時滿足：84 bar streams、4 funding streams、8 instruments、所有 stream 完整 readback；第二次相同同步的 instrument/bar/funding writes 全為 0。Funding 沒有 kline interval，不得為湊 `4 × 7 × 4` 而重複抓七次。

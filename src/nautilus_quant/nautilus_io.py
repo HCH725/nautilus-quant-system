@@ -42,13 +42,10 @@ def _exact_fixed(value: str, precision: int) -> str:
     return f"{fixed:.{precision}f}"
 
 
-def make_reference_instrument(symbol: str, kind: str) -> IndexInstrument:
-    if kind not in {"index", "premium"}:
-        raise ValueError(f"unsupported reference kind: {kind}")
-    suffix = kind.upper()
+def make_index_instrument(symbol: str) -> IndexInstrument:
     return IndexInstrument(
-        instrument_id=InstrumentId.from_str(f"{symbol}-{suffix}.BINANCE"),
-        raw_symbol=Symbol(f"{symbol}-{suffix}"),
+        instrument_id=InstrumentId.from_str(f"{symbol}-INDEX.BINANCE"),
+        raw_symbol=Symbol(f"{symbol}-INDEX"),
         currency=Currency.from_str("USDT"),
         price_precision=12,
         size_precision=0,

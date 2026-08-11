@@ -21,7 +21,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 
 from .binance_public import BinancePublicClient
 from .config import MarketDataConfig
-from .nautilus_io import FundingJsonStore, make_reference_instrument
+from .nautilus_io import FundingJsonStore, bar_type_string, make_index_instrument
 from .sync import (
     FUNDING_MINUTE_NS,
     MAX_FUNDING_INTERVAL_MINUTES,
@@ -97,14 +97,23 @@ async def load_perpetuals(symbols: tuple[str, ...]) -> list[object]:
     return sorted(instruments, key=lambda item: str(item.id))
 
 
-def ensure_instruments(catalog: ParquetDataCatalog, perpetuals: list[object], symbols: tuple[str, ...]) -> int:
+def ensure_instruments(
+    catalog: ParquetDataCatalog,
+    perpetuals: list[object],
+    symbols: tuple[str, ...],
+    datasets: tuple[str, ...],
+) -> int:
     desired = [
         *perpetuals,
-        *(make_reference_instrument(symbol, kind) for symbol in symbols for kind in ("index", "premium")),
+        *(make_index_instrument(symbol) for symbol in symbols if "index" in datasets),
     ]
     existing_by_id: dict[str, object] = {}
     for instrument in catalog.instruments():
         existing_by_id[str(instrument.id)] = instrument
+    desired_ids = {str(instrument.id) for instrument in desired}
+    unexpected = set(existing_by_id) - desired_ids
+    if unexpected:
+        raise RuntimeError(f"unexpected catalog instruments: {sorted(unexpected)}")
     writes = []
     for instrument in desired:
         existing = existing_by_id.get(str(instrument.id))
@@ -112,16 +121,34 @@ def ensure_instruments(catalog: ParquetDataCatalog, perpetuals: list[object], sy
             writes.append(instrument)
     if writes:
         catalog.write_instruments(writes)
-        after = {str(instrument.id): instrument for instrument in catalog.instruments()}
-        mismatched = {
-            str(instrument.id)
-            for instrument in desired
-            if str(instrument.id) not in after
-            or _instrument_fingerprint(after[str(instrument.id)]) != _instrument_fingerprint(instrument)
-        }
-        if mismatched:
-            raise RuntimeError(f"catalog instrument readback mismatch: {sorted(mismatched)}")
+    after = {str(instrument.id): instrument for instrument in catalog.instruments()}
+    unexpected = set(after) - desired_ids
+    if unexpected:
+        raise RuntimeError(f"unexpected catalog instruments: {sorted(unexpected)}")
+    mismatched = {
+        str(instrument.id)
+        for instrument in desired
+        if str(instrument.id) not in after
+        or _instrument_fingerprint(after[str(instrument.id)]) != _instrument_fingerprint(instrument)
+    }
+    if mismatched:
+        raise RuntimeError(f"catalog instrument readback mismatch: {sorted(mismatched)}")
     return len(writes)
+
+
+def validate_catalog_scope(catalog: ParquetDataCatalog, config: MarketDataConfig) -> None:
+    if "bars" not in catalog.list_data_types():
+        return
+    expected = set()
+    for symbol in config.symbols:
+        for dataset in (item for item in config.datasets if item != "funding"):
+            instrument_id = f"{symbol}-PERP.BINANCE" if dataset in {"trade", "mark"} else f"{symbol}-INDEX.BINANCE"
+            price_type = "MARK" if dataset == "mark" else "LAST"
+            for interval in config.intervals:
+                expected.add(bar_type_string(instrument_id, interval, price_type))
+    unexpected = {str(item) for item in catalog.list_instruments("bars")} - expected
+    if unexpected:
+        raise RuntimeError(f"unconfigured catalog bars: {sorted(unexpected)}")
 
 
 def _validated_funding_tail(store: FundingJsonStore, instrument_id: str, start_ms: int) -> int | None:
@@ -200,11 +227,13 @@ def run_sync(
     progress = progress or (lambda _event: None)
     config.catalog_path.mkdir(parents=True, exist_ok=True)
     catalog = ParquetDataCatalog(str(config.catalog_path))
+    validate_catalog_scope(catalog, config)
     client = BinancePublicClient(config.base_url)
     perpetuals = asyncio.run(load_perpetuals(config.symbols))
     perpetual_by_symbol = {str(item.id).split("-PERP.", 1)[0]: item for item in perpetuals}
-    instrument_writes = ensure_instruments(catalog, perpetuals, config.symbols)
-    progress({"event": "instruments", "writes": instrument_writes, "count": len(perpetuals) + 2 * len(config.symbols)})
+    instrument_writes = ensure_instruments(catalog, perpetuals, config.symbols, config.datasets)
+    instrument_count = len(perpetuals) + (len(config.symbols) if "index" in config.datasets else 0)
+    progress({"event": "instruments", "writes": instrument_writes, "count": instrument_count})
 
     results: list[dict[str, object]] = []
     reconstruction_evidence: list[dict[str, object]] = []

@@ -20,14 +20,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def verify_config(config, now: datetime) -> dict[str, object]:
     catalog = ParquetDataCatalog(str(config.catalog_path))
     streams = {}
+    expected_bar_types = set()
     for symbol in config.symbols:
-        ids = {
+        instrument_ids = {
             "trade": f"{symbol}-PERP.BINANCE",
             "mark": f"{symbol}-PERP.BINANCE",
             "index": f"{symbol}-INDEX.BINANCE",
-            "premium": f"{symbol}-PREMIUM.BINANCE",
         }
-        price_types = {"trade": "LAST", "mark": "MARK", "index": "LAST", "premium": "LAST"}
+        price_types = {"trade": "LAST", "mark": "MARK", "index": "LAST"}
         for interval in config.intervals:
             start_ms = to_millis(align_start(interval, config.start))
             end_ms = to_millis(target_end(interval, now))
@@ -35,10 +35,9 @@ def verify_config(config, now: datetime) -> dict[str, object]:
             expected_count = (end_ms - start_ms) // step_ms
             if expected_count <= 0:
                 raise ValueError(f"smoke range has no complete {interval} bars")
-            for dataset in ("trade", "mark", "index", "premium"):
-                if dataset not in config.datasets:
-                    continue
-                bar_type = bar_type_string(ids[dataset], interval, price_types[dataset])
+            for dataset in (item for item in config.datasets if item != "funding"):
+                bar_type = bar_type_string(instrument_ids[dataset], interval, price_types[dataset])
+                expected_bar_types.add(bar_type)
                 bars = catalog.query_bars([bar_type])
                 times = [bar.ts_event for bar in bars]
                 assert len(bars) == expected_count, (symbol, dataset, interval, len(bars), expected_count)
@@ -51,6 +50,15 @@ def verify_config(config, now: datetime) -> dict[str, object]:
                     "first_ns": times[0],
                     "last_ns": times[-1],
                 }
+
+    expected_instrument_ids = {
+        *(f"{symbol}-PERP.BINANCE" for symbol in config.symbols),
+        *(f"{symbol}-INDEX.BINANCE" for symbol in config.symbols if "index" in config.datasets),
+    }
+    actual_instrument_ids = {str(instrument.id) for instrument in catalog.instruments()}
+    assert actual_instrument_ids == expected_instrument_ids, (actual_instrument_ids, expected_instrument_ids)
+    actual_bar_types = {str(item) for item in catalog.list_instruments("bars")}
+    assert actual_bar_types == expected_bar_types, (actual_bar_types, expected_bar_types)
 
     funding_streams = {}
     if "funding" in config.datasets:

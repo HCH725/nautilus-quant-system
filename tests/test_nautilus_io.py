@@ -6,7 +6,7 @@ import unittest
 from nautilus_trader.model import FundingRateUpdate, InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
 
-from nautilus_quant.nautilus_io import FundingJsonStore, make_bar, make_reference_instrument
+from nautilus_quant.nautilus_io import FundingJsonStore, make_bar, make_index_instrument
 
 
 class NautilusIoTests(unittest.TestCase):
@@ -34,7 +34,7 @@ class NautilusIoTests(unittest.TestCase):
     def test_reference_instrument_catalog_roundtrip(self):
         with TemporaryDirectory() as tmp:
             catalog = ParquetDataCatalog(tmp)
-            instrument = make_reference_instrument("BTCUSDT", "index")
+            instrument = make_index_instrument("BTCUSDT")
             catalog.write_instruments([instrument])
             got = catalog.instruments([str(instrument.id)])
             self.assertEqual(got, [instrument])

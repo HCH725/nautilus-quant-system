@@ -14,7 +14,8 @@ from .timebound import interval_millis
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config/market_data.json"
 _REPORT_STATUSES = {"PASS", "PARTIAL", "FAIL"}
-_REPORT_DATASETS = {"trade", "mark", "index", "premium", "funding"}
+_REPORT_DATASETS = {"trade", "mark", "index", "funding"}
+_HISTORICAL_REPORT_DATASETS = _REPORT_DATASETS | {"premium"}
 
 
 def _utc_datetime(value: str) -> datetime:
@@ -84,7 +85,7 @@ def _validated_report_scope(value: object) -> dict[str, object]:
             interval_millis(interval)
     except ValueError as exc:
         raise ValueError("invalid run report field: config_scope") from exc
-    if set(value["datasets"]) - _REPORT_DATASETS:
+    if set(value["datasets"]) - _HISTORICAL_REPORT_DATASETS:
         raise ValueError("invalid run report field: config_scope")
     return value
 

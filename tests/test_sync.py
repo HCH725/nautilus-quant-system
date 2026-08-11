@@ -8,8 +8,8 @@ from nautilus_trader.model import FundingRateUpdate, InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from nautilus_quant.binance_public import Kline
-from nautilus_quant.nautilus_io import FundingJsonStore, make_bar, make_reference_instrument
-from nautilus_quant.service import ensure_instruments, sync_funding_stream
+from nautilus_quant.nautilus_io import FundingJsonStore, make_bar, make_index_instrument
+from nautilus_quant.service import ensure_instruments, sync_funding_stream, validate_catalog_scope
 from nautilus_quant.sync import funding_events, sync_bar_stream
 
 
@@ -24,6 +24,91 @@ class FakeClient:
 
 
 class SyncTests(unittest.TestCase):
+    def test_catalog_scope_rejects_unconfigured_bar_type(self):
+        config = SimpleNamespace(
+            symbols=("BTCUSDT",),
+            intervals=("5m",),
+            datasets=("trade", "mark", "index"),
+        )
+
+        class Catalog:
+            @staticmethod
+            def list_data_types():
+                return ["bars"]
+
+            @staticmethod
+            def list_instruments(_data_type):
+                return ["BTCUSDT-PREMIUM.BINANCE-5-MINUTE-LAST-EXTERNAL"]
+
+        with self.assertRaisesRegex(RuntimeError, "unconfigured catalog bars"):
+            validate_catalog_scope(Catalog(), config)
+
+    def test_instruments_only_include_configured_reference_datasets(self):
+        fields = {
+            "id": "BTCUSDT-PERP.BINANCE",
+            "price_precision": 2,
+            "size_precision": 3,
+            "price_increment": "0.01",
+            "size_increment": "0.001",
+            "min_quantity": "0.001",
+            "max_quantity": "1000",
+            "min_notional": "5",
+            "max_notional": None,
+        }
+
+        class RecordingCatalog:
+            def __init__(self):
+                self.items = []
+
+            def instruments(self):
+                return self.items
+
+            def write_instruments(self, instruments):
+                self.items.extend(instruments)
+
+        catalog = RecordingCatalog()
+        writes = ensure_instruments(
+            catalog,
+            [SimpleNamespace(**fields)],
+            ("BTCUSDT",),
+            ("trade", "index"),
+        )
+
+        self.assertEqual(writes, 2)
+        self.assertEqual(
+            {str(instrument.id) for instrument in catalog.items},
+            {"BTCUSDT-PERP.BINANCE", "BTCUSDT-INDEX.BINANCE"},
+        )
+
+    def test_instruments_reject_unconfigured_catalog_entries_before_writing(self):
+        fields = {
+            "price_precision": 2,
+            "size_precision": 3,
+            "price_increment": "0.01",
+            "size_increment": "0.001",
+            "min_quantity": "0.001",
+            "max_quantity": "1000",
+            "min_notional": "5",
+            "max_notional": None,
+        }
+        desired = SimpleNamespace(id="BTCUSDT-PERP.BINANCE", **fields)
+        retired = SimpleNamespace(id="BTCUSDT-PREMIUM.BINANCE", **fields)
+
+        class Catalog:
+            writes = []
+
+            @staticmethod
+            def instruments():
+                return [retired]
+
+            @classmethod
+            def write_instruments(cls, instruments):
+                cls.writes.extend(instruments)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected catalog instruments"):
+            ensure_instruments(Catalog(), [desired], ("BTCUSDT",), ("trade", "index"))
+        self.assertEqual(Catalog.writes, [])
+
     def test_instrument_readback_rejects_stale_same_id_metadata(self):
         fields = {
             "id": "BTCUSDT-PERP.BINANCE",
@@ -43,8 +128,7 @@ class SyncTests(unittest.TestCase):
             def __init__(self):
                 self.items = [
                     stale,
-                    make_reference_instrument("BTCUSDT", "index"),
-                    make_reference_instrument("BTCUSDT", "premium"),
+                    make_index_instrument("BTCUSDT"),
                 ]
 
             def instruments(self):
@@ -55,7 +139,7 @@ class SyncTests(unittest.TestCase):
                 return None
 
         with self.assertRaisesRegex(RuntimeError, "instrument readback"):
-            ensure_instruments(DroppingCatalog(), [desired], ("BTCUSDT",))
+            ensure_instruments(DroppingCatalog(), [desired], ("BTCUSDT",), ("trade", "index"))
 
     def test_bar_stream_resumes_from_exact_catalog_bar_type(self):
         rows = [

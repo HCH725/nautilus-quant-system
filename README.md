@@ -10,7 +10,7 @@
 - Symbols：`BTCUSDT`、`ETHUSDT`、`BNBUSDT`、`SOLUSDT`
 - 歷史起點：`2022-08-01T00:00:00Z`
 - Intervals：`5m`、`15m`、`30m`、`1h`、`4h`、`1d`、`1w`
-- Data：trade、mark、index、premium klines 與 funding rate
+- Data：trade、mark、index klines 與 funding rate；不包含 premium index klines
 - 邊界：只同步前一個完整 UTC 日；週線只到最後一個完整 Monday boundary
 - 不包含 open interest
 
@@ -30,7 +30,6 @@
 | trade klines | perpetual instrument 的 `Bar/LAST` |
 | mark klines | perpetual instrument 的 `Bar/MARK` |
 | index klines | 原生 `IndexInstrument` 的 `Bar/LAST` |
-| premium index klines | 原生 `IndexInstrument` 的 `Bar/LAST` |
 | funding | 原生 `FundingRateUpdate` JSONL event store |
 
 `ParquetDataCatalog` 保存 instruments 與 bars。`2.0.0rc2` 尚無公開 funding Parquet writer，因此 funding 暫以 `FundingRateUpdate.to_json()` 原子檔保存；程式中的 `ponytail:` 註解標出未來可直接換回 Catalog 的位置。
@@ -70,13 +69,13 @@ uv sync --dev
 ```bash
 .venv/bin/nautilus-data sync \
   --config config/bounded_matrix.json \
-  --now 2026-08-10T12:00:00Z
+  --now 2026-08-11T00:00:00Z
 .venv/bin/python scripts/verify_smoke.py \
   --config config/bounded_matrix.json \
-  --now 2026-08-10T12:00:00Z
+  --now 2026-08-11T00:00:00Z
 ```
 
-驗收面是 4 symbols × 7 intervals × 4 bar datasets = 112 bar streams，另加每個 symbol 一條 funding stream，共 116 streams。2026-08-11 實跑 readback 為 12 instruments、103,744 bars、168 funding events；相同窗口第二輪所有 writes 為 0。這只證明 bounded 全矩陣，不表示 `2022-08-01 → D-1` 已回填。
+驗收面是 4 symbols × 7 intervals × 3 bar datasets = 84 bar streams，另加每個 symbol 一條 funding stream，共 88 streams、8 instruments。2026-08-11 實跑 readback 為 83,364 bars、180 funding events，且未出現 Premium instrument/stream；相同窗口第二輪的 instrument/bar/funding writes 全為 0。這只證明 bounded 全矩陣，不表示 `2022-08-01 → D-1` 已回填。
 
 ## OS-native 排程
 

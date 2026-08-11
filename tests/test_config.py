@@ -33,6 +33,13 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dataset"):
                 load_config(path, root)
 
+    def test_rejects_retired_premium_dataset(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self.write_config(root, {"datasets": ["trade", "premium"]})
+            with self.assertRaisesRegex(ValueError, "dataset"):
+                load_config(path, root)
+
     def test_rejects_naive_start(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

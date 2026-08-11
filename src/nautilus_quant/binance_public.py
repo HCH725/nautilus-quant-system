@@ -13,7 +13,6 @@ _ENDPOINTS = {
     "trade": "/fapi/v1/klines",
     "mark": "/fapi/v1/markPriceKlines",
     "index": "/fapi/v1/indexPriceKlines",
-    "premium": "/fapi/v1/premiumIndexKlines",
 }
 # ponytail: one day bounds REST fallback cost and prevents hiding long
 # outages. Add an official archive adapter before raising this ceiling.
