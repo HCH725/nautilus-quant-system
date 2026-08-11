@@ -12,6 +12,7 @@ from .service import AlreadyRunning, run_sync, single_writer, write_report
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config/market_data.json"
+_REPORT_STATUSES = {"PASS", "PARTIAL", "FAIL"}
 
 
 def _utc_datetime(value: str) -> datetime:
@@ -39,20 +40,40 @@ def _print_event(event: dict[str, object]) -> None:
     print(json.dumps(event, sort_keys=True), flush=True)
 
 
-def _latest_report(run_dir: Path) -> dict[str, object] | None:
-    reports = sorted(run_dir.glob("sync-*.json"))
-    if not reports:
-        return None
-    return json.loads(reports[-1].read_text(encoding="utf-8"))
+def _latest_report(run_dir: Path, catalog_path: Path, funding_path: Path) -> dict[str, object] | None:
+    for path in reversed(sorted(run_dir.glob("sync-*.json"))):
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict):
+            raise ValueError("run report must be a JSON object")
+        for field in ("catalog_path", "funding_path"):
+            if not isinstance(report.get(field), str) or not report[field]:
+                raise ValueError(f"invalid run report field: {field}")
+        if report.get("status") not in _REPORT_STATUSES:
+            raise ValueError("invalid run report field: status")
+        if (
+            report.get("catalog_path") == str(catalog_path)
+            and report.get("funding_path") == str(funding_path)
+        ):
+            return report
+    return None
 
 
-def _emit_failure(exc: BaseException, run_dir: Path, *, persist: bool) -> int:
+def _emit_failure(
+    exc: BaseException,
+    run_dir: Path,
+    *,
+    persist: bool,
+    catalog_path: Path | None = None,
+    funding_path: Path | None = None,
+) -> int:
     report = {
         "status": "FAIL",
         "failed_at": datetime.now(timezone.utc).isoformat(),
         "error_type": type(exc).__name__,
         "error": str(exc),
     }
+    if catalog_path is not None and funding_path is not None:
+        report.update({"catalog_path": str(catalog_path), "funding_path": str(funding_path)})
     if persist:
         report["report_path"] = str(write_report(report, run_dir))
     print(json.dumps(report, sort_keys=True), file=sys.stderr, flush=True)
@@ -71,7 +92,10 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_failure(exc, run_dir, persist=args.command == "sync")
 
     if args.command == "status":
-        latest = _latest_report(run_dir)
+        try:
+            latest = _latest_report(run_dir, config.catalog_path, config.funding_path)
+        except BaseException as exc:
+            return _emit_failure(exc, run_dir, persist=False)
         _print_event({
             "status": "NO_RUN" if latest is None else latest.get("status"),
             "latest_report": latest,
@@ -87,7 +111,13 @@ def main(argv: list[str] | None = None) -> int:
         _print_event({"status": "BUSY", "message": str(exc)})
         return 0
     except BaseException as exc:
-        return _emit_failure(exc, run_dir, persist=True)
+        return _emit_failure(
+            exc,
+            run_dir,
+            persist=True,
+            catalog_path=config.catalog_path,
+            funding_path=config.funding_path,
+        )
 
     report_path = write_report(report, run_dir)
     _print_event({"status": report["status"], "report_path": str(report_path)})
