@@ -2,8 +2,15 @@
 name = "nautilus-quant-system"
 version = "0.1.0"
 description = "Deterministic Binance USD-M data foundation for NautilusTrader"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.13,<3.14"
 dependencies = ["nautilus_trader==2.0.0rc2"]
+
+[project.urls]
+Repository = "https://github.com/HCH725/nautilus-quant-system"
+"Upstream framework" = "https://github.com/nautechsystems/nautilus_trader"
+Documentation = "https://nautilustrader.io/docs/"
 
 [project.scripts]
 nautilus-data = "nautilus_quant.cli:main"

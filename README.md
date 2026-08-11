@@ -1,5 +1,8 @@
 # Nautilus Quant System
 
+> [!IMPORTANT]
+> 這是建立於官方 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) runtime 之上的獨立專案，並非 NautilusTrader 官方 fork，也不隸屬於、未受贊助或背書於 Nautech Systems。完整出處與第三方授權見 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
 獨立、deterministic 的 Binance USD-M Futures 資料核心，使用 NautilusTrader `2.0.0rc2`。
 
 ## 範圍
@@ -10,6 +13,15 @@
 - Data：trade、mark、index、premium klines 與 funding rate
 - 邊界：只同步前一個完整 UTC 日；週線只到最後一個完整 Monday boundary
 - 不包含 open interest
+
+## 出處與授權
+
+- 本 repository 的原創程式碼採 [MIT License](LICENSE)。
+- [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) 由 [Nautech Systems](https://www.nautechsystems.io/) 維護，並以 `LGPL-3.0-or-later` 授權。
+- NautilusTrader 只作為獨立、未修改的官方 PyPI runtime dependency，由 `uv.lock` 固定版本、來源與雜湊；本 repository 不包含或重新散布其原始碼與 binary wheel。
+- 市場資料來自 Binance USD-M Futures 公開 HTTP API；repository 不包含下載後的市場資料、API key 或交易憑證。
+
+授權邊界、官方連結與非隸屬聲明詳見 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ## 資料模型
 
