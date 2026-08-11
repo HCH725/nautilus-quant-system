@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.nautilus.quant.data-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Volumes/ExpansionDrive/nautilus-system/.venv/bin/nautilus-data</string>
+    <string>sync</string>
+    <string>--config</string>
+    <string>/Volumes/ExpansionDrive/nautilus-system/config/market_data.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Volumes/ExpansionDrive/nautilus-system</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>10</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/Volumes/ExpansionDrive/nautilus-system/var/log/data-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Volumes/ExpansionDrive/nautilus-system/var/log/data-sync.error.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
