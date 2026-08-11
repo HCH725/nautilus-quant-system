@@ -156,7 +156,7 @@ class CliTests(unittest.TestCase):
             ("start", "2022-08-01T00:00:00Z"),
             ("symbols", ["ETHUSDT"]),
             ("intervals", ["15m"]),
-            ("datasets", ["mark"]),
+            ("datasets", ["trade", "funding"]),
         ):
             with self.subTest(field=field), TemporaryDirectory() as tmp:
                 project = Path(tmp)
@@ -183,36 +183,37 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(event["status"], "NO_RUN")
                 self.assertIsNone(event["latest_report"])
 
-    def test_status_ignores_historical_report_with_retired_premium_scope(self):
-        with TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            config = write_valid_config(project)
-            run_dir = project / "var/runs"
-            run_dir.mkdir(parents=True)
-            (run_dir / "sync-20260811T000000.000000Z.json").write_text(
-                json.dumps({
-                    "status": "FAIL",
-                    "catalog_path": str((project / "data/catalog").resolve()),
-                    "funding_path": str((project / "data/funding").resolve()),
-                    "config_scope": {
-                        "base_url": "https://fapi.binance.com",
-                        "start": "2021-01-01T00:00:00+00:00",
-                        "symbols": ["BTCUSDT"],
-                        "intervals": ["5m"],
-                        "datasets": ["trade", "premium"],
-                    },
-                }),
-                encoding="utf-8",
-            )
-            output = StringIO()
+    def test_status_ignores_historical_report_with_retired_reference_scope(self):
+        for dataset in ("premium", "mark", "index"):
+            with self.subTest(dataset=dataset), TemporaryDirectory() as tmp:
+                project = Path(tmp)
+                config = write_valid_config(project)
+                run_dir = project / "var/runs"
+                run_dir.mkdir(parents=True)
+                (run_dir / "sync-20260811T000000.000000Z.json").write_text(
+                    json.dumps({
+                        "status": "FAIL",
+                        "catalog_path": str((project / "data/catalog").resolve()),
+                        "funding_path": str((project / "data/funding").resolve()),
+                        "config_scope": {
+                            "base_url": "https://fapi.binance.com",
+                            "start": "2021-01-01T00:00:00+00:00",
+                            "symbols": ["BTCUSDT"],
+                            "intervals": ["5m"],
+                            "datasets": ["trade", dataset],
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+                output = StringIO()
 
-            with patch("nautilus_quant.cli.PROJECT_ROOT", project), redirect_stdout(output):
-                result = main(["status", "--config", str(config)])
+                with patch("nautilus_quant.cli.PROJECT_ROOT", project), redirect_stdout(output):
+                    result = main(["status", "--config", str(config)])
 
-            event = json.loads(output.getvalue())
-            self.assertEqual(result, 0)
-            self.assertEqual(event["status"], "NO_RUN")
-            self.assertIsNone(event["latest_report"])
+                event = json.loads(output.getvalue())
+                self.assertEqual(result, 0)
+                self.assertEqual(event["status"], "NO_RUN")
+                self.assertIsNone(event["latest_report"])
 
     def test_sync_success_report_persists_scope_and_is_visible_to_status(self):
         with TemporaryDirectory() as tmp:

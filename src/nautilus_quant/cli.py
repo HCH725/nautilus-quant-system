@@ -14,8 +14,8 @@ from .timebound import interval_millis
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config/market_data.json"
 _REPORT_STATUSES = {"PASS", "PARTIAL", "FAIL"}
-_REPORT_DATASETS = {"trade", "mark", "index", "funding"}
-_HISTORICAL_REPORT_DATASETS = _REPORT_DATASETS | {"premium"}
+_REPORT_DATASETS = {"trade", "funding"}
+_HISTORICAL_REPORT_DATASETS = _REPORT_DATASETS | {"mark", "index", "premium"}
 
 
 def _utc_datetime(value: str) -> datetime:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .timebound import UTC, interval_millis
 
-_ALLOWED_DATASETS = {"trade", "mark", "index", "funding"}
+_ALLOWED_DATASETS = {"trade", "funding"}
 
 
 def valid_binance_usdt_symbol(value: str) -> bool:
@@ -18,6 +18,13 @@ def valid_binance_usdt_symbol(value: str) -> bool:
         and value.isalnum()
         and value.endswith("USDT")
     )
+
+
+def _string_array(raw: dict[str, object], field: str) -> tuple[str, ...]:
+    value = raw.get(field)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field} must be an array of strings")
+    return tuple(value)
 
 
 @dataclass(frozen=True)
@@ -39,18 +46,18 @@ def load_config(path: Path, project_root: Path) -> MarketDataConfig:
     if not path.is_relative_to(root):
         raise ValueError("config path must stay within the project root")
     raw = json.loads(path.read_text(encoding="utf-8"))
-    datasets = tuple(raw["datasets"])
+    datasets = _string_array(raw, "datasets")
     if not datasets or len(datasets) != len(set(datasets)):
         raise ValueError("datasets must be non-empty and unique")
     unknown = set(datasets) - _ALLOWED_DATASETS
     if unknown:
         raise ValueError(f"unsupported dataset(s): {sorted(unknown)}")
-    intervals = tuple(raw["intervals"])
+    intervals = _string_array(raw, "intervals")
     if not intervals or len(intervals) != len(set(intervals)):
         raise ValueError("intervals must be non-empty and unique")
     for interval in intervals:
         interval_millis(interval)
-    symbols = tuple(raw["symbols"])
+    symbols = _string_array(raw, "symbols")
     if not symbols or len(symbols) != len(set(symbols)) or any(not valid_binance_usdt_symbol(s) for s in symbols):
         raise ValueError("symbols must be non-empty, unique Binance USDT symbols")
     parsed_start = datetime.fromisoformat(raw["start"].replace("Z", "+00:00"))
@@ -65,7 +72,10 @@ def load_config(path: Path, project_root: Path) -> MarketDataConfig:
         backtest_start = parsed_backtest_start.astimezone(UTC)
         if backtest_start < start:
             raise ValueError("backtest_start cannot be before download start")
-    chunk_days = int(raw["chunk_days"])
+    raw_chunk_days = raw.get("chunk_days")
+    if isinstance(raw_chunk_days, bool) or not isinstance(raw_chunk_days, int):
+        raise ValueError("chunk_days must be an integer")
+    chunk_days = raw_chunk_days
     if chunk_days < 1:
         raise ValueError("chunk_days must be positive")
     base_url = str(raw["base_url"]).rstrip("/")

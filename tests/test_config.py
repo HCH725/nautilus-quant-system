@@ -39,7 +39,14 @@ class ConfigTests(unittest.TestCase):
         assert config.backtest_start is not None
         self.assertEqual(config.backtest_start.isoformat(), "2022-07-01T00:00:00+00:00")
         self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"))
-        self.assertEqual(config.datasets, ("trade", "mark", "index", "funding"))
+        self.assertEqual(config.datasets, ("trade", "funding"))
+
+    def test_bounded_config_pins_trade_funding_matrix(self):
+        root = Path(__file__).resolve().parents[1]
+        config = load_config(root / "config/bounded_matrix.json", root)
+        self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"))
+        self.assertEqual(config.intervals, ("5m", "15m", "30m", "1h", "4h", "1d", "1w"))
+        self.assertEqual(config.datasets, ("trade", "funding"))
 
     def test_rejects_unknown_dataset(self):
         with TemporaryDirectory() as tmp:
@@ -48,12 +55,33 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dataset"):
                 load_config(path, root)
 
-    def test_rejects_retired_premium_dataset(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            path = self.write_config(root, {"datasets": ["trade", "premium"]})
-            with self.assertRaisesRegex(ValueError, "dataset"):
-                load_config(path, root)
+    def test_rejects_non_array_scope_fields(self):
+        for field, value in (
+            ("datasets", {"trade": "funding"}),
+            ("symbols", {"BTCUSDT": "ETHUSDT"}),
+            ("intervals", {"5m": "1h"}),
+        ):
+            with self.subTest(field=field), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = self.write_config(root, {field: value})
+                with self.assertRaisesRegex(ValueError, field):
+                    load_config(path, root)
+
+    def test_rejects_non_integer_chunk_days(self):
+        for value in (1.9, True, "30"):
+            with self.subTest(value=value), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = self.write_config(root, {"chunk_days": value})
+                with self.assertRaisesRegex(ValueError, "chunk_days"):
+                    load_config(path, root)
+
+    def test_rejects_retired_reference_datasets(self):
+        for dataset in ("premium", "mark", "index"):
+            with self.subTest(dataset=dataset), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = self.write_config(root, {"datasets": ["trade", dataset]})
+                with self.assertRaisesRegex(ValueError, "dataset"):
+                    load_config(path, root)
 
     def test_rejects_naive_start(self):
         with TemporaryDirectory() as tmp:

@@ -11,7 +11,7 @@
 - 資料下載起點：`2022-01-01T00:00:00Z`
 - 回測起點：`2022-07-01T00:00:00Z`；`2022-01-01 → 2022-06-30` 僅作策略指標 warm-up，不計入回測績效
 - Intervals：`5m`、`15m`、`30m`、`1h`、`4h`、`1d`、`1w`
-- Data：trade、mark、index klines 與 funding rate；不包含 premium index klines
+- Data：trade klines 與 funding rate；不抓 mark、index 或 premium index klines
 - 邊界：只同步前一個完整 UTC 日；週線只到最後一個完整 Monday boundary
 - 不包含 open interest
 
@@ -29,8 +29,6 @@
 | 來源 | Nautilus 表示 |
 |---|---|
 | trade klines | perpetual instrument 的 `Bar/LAST` |
-| mark klines | perpetual instrument 的 `Bar/MARK` |
-| index klines | 原生 `IndexInstrument` 的 `Bar/LAST` |
 | funding | 原生 `FundingRateUpdate` JSONL event store |
 
 `ParquetDataCatalog` 保存 instruments 與 bars。`2.0.0rc2` 尚無公開 funding Parquet writer，因此 funding 暫以 `FundingRateUpdate.to_json()` 原子檔保存；程式中的 `ponytail:` 註解標出未來可直接換回 Catalog 的位置。
@@ -76,7 +74,7 @@ uv sync --dev
   --now 2026-08-11T00:00:00Z
 ```
 
-驗收面是 4 symbols × 7 intervals × 3 bar datasets = 84 bar streams，另加每個 symbol 一條 funding stream，共 88 streams、8 instruments。2026-08-11 實跑 readback 為 83,364 bars、180 funding events，且未出現 Premium instrument/stream；相同窗口第二輪的 instrument/bar/funding writes 全為 0。這只證明 bounded 全矩陣，不表示 `2022-01-01 → D-1` 已回填。
+驗收面是 4 symbols × 7 intervals × 1 bar dataset = 28 bar streams，另加每個 symbol 一條 funding stream，共 32 streams、4 instruments。2026-08-11 實跑 readback 為 27,788 bars、180 funding events，沒有 Mark／Index／Premium stream；相同窗口第二輪的 instrument、bar、funding writes 全為 0。這只證明 bounded 全矩陣，不表示 `2022-01-01 → D-1` 已回填。
 
 ## OS-native 排程
 
