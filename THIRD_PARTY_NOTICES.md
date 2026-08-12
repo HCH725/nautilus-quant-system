@@ -17,6 +17,17 @@ NautilusTrader is installed as a separate, unmodified runtime dependency from it
 
 This repository is not affiliated with, maintained by, sponsored by, or endorsed by Nautech Systems or the NautilusTrader project.
 
+## PyBroker
+
+- Project: **PyBroker**
+- Official source: <https://github.com/edtechre/pybroker>
+- Package: <https://pypi.org/project/lib-pybroker/>
+- Version approved for the isolated research pilot: `lib-pybroker==1.2.14` (import name `pybroker`)
+- License: **Apache License 2.0 with Commons Clause**
+- Upstream license text: <https://github.com/edtechre/pybroker/blob/master/LICENSE>
+
+PyBroker is not a dependency of the current Nautilus runtime. Stage 0 does not install or redistribute it. A later, separately approved stage may use it only in an isolated internal research environment for provisional screening and candidate ranking. This approval does not cover paid hosting, consulting, commercialization, Testnet, or live trading; those uses require separate legal and operational review. PyBroker output is not the authoritative source for portfolio accounting, fees, funding, fills, or trading decisions.
+
 ## Binance
 
 This project retrieves public Binance USD-M Futures market data through public HTTP APIs. It does not vendor Binance SDK code, credentials, or downloaded market data. Binance names and trademarks belong to their respective owners. Users are responsible for complying with applicable Binance API terms and local requirements.
