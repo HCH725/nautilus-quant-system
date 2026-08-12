@@ -7,7 +7,7 @@
 
 ## Hybrid pilot 邊界
 
-已批准的 Stage 0 只封存基線、架構／legal contract，並修整 Nautilus 的資料與帳務裁判席；目前不安裝 PyBroker，也不建立 research runtime。
+已批准的 Stage 0 只封存基線、架構／legal contract，並修整 Nautilus 的資料與帳務裁判席；目前不安裝 PyBroker，也不建立 research runtime，亦不構成 Stage 1 授權。
 
 - Root runtime 維持 Python 3.13 + NautilusTrader；canonical data、權威回測、fills、fees、funding、positions、PnL 與 accounting 只以 Nautilus 為真值。
 - 後續另行批准時，PyBroker 只存在於隔離的 Python 3.12 research environment，負責 provisional ML／walk-forward screening 與候選排序，不得讀寫 canonical catalog、持有 credentials／訂單，或淘汰第一輪候選。
@@ -15,6 +15,8 @@
 - 第一輪最多驗證到 `nautilus_reproduced`；Shadow、Testnet、live 不在本輪授權範圍。
 
 完整責任邊界與 capsule contract 見 [`docs/architecture/hybrid-pybroker-nautilus.md`](docs/architecture/hybrid-pybroker-nautilus.md) 與 [`docs/contracts/candidate-capsule-v1.md`](docs/contracts/candidate-capsule-v1.md)。
+
+Stage 0 的本機 evidence 固定寫入 ignored `var/reports/pybroker-adoption/stage-0/`。本文件卡完成時只可回報：`P0-01 done；Stage 0 尚未完成；整體專案尚未完成。`
 
 ## 範圍
 

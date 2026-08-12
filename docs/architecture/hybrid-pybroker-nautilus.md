@@ -6,6 +6,16 @@
 
 目前只批准 Stage 0。此階段不安裝 PyBroker、不建立 research runtime，也不接 Shadow、Testnet 或 live。
 
+## Stage 0 文件契約
+
+- **Objective：** 先固定 Hybrid、license 與資料交換邊界，避免後續工作把 PyBroker 擴進 Nautilus runtime。
+- **In scope：** 本架構文件、Candidate Capsule contract、第三方 notice 與 README 摘要。
+- **Out of scope：** runtime code、依賴安裝、排程／服務變更、research environment，以及任何 Stage 1 以上工作。
+- **Evidence path：** 本機驗證證據固定寫入 ignored `var/reports/pybroker-adoption/stage-0/`；source 變更另以 Git commit、push 與遠端讀回為準。
+- **Authorization：** 本文件只封存 Stage 0 邊界；Stage 0 通過也不自動授權 Stage 1。
+
+本文件卡的固定完成措辭為：`P0-01 done；Stage 0 尚未完成；整體專案尚未完成。`
+
 ## 執行環境
 
 | 環境 | 責任 | 禁止事項 |
@@ -53,7 +63,7 @@ candidate -> verified -> nautilus_reproduced
 
 `shadow`、`testnet`、`live_candidate` 與 `live` 不在本輪授權範圍。任何 candidate 可轉為 `retired`。Promotion 只能依 deterministic evidence；LLM 文字、PyBroker metrics 或呼叫者自報 `passed=true` 均不能跳 gate。
 
-## AI Agent 邊界
+## 永久紅線與 AI Agent 邊界
 
 Agent 可提出 hypothesis、修改有測試的 Strategy Core、執行隔離研究、建立 capsule、驗證並要求 Nautilus replay。Agent 不得：
 

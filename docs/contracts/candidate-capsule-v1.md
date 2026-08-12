@@ -1,8 +1,10 @@
 # Candidate Capsule v1 Contract
 
-Status：Stage 0 contract；尚未建立 runtime implementation。
+Status：Stage 0 文件契約；尚未建立 runtime implementation，亦未授權 Stage 1。
 
 Candidate Capsule 是 PyBroker research 與 Nautilus authoritative replay 之間的不可變資料邊界。它只攜帶普通 JSON/JSONL 與 provenance，不攜帶可執行內容或 framework 物件。
+
+本階段 in scope 只有契約封存；capsule writer／verifier、research runtime、依賴與排程均 out of scope。
 
 ## Layout
 
@@ -78,7 +80,7 @@ Verifier 必須 fail closed，至少檢查：
 
 Capsule 完成後設為 read-only。Promotion state 必須寫在 capsule 外部，不得改寫 capsule。
 
-## Promotion boundary
+## 永久紅線與 Promotion boundary
 
 本輪正式狀態只允許：
 
