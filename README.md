@@ -40,7 +40,7 @@ uv sync --dev
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-以上命令應從 clone 後的 repository root 執行。`ops/RUNBOOK.md` 與 `ops/ai.nautilus.quant.data-sync.plist` 記錄目前維護者在 macOS 外接碟上的固定部署拓樸，不是通用安裝路徑；其他環境必須先調整絕對路徑，且不得直接載入尚未驗活的 launchd 草稿。
+以上命令應從 clone 後的 repository root 執行。`ops/RUNBOOK.md` 與 `ops/ai.nautilus.quant.data-sync.plist` 記錄目前維護者在 macOS 外接碟上的固定部署拓樸，不是通用安裝路徑；目前維護者機器已按該拓樸安裝並通過 RunAtLoad 驗活，其他環境必須先調整絕對路徑並重新完成驗收。
 
 ## 同步與狀態
 
@@ -78,9 +78,11 @@ uv sync --dev
 
 ## OS-native 排程
 
-`ops/ai.nautilus.quant.data-sync.plist` 目前只是**未安裝、未啟用**的 launchd 草稿；若未來通過完整回填、容量、恢復、監控與 review 驗收，設計上會在 `RunAtLoad` 與本機每日 10:15 執行。資料服務不需要 Hermes 存活。
+維護者機器已安裝 `ai.nautilus.quant.data-sync` LaunchAgent；它在 `RunAtLoad` 與本機每日 `10:15` 執行正式 `config/market_data.json`，核心資料同步不需要 Hermes 存活。Launchd stdout／stderr 位於 `~/Library/Logs/NautilusQuant/`，domain run evidence 仍原子寫入 ignored `var/runs/`。
 
-Preflight、failure recovery、evidence 與未來 scheduler 操作見 [`ops/RUNBOOK.md`](ops/RUNBOOK.md)。
+本次上線已驗證 RunAtLoad 與立即重跑皆退出 `0`、最新 report 為 `PASS`，且相同 D-1 的 instrument、28 條 bar stream 與 4 條 funding stream 寫入量全為 `0`。註冊成功本身不算完成；首個自然 `10:15` calendar slot 仍須依 Runbook 以 `runs`、`last exit code` 與新 report 讀回驗證。
+
+安裝／重載、Removable Volumes 權限、failure recovery 與 evidence 檢查見 [`ops/RUNBOOK.md`](ops/RUNBOOK.md)。
 
 ## 安全邊界
 
