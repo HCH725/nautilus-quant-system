@@ -21,6 +21,11 @@ PyBroker 導入為隔離的上游策略研究前端：唯讀使用既有市場�
 - [`docs/architecture/hybrid-pybroker-nautilus.md`](docs/architecture/hybrid-pybroker-nautilus.md)
 - [`docs/contracts/pybroker-candidate-v1.md`](docs/contracts/pybroker-candidate-v1.md)
 
+The isolated runner and lock-rebuild commands are in
+[`research/README.md`](research/README.md). Generated candidates stay under
+ignored `var/`; root code only provides a strict stdlib candidate parser for
+later Nautilus validation.
+
 ## 範圍
 
 - Symbols：`BTCUSDT`、`ETHUSDT`、`BNBUSDT`、`SOLUSDT`
