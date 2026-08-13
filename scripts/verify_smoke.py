@@ -6,12 +6,15 @@ import json
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from nautilus_quant.config import load_config
-from nautilus_quant.nautilus_io import FundingJsonStore, bar_type_string
-from nautilus_quant.sync import (
-    FUNDING_MINUTE_NS,
-    MAX_FUNDING_INTERVAL_MINUTES,
-    funding_interval_minutes,
+from nautilus_quant.funding_observation import (
+    FUNDING_PRICE_SOURCE,
+    HEAD_TOLERANCE_NS,
+    MAX_FUNDING_GAP_NS,
+    MODELED_FUNDING,
+    OFFICIAL,
+    read_funding_observations,
 )
+from nautilus_quant.nautilus_io import bar_type_string
 from nautilus_quant.timebound import align_start, interval_millis, target_end, to_millis
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,31 +66,42 @@ def verify_config(config, now: datetime) -> dict[str, object]:
     funding_streams = {}
     if "funding" in config.datasets:
         funding_start_ms = to_millis(config.start)
-        funding_end_ms = to_millis(target_end("1d", now))
+        funding_end_ms = to_millis(target_end("5m", now))
+        observations_by_symbol = read_funding_observations(config.funding_path, symbols=config.symbols)
         for symbol in config.symbols:
             expected_id = f"{symbol}-PERP.BINANCE"
-            funding = FundingJsonStore(config.funding_path / f"{expected_id}.jsonl").load()
+            funding = observations_by_symbol[symbol]
             assert funding
-            assert all(type(item).__name__ == "FundingRateUpdate" for item in funding)
-            assert len({item.ts_event for item in funding}) == len(funding)
-            head_gap_ns = funding[0].ts_event - funding_start_ms * 1_000_000
-            assert 0 <= head_gap_ns < FUNDING_MINUTE_NS // 2
+            assert all(item.instrument_id == expected_id for item in funding)
+            assert all(
+                (
+                    item.truth_status == OFFICIAL
+                    and item.mark_price is not None
+                    and item.mark_price > 0
+                    and item.funding_price_source == FUNDING_PRICE_SOURCE
+                )
+                or (
+                    item.truth_status == MODELED_FUNDING
+                    and item.mark_price is None
+                    and item.funding_price_source is None
+                )
+                for item in funding
+            )
+            assert funding[-1].truth_status == OFFICIAL
+            times = [item.funding_time_ns for item in funding]
+            assert len(times) == len(set(times))
+            head_gap_ns = times[0] - funding_start_ms * 1_000_000
+            assert 0 <= head_gap_ns < HEAD_TOLERANCE_NS
             for current, following in zip(funding, funding[1:], strict=False):
-                assert str(current.instrument_id) == expected_id
-                assert str(following.instrument_id) == expected_id
-                interval_minutes = funding_interval_minutes(following.ts_event - current.ts_event)
-                assert 0 < interval_minutes <= MAX_FUNDING_INTERVAL_MINUTES
-                assert current.interval == interval_minutes
-                assert current.next_funding_ns == following.ts_event
-            assert str(funding[-1].instrument_id) == expected_id
-            tail_gap_ns = funding_end_ms * 1_000_000 - funding[-1].ts_event
-            tail_gap_minutes = funding_interval_minutes(tail_gap_ns)
-            assert tail_gap_ns > 0
-            assert 0 < tail_gap_minutes <= MAX_FUNDING_INTERVAL_MINUTES
+                assert 0 < following.funding_time_ns - current.funding_time_ns < MAX_FUNDING_GAP_NS + HEAD_TOLERANCE_NS
+            tail_gap_ns = funding_end_ms * 1_000_000 - times[-1]
+            assert 0 < tail_gap_ns < MAX_FUNDING_GAP_NS + HEAD_TOLERANCE_NS
             funding_streams[symbol] = {
                 "count": len(funding),
-                "first_ns": funding[0].ts_event,
-                "last_ns": funding[-1].ts_event,
+                "first_ns": times[0],
+                "last_ns": times[-1],
+                "modeled_count": sum(item.truth_status == MODELED_FUNDING for item in funding),
+                "official_count": sum(item.truth_status == OFFICIAL for item in funding),
             }
 
     return {

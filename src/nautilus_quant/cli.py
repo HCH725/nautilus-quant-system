@@ -9,7 +9,7 @@ import traceback
 
 from .binance_public import BinancePublicClient
 from .config import MarketDataConfig, load_config, valid_binance_usdt_symbol
-from .funding_observation import migrate_funding_observations, sync_funding_generation
+from .funding_observation import migrate_funding_observations, read_funding_status, sync_funding_generation
 from .service import AlreadyRunning, run_sync, single_writer, write_report
 from .timebound import interval_millis, target_end, to_millis
 
@@ -176,6 +176,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         try:
             latest = _latest_report(run_dir, config.catalog_path, config.funding_path, config_scope)
+            funding_status = (
+                read_funding_status(config.funding_path, symbols=config.symbols)
+                if "funding" in config.datasets
+                else None
+            )
+            reported_generation = latest.get("funding_generation") if latest is not None else None
+            if (
+                latest is not None
+                and latest.get("status") == "PASS"
+                and funding_status is not None
+                and reported_generation != funding_status["generation"]
+            ):
+                raise ValueError("latest run report and canonical funding generation mismatch")
         except BaseException as exc:
             return _emit_failure(exc, run_dir, persist=False)
         _print_event({
@@ -183,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
             "latest_report": latest,
             "catalog_path": str(config.catalog_path),
             "funding_path": str(config.funding_path),
+            "funding_canonical": funding_status,
             "config_scope": config_scope,
         })
         return 0

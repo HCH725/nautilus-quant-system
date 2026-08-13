@@ -15,6 +15,7 @@ from nautilus_quant.funding_observation import (
     migrate_funding_observations,
     observations_from_api_rows,
     read_funding_observations,
+    read_funding_status,
     sync_funding_generation,
 )
 
@@ -392,6 +393,69 @@ class FundingObservationTests(unittest.TestCase):
                     end_ms=24 * HOUR_MS,
                 )
             self.assertEqual(pointer_path.read_bytes(), old_pointer)
+
+    def test_daily_sync_at_current_boundary_is_a_readback_only_noop(self):
+        rows = [api_row(0, "0.0001", ""), api_row(8 * HOUR_MS, "0.0002", "1000")]
+        with TemporaryDirectory() as tmp:
+            funding_path = Path(tmp)
+            pointer = migrate_funding_observations(
+                client=FakeFundingClient({"BTCUSDT": rows}),
+                funding_path=funding_path,
+                symbols=("BTCUSDT",),
+                start_ms=0,
+                end_ms=16 * HOUR_MS,
+            )
+            pointer_path = funding_path / "funding-observations.v1.ready.json"
+            pointer_bytes = pointer_path.read_bytes()
+
+            class NoNetworkClient:
+                def funding(
+                    self,
+                    _symbol: str,
+                    _start_ms: int,
+                    _end_ms: int,
+                ) -> list[dict[str, object]]:
+                    raise AssertionError("same-boundary sync must not call Binance")
+
+            readback = sync_funding_generation(
+                client=NoNetworkClient(),
+                funding_path=funding_path,
+                symbols=("BTCUSDT",),
+                start_ms=0,
+                end_ms=16 * HOUR_MS,
+            )
+
+            self.assertEqual(readback, pointer)
+            self.assertEqual(pointer_path.read_bytes(), pointer_bytes)
+
+    def test_status_binds_generation_coverage_and_truth_counts(self):
+        rows = [api_row(0, "0.0001", ""), api_row(8 * HOUR_MS, "0.0002", "1000")]
+        with TemporaryDirectory() as tmp:
+            funding_path = Path(tmp)
+            pointer = migrate_funding_observations(
+                client=FakeFundingClient({"BTCUSDT": rows}),
+                funding_path=funding_path,
+                symbols=("BTCUSDT",),
+                start_ms=0,
+                end_ms=16 * HOUR_MS,
+            )
+
+            status = read_funding_status(funding_path, symbols=("BTCUSDT",))
+
+            self.assertEqual(status, {
+                "status": "READY",
+                "generation": pointer["generation"],
+                "start_ms": 0,
+                "end_ms": 16 * HOUR_MS,
+                "truth_counts": {"modeled_funding": 1, "official": 1},
+                "streams": {
+                    "BTCUSDT": {
+                        "rows": 2,
+                        "first_ns": 0,
+                        "last_ns": 8 * HOUR_MS * 1_000_000,
+                    },
+                },
+            })
 
 
 if __name__ == "__main__":

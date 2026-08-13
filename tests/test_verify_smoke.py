@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 import unittest
 
@@ -9,8 +10,8 @@ from nautilus_trader.model import Currency, IndexInstrument, InstrumentId, Price
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from nautilus_quant.config import MarketDataConfig
-from nautilus_quant.nautilus_io import FundingJsonStore, make_bar
-from nautilus_quant.sync import legacy_funding_events
+from nautilus_quant.funding_observation import migrate_funding_observations
+from nautilus_quant.nautilus_io import make_bar
 from scripts.verify_smoke import verify_config
 
 
@@ -105,6 +106,7 @@ class VerifySmokeTests(unittest.TestCase):
             end_ms = int(datetime(2026, 8, 10, tzinfo=timezone.utc).timestamp() * 1000)
             start_ms = int(start.timestamp() * 1000)
             bars = []
+            funding_by_symbol: dict[str, list[dict[str, object]]] = {}
             for symbol in symbols:
                 for dataset in datasets[:-1]:
                     instrument_id = (
@@ -130,18 +132,42 @@ class VerifySmokeTests(unittest.TestCase):
                             )
                             for close_ms in range(start_ms + step_ms, end_ms + 1, step_ms)
                         )
-                funding_rows = [
-                    {"fundingTime": timestamp, "fundingRate": "0.0001"}
+                funding_by_symbol[symbol] = [
+                    {
+                        "symbol": symbol,
+                        "fundingTime": timestamp,
+                        "fundingRate": "0.0001",
+                        "markPrice": "1000",
+                        "rateType": "Regular",
+                    }
                     for timestamp in range(start_ms, end_ms, 8 * 60 * 60_000)
                 ]
-                FundingJsonStore(config.funding_path / f"{symbol}-PERP.BINANCE.jsonl").append(
-                    legacy_funding_events(f"{symbol}-PERP.BINANCE", funding_rows),
-                )
             bars_by_type = {}
             for bar in bars:
                 bars_by_type.setdefault(str(bar.bar_type), []).append(bar)
             for stream in bars_by_type.values():
                 catalog.write_bars(stream)
+
+            class FundingClient:
+                def funding(
+                    self,
+                    symbol: str,
+                    requested_start_ms: int,
+                    requested_end_ms: int,
+                ) -> list[dict[str, object]]:
+                    return [
+                        row
+                        for row in funding_by_symbol[symbol]
+                        if requested_start_ms <= cast(int, row["fundingTime"]) < requested_end_ms
+                    ]
+
+            migrate_funding_observations(
+                client=FundingClient(),
+                funding_path=config.funding_path,
+                symbols=symbols,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
 
             result = verify_config(config, now)
 

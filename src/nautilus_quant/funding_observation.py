@@ -500,8 +500,10 @@ def sync_funding_generation(
 ) -> dict[str, object]:
     funding_path = Path(funding_path)
     _pointer, manifest, existing = _load_ready_generation(funding_path, symbols=symbols)
-    if manifest["start_ms"] != start_ms or not isinstance(manifest["end_ms"], int) or end_ms <= manifest["end_ms"]:
+    if manifest["start_ms"] != start_ms or not isinstance(manifest["end_ms"], int) or end_ms < manifest["end_ms"]:
         raise ValueError("daily FundingObservation boundaries must extend the ready generation")
+    if end_ms == manifest["end_ms"]:
+        return _pointer
     observations_by_symbol = {}
     for symbol in sorted(symbols):
         current = existing[symbol]
@@ -670,3 +672,26 @@ def read_funding_observations(
     symbols: tuple[str, ...],
 ) -> dict[str, list[FundingObservation]]:
     return _load_ready_generation(funding_path, symbols=symbols)[2]
+
+
+def read_funding_status(
+    funding_path: Path,
+    *,
+    symbols: tuple[str, ...],
+) -> dict[str, object]:
+    pointer, manifest, observations_by_symbol = _load_ready_generation(funding_path, symbols=symbols)
+    return {
+        "status": "READY",
+        "generation": pointer["generation"],
+        "start_ms": manifest["start_ms"],
+        "end_ms": manifest["end_ms"],
+        "truth_counts": manifest["truth_counts"],
+        "streams": {
+            symbol: {
+                "rows": len(observations),
+                "first_ns": observations[0].funding_time_ns,
+                "last_ns": observations[-1].funding_time_ns,
+            }
+            for symbol, observations in observations_by_symbol.items()
+        },
+    }

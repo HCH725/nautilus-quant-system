@@ -1,16 +1,20 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import cast
+from unittest.mock import patch
 import unittest
 
-from nautilus_trader.model import FundingRateUpdate, InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from nautilus_quant.binance_public import Kline
-from nautilus_quant.nautilus_io import FundingJsonStore, make_bar, make_index_instrument
-from nautilus_quant.service import ensure_instruments, sync_funding_stream, validate_catalog_scope
-from nautilus_quant.sync import funding_events, legacy_funding_events, sync_bar_stream
+from nautilus_quant.config import MarketDataConfig
+from nautilus_quant.funding_observation import FundingObservation
+from nautilus_quant.nautilus_io import make_bar, make_index_instrument
+from nautilus_quant.service import ensure_instruments, run_sync, validate_catalog_scope
+from nautilus_quant.sync import funding_events, sync_bar_stream
 
 
 class FakeClient:
@@ -304,115 +308,60 @@ class SyncTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "interval"):
             funding_events("BTCUSDT-PERP.BINANCE", rows)
 
-    def test_subminute_funding_timestamp_jitter_is_not_a_missing_interval(self):
-        eight_hours_ms = 8 * 60 * 60_000
-
-        class FundingClient:
-            @staticmethod
-            def funding(_symbol, _start_ms, _end_ms):
-                return [
-                    {"fundingTime": 0, "fundingRate": "0.0001"},
-                    {"fundingTime": eight_hours_ms + 5, "fundingRate": "0.0002"},
-                ]
-
+    def test_run_sync_uses_ready_funding_generation_as_the_only_live_store(self):
         with TemporaryDirectory() as tmp:
-            store = FundingJsonStore(Path(tmp) / "funding.jsonl")
-            result = sync_funding_stream(
-                client=FundingClient(),
-                store=store,
-                symbol="BTCUSDT",
-                instrument_id="BTCUSDT-PERP.BINANCE",
-                start_ms=0,
-                end_ms=2 * eight_hours_ms,
+            root = Path(tmp)
+            config = MarketDataConfig(
+                base_url="https://fapi.binance.com",
+                start=datetime(2022, 1, 1, tzinfo=timezone.utc),
+                symbols=("BTCUSDT", "ETHUSDT"),
+                intervals=("5m",),
+                datasets=("funding",),
+                chunk_days=30,
+                catalog_path=root / "catalog",
+                funding_path=root / "funding",
             )
-            self.assertEqual(result["written"], 2)
-            self.assertEqual(store.load()[0].interval, 480)
+            observations = {
+                symbol: [FundingObservation.from_api_row(
+                    f"{symbol}-PERP.BINANCE",
+                    {
+                        "symbol": symbol,
+                        "fundingTime": 1_641_024_000_000,
+                        "fundingRate": "0.0001",
+                        "markPrice": "1000",
+                        "rateType": "Regular",
+                    },
+                )]
+                for symbol in config.symbols
+            }
 
-    def test_funding_tail_must_reach_within_eight_hours_of_boundary(self):
-        class FundingClient:
-            @staticmethod
-            def funding(_symbol, start_ms, _end_ms):
-                return [{"fundingTime": start_ms, "fundingRate": "0.0001"}]
+            async def load_perpetuals(_symbols):
+                return [SimpleNamespace(id=f"{symbol}-PERP.BINANCE") for symbol in config.symbols]
 
-        with TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, "tail gap"):
-                sync_funding_stream(
-                    client=FundingClient(),
-                    store=FundingJsonStore(Path(tmp) / "funding.jsonl"),
-                    symbol="BTCUSDT",
-                    instrument_id="BTCUSDT-PERP.BINANCE",
-                    start_ms=0,
-                    end_ms=24 * 60 * 60 * 1000,
-                )
+            with (
+                patch("nautilus_quant.service.ParquetDataCatalog", return_value=SimpleNamespace(list_data_types=lambda: [])),
+                patch("nautilus_quant.service.BinancePublicClient", return_value=SimpleNamespace(last_used_weight=7)) as client,
+                patch("nautilus_quant.service.load_perpetuals", side_effect=load_perpetuals),
+                patch("nautilus_quant.service.ensure_instruments", return_value=0),
+                patch(
+                    "nautilus_quant.service.sync_funding_generation",
+                    return_value={"generation": "a" * 64, "status": "READY"},
+                ) as sync_generation,
+                patch("nautilus_quant.service.read_funding_observations", return_value=observations) as read_generation,
+            ):
+                report = run_sync(config, now=datetime(2026, 8, 13, 3, tzinfo=timezone.utc))
 
-    def test_initial_funding_head_must_match_requested_start(self):
-        class FundingClient:
-            @staticmethod
-            def funding(_symbol, start_ms, _end_ms):
-                return [{"fundingTime": start_ms + 8 * 60 * 60_000, "fundingRate": "0.0001"}]
-
-        with TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, "funding head gap"):
-                sync_funding_stream(
-                    client=FundingClient(),
-                    store=FundingJsonStore(Path(tmp) / "funding.jsonl"),
-                    symbol="BTCUSDT",
-                    instrument_id="BTCUSDT-PERP.BINANCE",
-                    start_ms=0,
-                    end_ms=16 * 60 * 60_000,
-                )
-
-    def test_existing_funding_internal_gap_is_rejected_before_resume(self):
-        instrument_id = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
-        gap_ms = 16 * 60 * 60_000
-
-        class FundingClient:
-            @staticmethod
-            def funding(_symbol, start_ms, _end_ms):
-                return [{"fundingTime": start_ms, "fundingRate": "0.0001"}]
-
-        with TemporaryDirectory() as tmp:
-            store = FundingJsonStore(Path(tmp) / "funding.jsonl")
-            store.append([
-                FundingRateUpdate(instrument_id, Decimal("0.0001"), 0, 0),
-                FundingRateUpdate(instrument_id, Decimal("0.0001"), gap_ms * 1_000_000, gap_ms * 1_000_000),
-            ])
-            with self.assertRaisesRegex(ValueError, "funding continuity"):
-                sync_funding_stream(
-                    client=FundingClient(),
-                    store=store,
-                    symbol="BTCUSDT",
-                    instrument_id=str(instrument_id),
-                    start_ms=0,
-                    end_ms=24 * 60 * 60_000,
-                )
-
-    def test_funding_api_gap_fails_before_mutating_store(self):
-        interval_ms = 8 * 60 * 60_000
-        instrument_id = "BTCUSDT-PERP.BINANCE"
-
-        class FundingClient:
-            @staticmethod
-            def funding(_symbol, _start_ms, _end_ms):
-                return [{"fundingTime": 2 * interval_ms, "fundingRate": "0.0003"}]
-
-        with TemporaryDirectory() as tmp:
-            store = FundingJsonStore(Path(tmp) / "funding.jsonl")
-            store.append(legacy_funding_events(instrument_id, [
-                {"fundingTime": 0, "fundingRate": "0.0001"},
-                {"fundingTime": interval_ms, "fundingRate": "0.0002"},
-            ]))
-            before = store.load()
-            with self.assertRaisesRegex(ValueError, "funding API gap"):
-                sync_funding_stream(
-                    client=FundingClient(),
-                    store=store,
-                    symbol="BTCUSDT",
-                    instrument_id=instrument_id,
-                    start_ms=0,
-                    end_ms=3 * interval_ms,
-                )
-            self.assertEqual(store.load(), before)
+            sync_generation.assert_called_once_with(
+                client=client.return_value,
+                funding_path=config.funding_path,
+                symbols=config.symbols,
+                start_ms=1_640_995_200_000,
+                end_ms=1_786_579_200_000,
+            )
+            read_generation.assert_called_once_with(config.funding_path, symbols=config.symbols)
+            self.assertEqual(report["funding_generation"], "a" * 64)
+            funding_streams = cast(list[dict[str, object]], report["funding_streams"])
+            self.assertEqual([item["official_rows"] for item in funding_streams], [1, 1])
 
     def test_each_funding_rate_settles_once_at_its_own_boundary(self):
         rows = [

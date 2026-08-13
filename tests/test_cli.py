@@ -10,6 +10,7 @@ import unittest
 
 from nautilus_quant.binance_public import BinancePublicClient
 from nautilus_quant.cli import main
+from nautilus_quant.funding_observation import migrate_funding_observations
 
 
 def write_valid_config(project: Path) -> Path:
@@ -261,7 +262,14 @@ class CliTests(unittest.TestCase):
                 config.write_text(json.dumps(raw), encoding="utf-8")
                 output = StringIO()
 
-                with patch("nautilus_quant.cli.PROJECT_ROOT", project), redirect_stdout(output):
+                with (
+                    patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                    patch(
+                        "nautilus_quant.cli.read_funding_status",
+                        return_value={"status": "READY", "generation": "a" * 64},
+                    ),
+                    redirect_stdout(output),
+                ):
                     result = main(["status", "--config", str(config)])
 
                 event = json.loads(output.getvalue())
@@ -332,6 +340,117 @@ class CliTests(unittest.TestCase):
             event = json.loads(output.getvalue())
             self.assertEqual(event["status"], "PASS")
             self.assertEqual(event["latest_report"]["config_scope"], expected_scope)
+
+    def test_status_binds_matching_report_to_ready_funding_generation(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw["datasets"] = ["trade", "funding"]
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            report = {
+                "status": "PASS",
+                "catalog_path": str((project / "data/catalog").resolve()),
+                "funding_path": str((project / "data/funding").resolve()),
+                "funding_generation": "a" * 64,
+            }
+            funding_status = {"status": "READY", "generation": "a" * 64}
+
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.cli.run_sync", return_value=report),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(main(["sync", "--config", str(config)]), 0)
+
+            output = StringIO()
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.cli.read_funding_status", return_value=funding_status) as read_status,
+                redirect_stdout(output),
+            ):
+                self.assertEqual(main(["status", "--config", str(config)]), 0)
+
+            event = json.loads(output.getvalue())
+            read_status.assert_called_once_with((project / "data/funding").resolve(), symbols=("BTCUSDT",))
+            self.assertEqual(event["funding_canonical"], funding_status)
+
+            output = StringIO()
+            errors = StringIO()
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch(
+                    "nautilus_quant.cli.read_funding_status",
+                    return_value={"status": "READY", "generation": "b" * 64},
+                ),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                self.assertEqual(main(["status", "--config", str(config)]), 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("generation mismatch", json.loads(errors.getvalue().splitlines()[0])["error"])
+
+    def test_status_rejects_pre_cutover_pass_report_without_funding_generation(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw["datasets"] = ["trade", "funding"]
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            start_ms = 1_609_459_200_000
+
+            class FundingClient:
+                def funding(
+                    self,
+                    symbol: str,
+                    start_ms: int,
+                    end_ms: int,
+                ) -> list[dict[str, object]]:
+                    return [
+                        {
+                            "symbol": symbol,
+                            "fundingTime": timestamp,
+                            "fundingRate": "0.0001",
+                            "markPrice": "1000",
+                        }
+                        for timestamp in (start_ms, start_ms + 8 * 60 * 60_000, start_ms + 16 * 60 * 60_000)
+                        if start_ms <= timestamp < end_ms
+                    ]
+
+            migrate_funding_observations(
+                client=FundingClient(),
+                funding_path=project / "data/funding",
+                symbols=("BTCUSDT",),
+                start_ms=start_ms,
+                end_ms=start_ms + 24 * 60 * 60_000,
+            )
+            run_dir = project / "var/runs"
+            run_dir.mkdir(parents=True)
+            (run_dir / "sync-20260813T021534.612879Z.json").write_text(json.dumps({
+                "status": "PASS",
+                "catalog_path": str((project / "data/catalog").resolve()),
+                "funding_path": str((project / "data/funding").resolve()),
+                "config_scope": {
+                    "base_url": "https://fapi.binance.com",
+                    "start": "2021-01-01T00:00:00+00:00",
+                    "symbols": ["BTCUSDT"],
+                    "intervals": ["5m"],
+                    "datasets": ["trade", "funding"],
+                },
+            }), encoding="utf-8")
+
+            output = StringIO()
+            errors = StringIO()
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                result = main(["status", "--config", str(config)])
+
+            self.assertEqual(result, 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("generation", json.loads(errors.getvalue().splitlines()[0])["error"])
 
     def test_status_ignores_latest_report_for_different_data_paths(self):
         with TemporaryDirectory() as tmp:

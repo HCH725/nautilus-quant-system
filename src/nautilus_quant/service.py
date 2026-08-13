@@ -21,14 +21,14 @@ from nautilus_trader.persistence import ParquetDataCatalog
 
 from .binance_public import BinancePublicClient
 from .config import MarketDataConfig
-from .nautilus_io import FundingJsonStore, bar_type_string, make_index_instrument
-from .sync import (
-    FUNDING_MINUTE_NS,
-    MAX_FUNDING_INTERVAL_MINUTES,
-    funding_interval_minutes,
-    legacy_funding_events,
-    sync_bar_stream,
+from .funding_observation import (
+    MODELED_FUNDING,
+    OFFICIAL,
+    read_funding_observations,
+    sync_funding_generation,
 )
+from .nautilus_io import bar_type_string, make_index_instrument
+from .sync import sync_bar_stream
 from .timebound import align_start, interval_millis, target_end, to_millis
 
 Progress = Callable[[dict[str, object]], None]
@@ -151,71 +151,6 @@ def validate_catalog_scope(catalog: ParquetDataCatalog, config: MarketDataConfig
         raise RuntimeError(f"unconfigured catalog bars: {sorted(unexpected)}")
 
 
-def _validated_funding_tail(store: FundingJsonStore, instrument_id: str, start_ms: int) -> int | None:
-    events = store.load()
-    if not events:
-        return None
-    expected_first_ns = start_ms * 1_000_000
-    head_gap_ns = events[0].ts_event - expected_first_ns
-    if not 0 <= head_gap_ns < FUNDING_MINUTE_NS // 2:
-        raise ValueError(f"funding continuity head error: expected {expected_first_ns}, got {events[0].ts_event}")
-    for current, following in zip(events, events[1:], strict=False):
-        if str(current.instrument_id) != instrument_id or str(following.instrument_id) != instrument_id:
-            raise ValueError("funding continuity instrument mismatch")
-        gap_ns = following.ts_event - current.ts_event
-        interval = funding_interval_minutes(gap_ns)
-        if interval <= 0 or interval > MAX_FUNDING_INTERVAL_MINUTES:
-            raise ValueError(f"funding continuity gap: {current.ts_event} -> {following.ts_event}")
-        if current.interval != interval or current.next_funding_ns != following.ts_event:
-            raise ValueError(f"funding continuity link mismatch at {current.ts_event}")
-    if str(events[-1].instrument_id) != instrument_id:
-        raise ValueError("funding continuity instrument mismatch")
-    return events[-1].ts_event
-
-
-def sync_funding_stream(
-    *,
-    client: BinancePublicClient,
-    store: FundingJsonStore,
-    symbol: str,
-    instrument_id: str,
-    start_ms: int,
-    end_ms: int,
-) -> dict[str, int | str | None]:
-    last_ns = _validated_funding_tail(store, instrument_id, start_ms)
-    cursor = max(start_ms, last_ns // 1_000_000 if last_ns is not None else start_ms)
-    if cursor >= end_ms:
-        return {"instrument_id": instrument_id, "written": 0, "last_ns": last_ns}
-    rows = client.funding(symbol, cursor, end_ms)
-    if not rows and last_ns is None:
-        raise ValueError(f"no funding data for {symbol} from {cursor} to {end_ms}")
-    if rows:
-        head_offset_ms = int(rows[0]["fundingTime"]) - cursor
-        if last_ns is None:
-            valid_head = 0 <= head_offset_ms < FUNDING_MINUTE_NS // 2 // 1_000_000
-        else:
-            valid_head = head_offset_ms == 0
-        if not valid_head:
-            kind = "head" if last_ns is None else "API"
-            raise ValueError(f"funding {kind} gap for {symbol}: expected {cursor}, got {rows[0]['fundingTime']}")
-    events = legacy_funding_events(instrument_id, rows)
-    written = store.append(events)
-    actual_last = _validated_funding_tail(store, instrument_id, start_ms)
-    if events and actual_last != events[-1].ts_event:
-        raise RuntimeError(f"funding readback mismatch: {actual_last} != {events[-1].ts_event}")
-    tail_gap_ns = end_ms * 1_000_000 - actual_last if actual_last is not None else None
-    tail_gap_minutes = funding_interval_minutes(tail_gap_ns) if tail_gap_ns is not None else None
-    if (
-        tail_gap_ns is None
-        or tail_gap_ns <= 0
-        or tail_gap_minutes is None
-        or tail_gap_minutes <= 0
-        or tail_gap_minutes > MAX_FUNDING_INTERVAL_MINUTES
-    ):
-        raise ValueError(f"funding tail gap for {symbol}: {tail_gap_ns}ns")
-    return {"instrument_id": instrument_id, "written": written, "last_ns": actual_last}
-
-
 def run_sync(
     config: MarketDataConfig,
     *,
@@ -288,28 +223,41 @@ def run_sync(
                 progress({"event": "bar_stream", **result})
 
     funding_results: list[dict[str, object]] = []
+    funding_generation: str | None = None
     if "funding" in config.datasets:
         end_ms = to_millis(target_end("5m", now))
         start_ms = to_millis(config.start)
+        try:
+            pointer = sync_funding_generation(
+                client=client,
+                funding_path=config.funding_path,
+                symbols=config.symbols,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            observations_by_symbol = read_funding_observations(config.funding_path, symbols=config.symbols)
+        except BaseException as exc:
+            setattr(exc, "sync_evidence", {
+                "bar_streams": results,
+                "funding_streams": funding_results,
+                "reconstructed_chunks": reconstruction_evidence,
+            })
+            raise
+        funding_generation = str(pointer["generation"])
         for symbol in config.symbols:
             instrument_id = f"{symbol}-PERP.BINANCE"
-            try:
-                result = sync_funding_stream(
-                    client=client,
-                    store=FundingJsonStore(config.funding_path / f"{instrument_id}.jsonl"),
-                    symbol=symbol,
-                    instrument_id=instrument_id,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                )
-            except BaseException as exc:
-                exc.sync_evidence = {
-                    "bar_streams": results,
-                    "funding_streams": funding_results,
-                    "reconstructed_chunks": reconstruction_evidence,
-                }
-                raise
-            result.update({"dataset": "funding", "symbol": symbol})
+            observations = observations_by_symbol[symbol]
+            result = {
+                "dataset": "funding",
+                "symbol": symbol,
+                "instrument_id": instrument_id,
+                "rows": len(observations),
+                "first_ns": observations[0].funding_time_ns,
+                "last_ns": observations[-1].funding_time_ns,
+                "modeled_rows": sum(item.truth_status == MODELED_FUNDING for item in observations),
+                "official_rows": sum(item.truth_status == OFFICIAL for item in observations),
+                "generation": funding_generation,
+            }
             funding_results.append(result)
             progress({"event": "funding_stream", **result})
 
@@ -322,6 +270,7 @@ def run_sync(
         "last_used_weight": client.last_used_weight,
         "bar_streams": results,
         "funding_streams": funding_results,
+        "funding_generation": funding_generation,
     }
 
 
