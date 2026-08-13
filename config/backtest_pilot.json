@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "engine": "nautilus_trader==2.0.0rc2",
+  "fixture_only": true,
+  "instrument_id": "BTCUSDT-PERP.BINANCE",
+  "starting_balance": "1000",
+  "quantity": "1.000",
+  "taker_fee": "0.001",
+  "official": {
+    "truth_status": "official",
+    "funding_price_source": "binance_funding_history_mark_price",
+    "performance_claimable": true,
+    "same_timestamp_order": "mark_then_funding",
+    "quotes": [
+      {"time_hours": 1, "bid": "1000.00", "ask": "1000.00", "action": "BUY"},
+      {"time_hours": 17, "bid": "1000.00", "ask": "1000.00", "action": "SELL"},
+      {"time_hours": 21, "bid": "1000.00", "ask": "1000.00", "action": "SELL"},
+      {"time_hours": 33, "bid": "1000.00", "ask": "1000.00", "action": "BUY"}
+    ],
+    "funding": [
+      {"time_hours": 8, "rate": "0.001", "mark_price": "1000", "expected_direction": "LONG"},
+      {"time_hours": 16, "rate": "-0.002", "mark_price": "2000", "expected_direction": "LONG"},
+      {"time_hours": 20, "rate": "0.01", "mark_price": "1500", "expected_direction": "FLAT"},
+      {"time_hours": 24, "rate": "0.0015", "mark_price": "1000", "expected_direction": "SHORT"},
+      {"time_hours": 32, "rate": "-0.001", "mark_price": "2000", "expected_direction": "SHORT"},
+      {"time_hours": 40, "rate": "-0.01", "mark_price": "1500", "expected_direction": "FLAT"}
+    ]
+  },
+  "modeled_missing_mark": {
+    "truth_status": "modeled_funding",
+    "funding_price_source": null,
+    "performance_claimable": false,
+    "same_timestamp_order": "top_of_book_fallback",
+    "quotes": [
+      {"time_hours": 1, "bid": "500.00", "ask": "1000.00", "action": "BUY"},
+      {"time_hours": 17, "bid": "1000.00", "ask": "1000.00", "action": "SELL"}
+    ],
+    "funding": [
+      {"time_hours": 8, "rate": "0.001", "mark_price": null, "expected_direction": "LONG"}
+    ]
+  }
+}
