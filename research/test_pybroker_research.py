@@ -6,10 +6,39 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from pybroker_research import decode_fixed, write_candidate
+from pybroker_research import decode_fixed, run, write_candidate
 
 
 class CandidateWriterTests(unittest.TestCase):
+    def test_rejects_candidate_output_inside_canonical_data(self):
+        with TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            catalog = data / "catalog"
+            funding = data / "funding"
+            catalog.mkdir(parents=True)
+            funding.mkdir()
+
+            for output in (catalog / "candidate.json", funding / "candidate.json"):
+                with self.subTest(output=output):
+                    with self.assertRaisesRegex(ValueError, "outside canonical data"):
+                        run(catalog, output)
+
+    def test_rejects_canonical_output_when_catalog_is_symlink(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "data"
+            target = root / "catalog-target"
+            funding = data / "funding"
+            target.mkdir()
+            funding.mkdir(parents=True)
+            catalog = data / "catalog"
+            catalog.symlink_to(target, target_is_directory=True)
+
+            for output in (funding / "candidate.json", target / "candidate.json"):
+                with self.subTest(output=output):
+                    with self.assertRaisesRegex(ValueError, "outside canonical data"):
+                        run(catalog, output)
+
     def test_decodes_nautilus_high_precision_fixed_bytes(self):
         raw = bytes.fromhex("00403a1fcf3d010d1900000000000000")
 

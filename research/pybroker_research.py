@@ -101,6 +101,13 @@ def load_bars(catalog: Path):
 
 
 def run(catalog: Path, output: Path) -> dict[str, object]:
+    catalog_path = Path(catalog)
+    canonical_data = (catalog_path.parent if catalog_path.name == "catalog" else catalog_path).resolve()
+    catalog = catalog_path.resolve()
+    output = Path(output).resolve()
+    if output.is_relative_to(canonical_data) or output.is_relative_to(catalog):
+        raise ValueError("candidate output must be outside canonical data")
+
     import pybroker
     from pybroker import Strategy, StrategyConfig
 
