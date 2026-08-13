@@ -7,9 +7,11 @@ from pathlib import Path
 import sys
 import traceback
 
+from .binance_public import BinancePublicClient
 from .config import MarketDataConfig, load_config, valid_binance_usdt_symbol
+from .funding_observation import migrate_funding_observations, sync_funding_generation
 from .service import AlreadyRunning, run_sync, single_writer, write_report
-from .timebound import interval_millis
+from .timebound import interval_millis, target_end, to_millis
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config/market_data.json"
@@ -36,6 +38,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="show latest deterministic run evidence")
     status.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+
+    migrate = subparsers.add_parser(
+        "migrate-funding-observations",
+        help="build and atomically publish a verified FundingObservation v1 candidate",
+    )
+    migrate.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    migrate.add_argument("--now", type=_utc_datetime, help="override current UTC time for deterministic verification")
+
+    candidate_sync = subparsers.add_parser(
+        "sync-funding-observations-candidate",
+        help="extend the uncut FundingObservation v1 candidate without changing the live reader",
+    )
+    candidate_sync.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    candidate_sync.add_argument("--now", type=_utc_datetime, help="override current UTC time for deterministic verification")
     return parser
 
 
@@ -169,6 +185,46 @@ def main(argv: list[str] | None = None) -> int:
             "funding_path": str(config.funding_path),
             "config_scope": config_scope,
         })
+        return 0
+
+    if args.command == "migrate-funding-observations":
+        try:
+            if "funding" not in config.datasets:
+                raise ValueError("funding dataset must be configured for FundingObservation migration")
+            with single_writer(project_root / "var/locks/data-sync.lock"):
+                pointer = migrate_funding_observations(
+                    client=BinancePublicClient(config.base_url),
+                    funding_path=config.funding_path,
+                    symbols=config.symbols,
+                    start_ms=to_millis(config.start),
+                    end_ms=to_millis(target_end("5m", args.now)),
+                )
+        except AlreadyRunning as exc:
+            _print_event({"status": "BUSY", "message": str(exc)})
+            return 0
+        except BaseException as exc:
+            return _emit_failure(exc, run_dir, persist=False)
+        _print_event(pointer)
+        return 0
+
+    if args.command == "sync-funding-observations-candidate":
+        try:
+            if "funding" not in config.datasets:
+                raise ValueError("funding dataset must be configured for FundingObservation sync")
+            with single_writer(project_root / "var/locks/data-sync.lock"):
+                pointer = sync_funding_generation(
+                    client=BinancePublicClient(config.base_url),
+                    funding_path=config.funding_path,
+                    symbols=config.symbols,
+                    start_ms=to_millis(config.start),
+                    end_ms=to_millis(target_end("5m", args.now)),
+                )
+        except AlreadyRunning as exc:
+            _print_event({"status": "BUSY", "message": str(exc)})
+            return 0
+        except BaseException as exc:
+            return _emit_failure(exc, run_dir, persist=False)
+        _print_event(pointer)
         return 0
 
     try:

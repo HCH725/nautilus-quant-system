@@ -7,6 +7,7 @@ from nautilus_trader.model import FundingRateUpdate, InstrumentId
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from .binance_public import BinancePublicClient
+from .funding_observation import MODELED_FUNDING, observations_from_api_rows
 from .nautilus_io import bar_type_string, make_bar
 from .timebound import interval_millis
 
@@ -148,6 +149,37 @@ def sync_bar_stream(
 
 
 def funding_events(instrument_id: str, rows: Iterable[dict[str, object]]) -> list[FundingRateUpdate]:
+    observations = observations_from_api_rows(instrument_id, list(rows))
+    if any(item.truth_status == MODELED_FUNDING for item in observations):
+        raise ValueError("markPrice is required for authoritative funding accounting")
+    timestamps = [item.funding_time_ns for item in observations]
+    events: list[FundingRateUpdate] = []
+    for index, observation in enumerate(observations):
+        if index + 1 < len(observations):
+            interval: int | None = funding_interval_minutes(timestamps[index + 1] - timestamps[index])
+            if interval <= 0 or interval > MAX_FUNDING_INTERVAL_MINUTES:
+                raise ValueError("invalid funding interval")
+        else:
+            interval = None
+        events.append(
+            FundingRateUpdate(
+                InstrumentId.from_str(instrument_id),
+                observation.rate,
+                observation.funding_time_ns,
+                observation.funding_time_ns,
+                interval=interval,
+                next_funding_ns=observation.funding_time_ns,
+            ),
+        )
+    return events
+
+
+def legacy_funding_events(instrument_id: str, rows: Iterable[dict[str, object]]) -> list[FundingRateUpdate]:
+    """Map the uncut legacy store until P0-05 activates the v1 pointer.
+
+    ponytail: this deliberately preserves the rollback reader/writer; P0-05 must
+    delete it when live-data cutover is authorized.
+    """
     ordered = sorted(rows, key=lambda row: int(row["fundingTime"]))
     timestamps = [int(row["fundingTime"]) for row in ordered]
     if len(timestamps) != len(set(timestamps)):

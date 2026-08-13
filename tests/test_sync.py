@@ -10,7 +10,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_quant.binance_public import Kline
 from nautilus_quant.nautilus_io import FundingJsonStore, make_bar, make_index_instrument
 from nautilus_quant.service import ensure_instruments, sync_funding_stream, validate_catalog_scope
-from nautilus_quant.sync import funding_events, sync_bar_stream
+from nautilus_quant.sync import funding_events, legacy_funding_events, sync_bar_stream
 
 
 class FakeClient:
@@ -298,8 +298,8 @@ class SyncTests(unittest.TestCase):
 
     def test_funding_gap_over_eight_hours_is_rejected(self):
         rows = [
-            {"fundingTime": 0, "fundingRate": "0.0001"},
-            {"fundingTime": 9 * 60 * 60 * 1000, "fundingRate": "0.0002"},
+            {"fundingTime": 0, "fundingRate": "0.0001", "markPrice": "1000"},
+            {"fundingTime": 9 * 60 * 60 * 1000, "fundingRate": "0.0002", "markPrice": "1000"},
         ]
         with self.assertRaisesRegex(ValueError, "interval"):
             funding_events("BTCUSDT-PERP.BINANCE", rows)
@@ -398,7 +398,7 @@ class SyncTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             store = FundingJsonStore(Path(tmp) / "funding.jsonl")
-            store.append(funding_events(instrument_id, [
+            store.append(legacy_funding_events(instrument_id, [
                 {"fundingTime": 0, "fundingRate": "0.0001"},
                 {"fundingTime": interval_ms, "fundingRate": "0.0002"},
             ]))
@@ -414,16 +414,35 @@ class SyncTests(unittest.TestCase):
                 )
             self.assertEqual(store.load(), before)
 
-    def test_funding_rows_become_native_events_with_next_timestamp(self):
+    def test_each_funding_rate_settles_once_at_its_own_boundary(self):
         rows = [
-            {"fundingTime": 0, "fundingRate": "0.0001"},
-            {"fundingTime": 4 * 60 * 60_000, "fundingRate": "0.0002"},
+            {
+                "fundingTime": 8 * 60 * 60_000,
+                "fundingRate": "0.0001",
+                "markPrice": "1000.00",
+                "rateType": "Regular",
+            },
+            {
+                "fundingTime": 16 * 60 * 60_000,
+                "fundingRate": "-0.0002",
+                "markPrice": "2000.00",
+                "rateType": "Regular",
+            },
         ]
         events = funding_events("BTCUSDT-PERP.BINANCE", rows)
-        self.assertEqual(events[0].interval, 240)
-        self.assertEqual(events[0].next_funding_ns, events[1].ts_event)
-        self.assertIsNone(events[1].interval)
-        self.assertIsNone(events[1].next_funding_ns)
+        self.assertEqual([event.rate for event in events], [Decimal("0.0001"), Decimal("-0.0002")])
+        self.assertEqual(
+            [event.next_funding_ns for event in events],
+            [event.ts_event for event in events],
+            "Binance fundingTime is this row's settlement boundary; a rate must not shift to the next row",
+        )
+
+    def test_funding_row_without_settlement_mark_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "markPrice"):
+            funding_events(
+                "BTCUSDT-PERP.BINANCE",
+                [{"fundingTime": 8 * 60 * 60_000, "fundingRate": "0.0001"}],
+            )
 
 
 if __name__ == "__main__":

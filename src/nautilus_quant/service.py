@@ -25,8 +25,8 @@ from .nautilus_io import FundingJsonStore, bar_type_string, make_index_instrumen
 from .sync import (
     FUNDING_MINUTE_NS,
     MAX_FUNDING_INTERVAL_MINUTES,
-    funding_events,
     funding_interval_minutes,
+    legacy_funding_events,
     sync_bar_stream,
 )
 from .timebound import align_start, interval_millis, target_end, to_millis
@@ -198,7 +198,7 @@ def sync_funding_stream(
         if not valid_head:
             kind = "head" if last_ns is None else "API"
             raise ValueError(f"funding {kind} gap for {symbol}: expected {cursor}, got {rows[0]['fundingTime']}")
-    events = funding_events(instrument_id, rows)
+    events = legacy_funding_events(instrument_id, rows)
     written = store.append(events)
     actual_last = _validated_funding_tail(store, instrument_id, start_ms)
     if events and actual_last != events[-1].ts_event:

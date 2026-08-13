@@ -1,4 +1,4 @@
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -32,6 +32,92 @@ def write_valid_config(project: Path) -> Path:
 
 
 class CliTests(unittest.TestCase):
+    def test_migrate_funding_observations_uses_data_sync_lock_and_config_boundaries(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw.update({"datasets": ["trade", "funding"], "symbols": ["BTCUSDT", "ETHUSDT"]})
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            locks = []
+
+            @contextmanager
+            def recording_lock(path: Path):
+                locks.append(path)
+                yield
+
+            output = StringIO()
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.cli.single_writer", side_effect=recording_lock),
+                patch("nautilus_quant.cli.BinancePublicClient") as client,
+                patch(
+                    "nautilus_quant.cli.migrate_funding_observations",
+                    return_value={"status": "READY", "schema_version": 1},
+                ) as migrate,
+                redirect_stdout(output),
+            ):
+                result = main([
+                    "migrate-funding-observations",
+                    "--config",
+                    str(config),
+                    "--now",
+                    "2021-01-02T00:00:00Z",
+                ])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(locks, [project.resolve() / "var/locks/data-sync.lock"])
+            migrate.assert_called_once_with(
+                client=client.return_value,
+                funding_path=(project / "data/funding").resolve(),
+                symbols=("BTCUSDT", "ETHUSDT"),
+                start_ms=1_609_459_200_000,
+                end_ms=1_609_545_600_000,
+            )
+            self.assertEqual(json.loads(output.getvalue())["status"], "READY")
+
+    def test_candidate_funding_sync_uses_data_sync_lock_without_live_cutover(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw.update({"datasets": ["trade", "funding"], "symbols": ["BTCUSDT"]})
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            locks = []
+
+            @contextmanager
+            def recording_lock(path: Path):
+                locks.append(path)
+                yield
+
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.cli.single_writer", side_effect=recording_lock),
+                patch("nautilus_quant.cli.BinancePublicClient") as client,
+                patch(
+                    "nautilus_quant.cli.sync_funding_generation",
+                    return_value={"status": "READY", "schema_version": 1},
+                ) as candidate_sync,
+                redirect_stdout(StringIO()),
+            ):
+                result = main([
+                    "sync-funding-observations-candidate",
+                    "--config",
+                    str(config),
+                    "--now",
+                    "2021-01-02T00:00:00Z",
+                ])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(locks, [project.resolve() / "var/locks/data-sync.lock"])
+            candidate_sync.assert_called_once_with(
+                client=client.return_value,
+                funding_path=(project / "data/funding").resolve(),
+                symbols=("BTCUSDT",),
+                start_ms=1_609_459_200_000,
+                end_ms=1_609_545_600_000,
+            )
+
     def test_failure_report_retains_read_back_reconstruction_across_resume(self):
         with TemporaryDirectory() as tmp:
             project = Path(tmp)

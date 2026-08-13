@@ -10,7 +10,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 
 from nautilus_quant.config import MarketDataConfig
 from nautilus_quant.nautilus_io import FundingJsonStore, make_bar
-from nautilus_quant.sync import funding_events
+from nautilus_quant.sync import legacy_funding_events
 from scripts.verify_smoke import verify_config
 
 
@@ -135,7 +135,7 @@ class VerifySmokeTests(unittest.TestCase):
                     for timestamp in range(start_ms, end_ms, 8 * 60 * 60_000)
                 ]
                 FundingJsonStore(config.funding_path / f"{symbol}-PERP.BINANCE.jsonl").append(
-                    funding_events(f"{symbol}-PERP.BINANCE", funding_rows),
+                    legacy_funding_events(f"{symbol}-PERP.BINANCE", funding_rows),
                 )
             bars_by_type = {}
             for bar in bars:
