@@ -5,18 +5,21 @@
 
 獨立、deterministic 的 Binance USD-M Futures 資料核心，使用 NautilusTrader `2.0.0rc2`。
 
-## Hybrid pilot 邊界
+## PyBroker 策略發源地
 
-已批准的 Stage 0 只封存基線、架構／legal contract，並修整 Nautilus 的資料與帳務裁判席；目前不安裝 PyBroker，也不建立 research runtime，亦不構成 Stage 1 授權。
+PyBroker 導入為隔離的上游策略研究前端：唯讀使用既有市場資料，實跑研究策略並輸出純資料 candidate；NautilusTrader 保持 canonical data、正式回測、fills、fees、Funding、positions、PnL 與 accounting 的唯一真值。
 
-- Root runtime 維持 Python 3.13 + NautilusTrader；canonical data、權威回測、fills、fees、funding、positions、PnL 與 accounting 只以 Nautilus 為真值。
-- 後續另行批准時，PyBroker 只存在於隔離的 Python 3.12 research environment，負責 provisional ML／walk-forward screening 與候選排序，不得讀寫 canonical catalog、持有 credentials／訂單，或淘汰第一輪候選。
-- 兩側只可透過零框架依賴的 Strategy Core 與不可變 Candidate Capsule 交換資料，不共享 framework object、cache、pickle 或帳本。
-- 第一輪最多驗證到 `nautilus_reproduced`；Shadow、Testnet、live 不在本輪授權範圍。
+- PyBroker 只存在於獨立 `research/` environment，不加入正式 root runtime。
+- Research 不改寫 canonical catalog／Funding、不持有 credentials 或訂單權限。
+- Candidate 是 canonical JSON，不含 framework object、cache、pickle 或可執行 payload。
+- PyBroker 結果一律是 provisional；Shadow、Testnet 與 live 不在本次範圍。
+- 既有 FundingObservation 修正已完成，不再作為研究前端導入的等待條件。
 
-完整責任邊界與 capsule contract 見 [`docs/architecture/hybrid-pybroker-nautilus.md`](docs/architecture/hybrid-pybroker-nautilus.md) 與 [`docs/contracts/candidate-capsule-v1.md`](docs/contracts/candidate-capsule-v1.md)。
+最小導入計畫、責任邊界與 candidate contract：
 
-Stage 0 的本機 evidence 固定寫入 ignored `var/reports/pybroker-adoption/stage-0/`。本文件卡完成時只可回報：`P0-01 done；Stage 0 尚未完成；整體專案尚未完成。`
+- [`docs/plans/pybroker-nautilus-adoption.md`](docs/plans/pybroker-nautilus-adoption.md)
+- [`docs/architecture/hybrid-pybroker-nautilus.md`](docs/architecture/hybrid-pybroker-nautilus.md)
+- [`docs/contracts/pybroker-candidate-v1.md`](docs/contracts/pybroker-candidate-v1.md)
 
 ## 範圍
 
@@ -42,9 +45,9 @@ Stage 0 的本機 evidence 固定寫入 ignored `var/reports/pybroker-adoption/s
 | 來源 | Nautilus 表示 |
 |---|---|
 | trade klines | perpetual instrument 的 `Bar/LAST` |
-| funding | 原生 `FundingRateUpdate` JSONL event store |
+| funding | versioned canonical `FundingObservation` v1 store |
 
-`ParquetDataCatalog` 保存 instruments 與 bars。`2.0.0rc2` 尚無公開 funding Parquet writer，因此 funding 暫以 `FundingRateUpdate.to_json()` 原子檔保存；程式中的 `ponytail:` 註解標出未來可直接換回 Catalog 的位置。
+`ParquetDataCatalog` 保存 instruments 與 bars。Funding 以版本化 generation、ready pointer 與 canonical JSONL 保存；每列保留自己的 funding time、rate、truth status，以及官方資料存在時的 settlement mark price。舊 `FundingRateUpdate` JSONL 只保留作短期 rollback evidence，不再是正式 reader／writer。
 
 ## 安裝與測試
 
@@ -93,7 +96,7 @@ uv sync --dev
 
 維護者機器已安裝 `ai.nautilus.quant.data-sync` LaunchAgent；它在 `RunAtLoad` 與本機每日 `10:15` 執行正式 `config/market_data.json`，核心資料同步不需要 Hermes 存活。Launchd stdout／stderr 位於 `~/Library/Logs/NautilusQuant/`，domain run evidence 仍原子寫入 ignored `var/runs/`。
 
-本次上線已驗證 RunAtLoad 與立即重跑皆退出 `0`、最新 report 為 `PASS`，且相同 D-1 的 instrument、28 條 bar stream 與 4 條 funding stream 寫入量全為 `0`。註冊成功本身不算完成；首個自然 `10:15` calendar slot 仍須依 Runbook 以 `runs`、`last exit code` 與新 report 讀回驗證。
+本次上線已驗證 RunAtLoad、自然 `10:15` calendar slot 與立即重跑皆可完成；最新健康狀態仍以 `nautilus-data status`、launchctl exit code 與 `var/runs/` readback 為準。PyBroker 研究前端不修改或重驗此 OS 排程。
 
 安裝／重載、Removable Volumes 權限、failure recovery 與 evidence 檢查見 [`ops/RUNBOOK.md`](ops/RUNBOOK.md)。
 

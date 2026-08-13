@@ -1,79 +1,53 @@
-# PyBroker × NautilusTrader Hybrid 邊界
+# PyBroker × NautilusTrader 責任邊界
 
 ## 決策
 
-本專案採用 Nautilus-first 的雙環境架構。PyBroker 若在後續 Stage 獲准，只能作為可移除的上游 research adapter；NautilusTrader 保持 canonical data、權威回測、帳務、風控與 execution 的唯一真值。
+PyBroker 是可移除的上游策略研究前端；NautilusTrader 保持 canonical data、正式回測、成交、費用、Funding、部位、帳務與未來 execution 的唯一真值。
 
-目前只批准 Stage 0。此階段不安裝 PyBroker、不建立 research runtime，也不接 Shadow、Testnet 或 live。
+```text
+Nautilus canonical bars（唯讀）
+        ↓
+PyBroker research：研究、試跑、候選產生
+        ↓
+純資料 candidate
+        ↓
+NautilusTrader：後續正式驗證
+```
 
-## Stage 0 文件契約
-
-- **Objective：** 先固定 Hybrid、license 與資料交換邊界，避免後續工作把 PyBroker 擴進 Nautilus runtime。
-- **In scope：** 本架構文件、Candidate Capsule contract、第三方 notice 與 README 摘要。
-- **Out of scope：** runtime code、依賴安裝、排程／服務變更、research environment，以及任何 Stage 1 以上工作。
-- **Evidence path：** 本機驗證證據固定寫入 ignored `var/reports/pybroker-adoption/stage-0/`；source 變更另以 Git commit、push 與遠端讀回為準。
-- **Authorization：** 本文件只封存 Stage 0 邊界；Stage 0 通過也不自動授權 Stage 1。
-
-本文件卡的固定完成措辭為：`P0-01 done；Stage 0 尚未完成；整體專案尚未完成。`
+這是責任分工，不是逐階段授權鏈。既有 FundingObservation 修正已完成，不再阻擋 PyBroker 研究前端導入。
 
 ## 執行環境
 
-| 環境 | 責任 | 禁止事項 |
+| 環境 | 責任 | 邊界 |
 |---|---|---|
-| Root runtime（Python 3.13） | Binance 公開資料、Nautilus replay、帳務與 deterministic gates | 不安裝 PyBroker、pandas、NumPy 或 scikit-learn；不接受 provisional metrics 當正式績效 |
-| Research（未建立；規劃 Python 3.12） | 未來的 ML、walk-forward、provisional screening 與候選排序 | 不讀或改 canonical catalog；不持有憑證、交易權限或訂單指令；不得淘汰第一輪候選 |
+| Root runtime | 資料同步、canonical storage、Nautilus 正式驗證 | 不加入 PyBroker；不接受 provisional metrics 當正式績效 |
+| `research/` | PyBroker 策略研究與 candidate 產生 | 唯讀市場資料；無憑證、訂單、Testnet 或 live 權限 |
 
-兩側未來只共享零框架依賴的 Strategy Core 與不可變 Candidate Capsule。不得共享 framework 內部物件、cache、pickle、帳本或 credentials。Hermes、LLM 或 research process 故障時，既有 Nautilus 資料同步仍須獨立運作。
+刪除 `research/` 必須不影響 root runtime 或每日資料同步。兩側不共享 framework object、cache、pickle、帳本或 credentials。
 
 ## Domain ownership
 
-| Domain | 唯一 owner | Research 權限 |
-|---|---|---|
-| Binance public ingestion、D-1 completeness | Nautilus data foundation | 只讀已匯出的 immutable snapshot |
-| Canonical bars 與 funding | Nautilus data foundation | 不得改寫 |
-| Feature、model、policy 定義 | Framework-neutral Strategy Core | 只可透過有測試的 Git 變更 |
-| Training、walk-forward、screening | PyBroker research adapter | 輸出一律 provisional |
-| Candidate payload 與 provenance | Candidate Capsule contract | 只能新建，不可覆寫 |
-| Feature、prediction、intent correctness | Deterministic verifier | 自評不算 gate evidence |
-| Fills、fees、funding、positions、PnL、accounting | NautilusTrader | 無改寫權 |
-| Risk、sizing、leverage、reduce-only、TIF | Nautilus runtime | 無改寫權 |
-| Testnet/live credentials | Nautilus runtime（本輪不建立） | 絕對不可存取 |
+| Domain | Owner |
+|---|---|
+| Binance public ingestion、D-1 completeness、canonical bars／Funding | Nautilus data foundation |
+| 策略研究、PyBroker execution、provisional screening | PyBroker research frontend |
+| Candidate 格式與來源識別 | 純資料 contract |
+| Fills、fees、Funding、positions、PnL、accounting | NautilusTrader |
+| Risk、sizing、OMS、execution、credentials | Nautilus runtime；本次不修改 |
 
-## Strategy Contract v1
+## Candidate 邊界
 
-未來的 Strategy Core 只提供三個純函式語意：
+第一版 candidate 只需符合 [`pybroker-candidate-v1.md`](../contracts/pybroker-candidate-v1.md)：普通 canonical JSON、可由 Python stdlib 讀取、不含程式碼或可執行序列化。它表達「研究前端提出了什麼」，不宣稱 Nautilus 已驗證，也不攜帶正式帳務結果。
 
-```text
-features(history, spec) -> feature vector or none
-predict(model, features) -> score
-policy(score, previous_intent, spec) -> LONG or FLAT
-```
+## 永久紅線
 
-它不得 import PyBroker、NautilusTrader、pandas、NumPy，亦不得執行網路或檔案 I/O。Feature 只能使用 decision timestamp 當下可得的資料；不足 warmup 時不產生結果；NaN、Inf、重複 feature 或未知 model type 一律拒絕。Policy 只輸出 target intent，不建立 order，也不決定 quantity、leverage 或 TIF。
+- PyBroker 不改寫 canonical catalog、Funding store 或同步狀態。
+- PyBroker 不持有 API key、交易權限或訂單指令。
+- PyBroker 輸出一律標記 provisional。
+- Candidate 不含 pickle、joblib、import path 或 framework object。
+- Shadow、Testnet、live 與商業化不在本次導入範圍。
+- Hermes、LLM 或 research environment 故障不得影響既有資料同步。
 
-## Candidate 與 promotion
+## 何時才擴充
 
-Candidate 必須符合 [`candidate-capsule-v1.md`](../contracts/candidate-capsule-v1.md)：只含 canonical JSON/JSONL 資料與 provenance，不含程式碼、import path、cache 或可執行序列化。
-
-第一輪 lifecycle 最多自動到：
-
-```text
-candidate -> verified -> nautilus_reproduced
-```
-
-`shadow`、`testnet`、`live_candidate` 與 `live` 不在本輪授權範圍。任何 candidate 可轉為 `retired`。Promotion 只能依 deterministic evidence；LLM 文字、PyBroker metrics 或呼叫者自報 `passed=true` 均不能跳 gate。
-
-## 永久紅線與 AI Agent 邊界
-
-Agent 可提出 hypothesis、修改有測試的 Strategy Core、執行隔離研究、建立 capsule、驗證並要求 Nautilus replay。Agent 不得：
-
-- 改寫 canonical catalog、funding、snapshot、帳務或 gate evidence；
-- 刪除失敗 experiment、holdout usage 或 state events；
-- 推進 dirty／uncommitted candidate；
-- 載入外來 pickle、joblib 或 cache；
-- 取得交易憑證或將 LLM 輸出直接作為 signal／order；
-- 自動推進至 Shadow、Testnet 或 live。
-
-## 停損與移除
-
-任一 Stage 的 correctness、causality、accounting 或 reproducibility gate 失敗即停，不放寬容差或人工補 PnL。若 pilot 未量測到研究效率改善，移除 research adapter，不保留相容層，也不影響 Nautilus data/runtime。
+只有實測出現需求，才考慮多檔 capsule、immutable snapshot service、cross-framework parity、promotion state machine、sealed holdout、批量 benchmark 或研究 Dashboard；它們不是第一條縱切的前置條件。

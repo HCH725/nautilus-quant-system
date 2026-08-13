@@ -26,7 +26,7 @@ This repository is not affiliated with, maintained by, sponsored by, or endorsed
 - License: **Apache License 2.0 with Commons Clause**
 - Upstream license text: <https://github.com/edtechre/pybroker/blob/master/LICENSE>
 
-PyBroker is not a dependency of the current Nautilus runtime. Stage 0 only records this legal and architectural boundary; it does not install or redistribute PyBroker and does not authorize Stage 1. A later, separately approved stage may use it only in an isolated internal research environment for provisional screening and candidate ranking. This approval does not cover paid hosting, consulting, commercialization, Testnet, or live trading; those uses require separate legal and operational review. PyBroker output is not the authoritative source for portfolio accounting, fees, funding, fills, or trading decisions.
+PyBroker is not a dependency of the Nautilus runtime. This repository may use the pinned package only in an isolated internal research environment for provisional strategy research and candidate generation. PyBroker output is not authoritative for portfolio accounting, fees, funding, fills, or trading decisions. Paid hosting, consulting, commercialization, Testnet, or live trading require separate legal and operational review.
 
 ## Binance
 
