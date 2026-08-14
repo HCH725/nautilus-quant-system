@@ -39,13 +39,13 @@ NautilusTrader：後續正式驗證
 
 第一版 candidate 只需符合 [`pybroker-candidate-v1.md`](../contracts/pybroker-candidate-v1.md)：普通 canonical JSON、可由 Python stdlib 讀取、不含程式碼或可執行序列化。它表達「研究前端提出了什麼」，不宣稱 Nautilus 已驗證，也不攜帶正式帳務結果。
 
-## 永久紅線
+## 永久紅線與 v1 範圍邊界
 
 - PyBroker 不改寫 canonical catalog、Funding store 或同步狀態。
 - PyBroker 不持有 API key、交易權限或訂單指令。
 - PyBroker 輸出一律標記 provisional。
 - Candidate 不含 pickle、joblib、import path 或 framework object。
-- Shadow、Testnet、live 與商業化不在本次導入範圍。
+- Shadow、Paper、Binance Demo／Testnet、live 與商業化不在 **v1 導入實作範圍**；其中 Paper 與 Demo／Testnet 是未來 trading-eligible 候選的必要驗證層，長期模型見 [`strategy-loop-operating-model.md`](strategy-loop-operating-model.md)。
 - Hermes、LLM 或 research environment 故障不得影響既有資料同步。
 
 ## 何時才擴充

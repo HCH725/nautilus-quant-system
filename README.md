@@ -7,24 +7,28 @@
 
 ## PyBroker 策略發源地
 
-PyBroker 導入為隔離的上游策略研究前端：唯讀使用既有市場資料，實跑研究策略並輸出純資料 candidate；NautilusTrader 保持 canonical data、正式回測、fills、fees、Funding、positions、PnL 與 accounting 的唯一真值。
+PyBroker 是隔離的上游策略研究前端：唯讀使用既有市場資料，實跑研究策略並輸出純資料 candidate；NautilusTrader 保持 canonical data、正式回測、fills、fees、Funding、positions、PnL 與 accounting 的唯一真值。
 
 - PyBroker 只存在於獨立 `research/` environment，不加入正式 root runtime。
 - Research 不改寫 canonical catalog／Funding、不持有 credentials 或訂單權限。
 - Candidate 是 canonical JSON，不含 framework object、cache、pickle 或可執行 payload。
-- PyBroker 結果一律是 provisional；Shadow、Testnet 與 live 不在本次範圍。
-- 既有 FundingObservation 修正已完成，不再作為研究前端導入的等待條件。
+- PyBroker 結果一律是 provisional；Shadow、Paper、Binance Demo／Testnet 與 live 不在 v1 實作範圍。
+- V1 已實跑 Hermes hypothesis → PyBroker → Nautilus historical verdict → Hermes child hypothesis，並將 lineage、成功與失敗寫入 append-only SQLite ledger。
+- 長期操作模型允許 Hermes 自主新增 strategy family／公式，並要求 trading-eligible 候選通過 Paper 與 Binance Demo／Testnet；Live 仍是獨立授權。
 
-最小導入計畫、責任邊界與 candidate contract：
+計畫、責任邊界與 contracts：
 
 - [`docs/plans/pybroker-nautilus-adoption.md`](docs/plans/pybroker-nautilus-adoption.md)
+- [`docs/plans/2026-08-14-strategy-loop-v1.md`](docs/plans/2026-08-14-strategy-loop-v1.md)
 - [`docs/architecture/hybrid-pybroker-nautilus.md`](docs/architecture/hybrid-pybroker-nautilus.md)
+- [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)
 - [`docs/contracts/pybroker-candidate-v1.md`](docs/contracts/pybroker-candidate-v1.md)
+- [`docs/contracts/strategy-loop-v1.md`](docs/contracts/strategy-loop-v1.md)
 
 The isolated runner and lock-rebuild commands are in
-[`research/README.md`](research/README.md). Generated candidates stay under
-ignored `var/`; root code only provides a strict stdlib candidate parser for
-later Nautilus validation.
+[`research/README.md`](research/README.md). Runtime candidates, verdicts, and
+ledger state stay under ignored `var/`; the root `nautilus-research` CLI owns
+formal historical Nautilus evaluation, feedback, reuse, and funnel projection.
 
 ## 範圍
 
@@ -107,7 +111,7 @@ uv sync --dev
 
 ## 安全邊界
 
-目前只有 data foundation，沒有策略、execution client、API key 或真實資金路徑。安裝與資料 smoke 通過不代表 production trading ready。
+目前已有隔離的 PyBroker → Nautilus 歷史策略閉環，但尚無 shared live Strategy、Paper／Demo execution client、API key 或真實資金路徑。資料 smoke、歷史閉環或模擬環境通過都不代表 production trading ready；長期驗證與自主權邊界見 [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)。
 
 API key、token、憑證與個人資料不得寫入 repository；應放在受保護的環境檔或作業系統 Keychain，程式只讀環境變數。Repository 以三層降低誤傳風險：敏感檔 `.gitignore`、版本化的 pre-commit／pre-push fail-closed 掃描，以及 GitHub secret scanning／push protection。Clone 後啟用本機 hooks：
 
