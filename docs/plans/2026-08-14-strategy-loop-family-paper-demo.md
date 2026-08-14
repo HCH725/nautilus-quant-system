@@ -39,7 +39,7 @@ ledger verdict → Hermes bounded next action
 | Hypothesis | `strategy-hypothesis-v1` 只接受 `lookback-momentum-long-flat`、BTCUSDT 1H 與兩個固定參數 | 需 generic v2 + family version |
 | Ledger | `strategies` 固定欄位是 `lookback_bars` / `entry_threshold`；`stage_results` 只允許三個 historical stage | 需保留舊 row 與外鍵的 migration；不可 reset ledger |
 | Formula | momentum 公式內嵌在 `research/pybroker_research.py` | 需一份純 stdlib、historical/live 共用 kernel |
-| Candidate | `pybroker-candidate-v1` 已允許任意 plain-JSON 參數，但 intent 僅 LONG/FLAT | LONG/FLAT family 可沿用；只有要 SHORT／更豐富 intent 時才升 v2 |
+| Candidate | `pybroker-candidate-v1` 只保存 `intent`／`score`／`ts_event_ns`；Nautilus 回放還會丟掉 score | v1 必須持續可讀；所有新 experiment 改寫 v2，補 signal identity、reason、target intent 與 family/kernel version |
 | Campaign | 一次 CLI 只跑一個 hypothesis | 需 deterministic campaign expander、budget、dedupe、cohort summary |
 | PyBroker screen | 現在只驗 candidate 結構與 hash，合法就 `PASSED` | 需預先釘住的 provisional metrics 與 rejection policy |
 | Historical evaluator | Nautilus 真正負責 fills、fees、Funding、positions、accounting | 沿用；補 bounded window／stress 輸入 |
@@ -117,33 +117,41 @@ RED tests
 - Create: `src/nautilus_quant/strategy_families.py`
 - Create: `tests/test_strategy_families.py`
 - Create: `docs/contracts/strategy-hypothesis-v2.md`
+- Create: `docs/contracts/pybroker-candidate-v2.md`
 - Modify: `src/nautilus_quant/strategy_lab.py`
 - Modify: `tests/test_strategy_lab.py`
+- Modify: `src/nautilus_quant/pybroker_candidate.py`
+- Modify: `tests/test_pybroker_candidate.py`
+- Modify: `src/nautilus_quant/candidate_backtest.py`
+- Modify: `tests/test_candidate_backtest.py`
 - Modify: `research/pybroker_research.py`
 - Modify: `research/test_pybroker_research.py`
 
 ### 實作順序
 
-1. **先寫 RED golden-vector tests**：同一組 closed OHLCV bars + family version + parameters，root 與 research 必須得到相同 timestamp、score、LONG/FLAT intent、reason。
+1. **先寫 RED golden-vector tests**：同一組 closed OHLCV bars + family version + parameters，batch、incremental、root 與 research 必須得到相同 timestamp、score、target intent、reason 與 signal ID。
 2. 建立純 stdlib 的最小 kernel：
    - `ClosedBar`；
    - `FamilyDecision`；
    - 小型 tracked registry；
    - 每個 family 明確的 `version`、warm-up、parameter validator 與 evaluator。
-3. 把現有 `lookback-momentum-long-flat` 原樣搬入 kernel；此卡先證明 parity，不趁機改公式。
+3. Kernel 只能由 completed bars 產生 position/order-independent 的 target decision；現有 callback 的 `ctx.long_pos()`、持倉轉移、quantity 與 order mapping 留在外層 runtime。把 `lookback-momentum-long-flat` 原樣搬入 kernel；此卡先證明 parity，不趁機改公式。
 4. Research runtime 直接從 repo `src/` 載入這個純模組，不把 Nautilus dependency 加進 Python 3.12 research lock；repo-local path shortcut 要加 `ponytail:` ceiling 註解與 import-boundary test。
 5. 新增 canonical `strategy-hypothesis-v2`：含 `family_version`、任意 plain-JSON parameters、approved instrument／bar type、thesis、falsification 與 lineage；新 v2 strategy ID 必須包含 family version。
-6. `pybroker-candidate-v1` 保持不變，只要 intent 仍是 LONG/FLAT。
-7. 先用 copied legacy ledger 寫 migration RED test，再在單一 transaction 內把固定 strategy parameter 欄位遷成 canonical `parameters_json` + `family_version` + `identity_schema`；完整保留 v1 strategy／hypothesis／experiment／verdict／stage／error row 與外鍵。既有 row 標為 `strategy-id-v1` 並保留原 ID；只有新 row 使用包含 family version 的 `strategy-id-v2`，不得為了統一格式重算歷史 lineage。
-8. Migration 前後做 row count、content ID、foreign-key、artifact hash 與 append-only trigger readback；任何不一致必須 rollback，禁止清空 `var/strategy-loop`。
+6. 加 schema-dispatch loader：既有 `pybroker-candidate-v1` bytes、ID 與 artifact 保持可讀；新 `pybroker-candidate-v2` 每筆 signal 必含 `signal_id`、`reason`、`score`、`target_intent`、`ts_event_ns`、family/kernel version。Nautilus historical path 必須保留並驗證這些 canonical signal fields，不得再忽略 score。
+7. 把 kernel version 納入 `_engine_identity`；補 duplicate bar、save/load、restart 後零 duplicate signal 的 RED tests，證明 batch 與 incremental 路徑一致。
+8. 先用 copied legacy ledger 寫 migration RED test，再在單一 transaction 內把固定 strategy parameter 欄位遷成 canonical `parameters_json` + `family_version` + `identity_schema`；完整保留 v1 strategy／hypothesis／experiment／verdict／stage／error row 與外鍵。既有 row 標為 `strategy-id-v1` 並保留原 ID；只有新 row 使用包含 family version 的 `strategy-id-v2`，不得為了統一格式重算歷史 lineage。
+9. 新 `experiment-id-v2` 至少包含 strategy、data、engine、`screen_policy_id` 與 `evaluation_context_id`；evaluation context 表示 tier、window 與 policy，避免同策略在不同評估切片誤用舊 verdict。Campaign membership 不屬於 execution identity。
+10. Migration 前後做 row count、content ID、foreign-key、artifact hash 與 append-only trigger readback；任何不一致必須 rollback，禁止清空 `var/strategy-loop`。
 
 ### 驗收
 
 - 舊 v1 hypothesis 仍可讀、舊 ledger row 全數保留。
 - v2 可註冊不同 parameter shape 的第二個測試 family。
-- 同 bars 下 research/root kernel bytes 完全一致。
+- 同 bars 下 batch／incremental／research／root kernel bytes 完全一致；duplicate bar、save/load 與 restart 不產生重複 signal。
 - Registry test 固定 family version + golden vectors；formula 行為變更必須同步 bump version，read-only audit 以 diff 拒絕「只改 expected output、不改 version」。
-- Candidate v1 validator 與既有 H0/H1 artifact 仍可讀。
+- Candidate v1 validator 與既有 H0/H1 artifact 仍可讀；所有新 candidate v2 signal 欄位完整且 Nautilus replay 不丟欄位。
+- Kernel version、screen policy 與 evaluation context 變更都會改新 experiment identity；campaign 分組變更本身不會改 execution identity。
 - 無新 runtime dependency。
 
 ### 停止線
@@ -169,21 +177,23 @@ RED tests
 
 ### 實作順序
 
-1. 定義 canonical `strategy-campaign-v1`：family/version、approved instruments/bar types、deterministic parameter values、seed、data-as-of、maximum candidates、screen policy ID。
-2. 用 stdlib `itertools.product` 依 canonical 順序展開；在讀資料或啟 subprocess 前先 budget check、content-ID dedupe 與 ledger reuse。
-3. PyBroker result 增加有限且 finite 的 provisional metrics：至少 trade count、signal count、total return、max drawdown；必要時從 positions/orders 直接導出 turnover／exposure，但不複製完整 dataframe。
-4. `strategy_research_policy.json` 在看 campaign 結果前釘住最低活動量、最大 provisional drawdown、turnover 上限與 no-signal rejection；policy hash 進 experiment identity。
-5. `Research screened` 必須能真實 `PASSED` 或 `REJECTED`，不能再只做結構驗證。
-6. 產生 bounded cohort summary：survivors、top reason codes、policy/data IDs、每個 family 的進出數；不把 PyBroker PnL寫成正式績效。
+1. 先新增 `research-result-v2`，只保存有限且 finite 的 provisional metrics：至少 trade count、signal count、total return、max drawdown；必要時從 positions/orders 直接導出 turnover／exposure，但不複製完整 dataframe。
+2. `strategy_research_policy.json` 在看結果前釘住最低活動量、最大 provisional drawdown、turnover 上限與 no-signal rejection；policy hash 與 `screen_policy_id` 進 evaluation context／experiment identity。
+3. 先用**單一 hypothesis**證明 `Research screened` 能真實 `PASSED` 或 `REJECTED`；被拒絕者不可進入 Nautilus historical。這個 screen vertical slice 未通過前，不得擴成 campaign。
+4. 再定義 canonical `strategy-campaign-v1`：family/version、approved instruments/bar types、deterministic parameter values、seed、data-as-of、maximum candidates、screen policy ID。
+5. 用 stdlib `itertools.product` 依 canonical 順序展開；在讀資料或啟 subprocess 前先 budget check、content-ID dedupe 與 ledger reuse。
+6. Campaign ID 與 cohort membership 寫進獨立 membership table；不能混進相同 execution semantics 的 experiment identity。產生 bounded cohort summary：survivors、top reason codes、policy/data IDs、每個 family 的進出數；不把 PyBroker PnL 寫成正式績效。
 7. 此卡最後由小蒨自主建立一個**新的 tracked family/formula 作為機制證明**：先寫 thesis、falsification、golden vectors 和 family version，再放進 campaign；不能先看 campaign 結果才補公式理由。
-8. 寫 canonical `loop-action-v1` artifact；Hermes 在 cohort boundary 只能選 `MUTATE`、`NEW_FAMILY`、`KILL` 或 `ADVANCE`，並記錄 changed dimension。
+8. 此卡只記錄 screen reason codes 與 campaign membership；canonical `strategy-action-v1` 延後到 Card 3，等 robustness evidence 完整後才允許 `ADVANCE`。
 
 ### 驗收
 
 - 同 campaign spec 重跑得到相同 expansion IDs，沒有重複 experiment。
 - 超出 budget 在任何研究 process 啟動前 fail closed。
 - Screen threshold 改動會改 policy/experiment identity。
+- 同一 execution semantics 放入不同 campaign 只新增 membership，不重算 experiment identity。
 - 至少一個合法但無活動或違反 screen policy 的 candidate 真實被 `REJECTED`。
+- 被 screen 拒絕的 candidate 沒有 Nautilus historical experiment。
 - 新 family 與既有 momentum 都使用同一 registry/kernel。
 - 一個 campaign 只交給 Hermes 一份 bounded summary。
 
@@ -203,6 +213,9 @@ RED tests
 - Create: `tests/test_strategy_robustness.py`
 - Create: `config/strategy_robustness_policy.json`
 - Create: `docs/contracts/strategy-robustness-v1.md`
+- Create: `docs/contracts/nautilus-verdict-v2.md`
+- Create: `docs/contracts/strategy-feedback-v2.md`
+- Create: `docs/contracts/strategy-action-v1.md`
 - Modify: `src/nautilus_quant/candidate_backtest.py`
 - Modify: `tests/test_candidate_backtest.py`
 - Modify: `src/nautilus_quant/strategy_lab.py`
@@ -210,20 +223,22 @@ RED tests
 
 ### 實作順序
 
-1. 先寫 window generator RED tests：UTC boundaries、無倒序、無未完成 bar、每個 window 有 immutable ID；data-as-of 之後的資料永遠不可讀。
+1. 先寫 window generator RED tests：UTC boundaries、無倒序、無未完成 bar、每個 window 有 immutable `evaluation_context_id`；data-as-of 之後的資料永遠不可讀。
 2. 讓 `CandidateBacktestRequest` 接受明確 evaluation start/end 與 tracked cost policy，不改 candidate payload。
 3. 建立固定 robustness matrix：expanding／rolling windows、trend／range／high-volatility labels、fee/funding stress，以及經測試的 deterministic slippage-bps stress。Regime label 必須由預先定義的 deterministic rule 產生；若 rc2 無法在不繞過 Nautilus accounting 的情況下注入 slippage，該 stress 保持 `unmodeled` 並阻止 robustness PASS，不得用文字假裝已測。
 4. 每一格仍呼叫 Nautilus formal evaluator；PyBroker 不接管 fees、Funding、fills 或 accounting。
-5. 聚合 verdict 只保留 bounded metrics、worst window、reason codes、Funding truth、claimability 與 artifact hash。
-6. `Robustness passed` 從 ledger evidence 查詢，不再硬寫零。
-7. Economic fail → `MUTATE`／`NEW_FAMILY`／`KILL`；engine/data/runtime fail → `FIX_TECHNICAL`，且不污染 strategy attrition。
-8. 任何 strategy/family 變更都建立 child version，重新跑 historical + robustness；不可沿用舊 robustness verdict。
+5. 每個 historical／robustness verdict 使用 `nautilus-verdict-v2`／`strategy-feedback-v2`，綁定 strategy、candidate、evaluation context、policy、data、engine、reason codes 與 artifact hash；window、tier 或 policy 改變不得 reuse 舊 verdict。
+6. 聚合 verdict 只保留 bounded metrics、worst window、reason codes、Funding truth、claimability 與 artifact hash；`Robustness passed` 從 ledger evidence 查詢，不再硬寫零。
+7. Robustness 完整後才產生 canonical `strategy-action-v1`：至少包含 source verdict/tier、action、consumed reason codes、changed dimension、campaign/generation、child strategy ID。Technical fail 只能是 `FIX_TECHNICAL`；`ADVANCE` 必須綁定完整 robustness evidence。
+8. Economic fail → `MUTATE`／`NEW_FAMILY`／`KILL`；任何 strategy/family 變更都建立 child version，重新跑 historical + robustness；不可沿用舊 robustness verdict。A verdict → action → B hypothesis → B verdict 兩輪重跑必須得到相同 IDs 與順序。
 
 ### 驗收
 
 - 相同 policy/data/strategy 重跑完全 reuse，不膨脹 funnel。
 - Window 或 cost policy 變更會產生不同 experiment ID。
 - 至少一個 robustness rejection 與一個 technical failure 都被正確分類。
+- Technical fail 不會產生 mutation child；`ADVANCE` 缺任一 robustness evidence 時 fail closed。
+- Action artifact 可由 source verdict 完整追到 child hypothesis；相同輸入兩輪重跑不新增重複 lineage。
 - Funnel 第六級由真實 ledger stage 計算。
 - Verdict 明確寫出 historical data 已 inspected，不能自稱 sealed holdout 或 production evidence。
 
@@ -259,30 +274,36 @@ BinanceDataClientConfig(
     environment=BinanceEnvironment.LIVE,
 )
         ↓ production market data only
-LiveNode.builder(name, trader_id, Environment.SANDBOX)
-        ↓
-shared FamilyStrategy
-        ├─ SHADOW: canonical signal/order intent only
-        └─ PAPER: SandboxExecutionClientConfig simulated fills/account
+shared FamilyStrategy + canonical risk/order mapping
+        ├─ SHADOW NODE
+        │    └─ no execution client registered; signal/order-intent evidence only
+        └─ PAPER NODE
+             └─ SandboxExecutionClientConfig + active LiveRiskEngineConfig
+                  → simulated orders/fills/portfolio/account
 ```
 
 ### 實作順序
 
-1. `FamilyStrategy` 只吃 completed bars；維護 bounded warm-up window，呼叫 Card 1 kernel，產出 canonical `signal_id`、score、intent、reason。
-2. 同一 strategy class 支援 `SHADOW` 與 `PAPER`，不複製公式；mode 只決定是否把 intent 交給 risk/order mapping。
-3. 寫 synthetic event tests：warm-up、late/revised bar、gap、duplicate bar、restart、同 signal 不重送 order、flat idempotency、shutdown flatten policy。
-4. 寫 historical/live parity fixture：同 canonical bars 必須與 PyBroker signal identity 一致；fill 不要求一致。
-5. 先完成 bounded CLI smoke；只有 live data subscription、bar close、signal artifact、sandbox account/order readback都成功，才加一個原生 launchd plist 長跑。不得用 Hermes cron 承擔 trading runtime。
-6. Prospective cohort 從 strategy code + family version + parameters + policy 凍結之後開始；策略修改後舊 Paper 窗口作廢，新版本重新計時。
-7. Evidence 至少含：cohort start/end、completed/missing/revised bars、signal IDs、intent/order mapping、sandbox fills/fees/positions/account、restart/reconnect、duplicate suppression、technical/economic status、artifact hashes。
-8. Paper technical fail → `FIX_TECHNICAL`；修好後先重跑 parity，再為同 strategy logic 開新 prospective window。Paper economic fail → child/new family，完整重跑 historical + robustness + Paper。
+1. `FamilyStrategy` 只吃 completed bars；維護 bounded warm-up window，呼叫 Card 1 的 position/order-independent kernel，產出 canonical `signal_id`、score、target intent、reason。持倉轉移、quantity、risk 與 order mapping 只存在外層。
+2. 同一 strategy class 供 Shadow 與 Paper composition root 使用，不複製公式；Shadow **完全不註冊 execution client**，Paper 才註冊 sandbox execution 與 active risk engine。
+3. 寫 synthetic event tests：warm-up、late/revised bar、gap、duplicate bar、save/load、restart、同 signal 不重送 order、flat idempotency、shutdown flatten policy。
+4. 寫 historical/live parity fixture：同 canonical bars 的 batch/incremental/PyBroker/Nautilus signal identity 必須一致；fill 不要求一致。
+5. 新增 append-only `runtime_runs`／`runtime_verdicts`（或等價的同一深模組）：保存 strategy/family/kernel/runtime version、tier、environment、cohort、time range、data/risk/execution policy IDs、technical status、strategy outcome、reason codes與 artifact path/hash。不得用 `_hash_tree` 一次性靜態歷史 identity 表示持續到達的 live stream。
+6. 先以 Shadow 接收 1～2 根**未來到達**的 closed bars：orders cache 必須保持空，並把 live WebSocket closed-bar semantics 與 canonical REST ingestion 比對；Shadow 不產生 PnL claim。
+7. Paper 先跑 deterministic forced `LONG → FLAT` fixture，真實穿過 Strategy → Risk → Sandbox execution → order/fill events → portfolio/account；固定 max quantity/notional、balance、NETTING／MARGIN、fees、reduce-only 與 flatten-on-exit。這條縱切通過後才允許 prospective strategy cohort。
+8. 先完成 bounded CLI smoke；只有 live data subscription、bar close、signal artifact、sandbox account/order readback 都成功，才加一個原生 launchd plist 長跑。不得用 Hermes cron 承擔 trading runtime。
+9. Prospective cohort 從 strategy code + family version + kernel/runtime version + parameters + data/risk/execution policy 凍結之後開始；策略修改後舊 Paper 窗口作廢，新版本重新計時。
+10. Evidence 至少含：cohort start/end、completed/missing/revised bars、signal IDs、intent/order mapping、sandbox fills/fees/positions/account、restart/reconnect、duplicate suppression、technical/economic status、artifact hashes。
+11. Paper technical fail → `FIX_TECHNICAL`；修好後先重跑 parity，再為同 strategy logic 開新 prospective window。Paper economic fail → child/new family，完整重跑 historical + robustness + Paper。
 
 ### 驗收
 
-- LiveNode + production data + sandbox execution 真實啟動，不是 mock-only。
+- Shadow LiveNode 使用 production data 真實啟動，沒有 execution client、orders cache 全程為空，且 1～2 根未來 closed bars 與 canonical REST bar semantics 一致。
+- Paper LiveNode + production data + active risk + sandbox execution 真實啟動，不是 mock-only；forced LONG → FLAT fixture 與 prospective cohort 分開留證。
 - Shadow 與 Paper 對同 bars 的 signal bytes 一致。
 - 至少完成一次受控 restart/reconnect，無 duplicate signal/order。
-- 任何 gap、timestamp mismatch、state mismatch、unreconciled position 都 fail closed。
+- 每次 bounded Paper 結束時 terminal flat、無 open orders，fills/fees/positions/account 可 reconciliation；任何 gap、timestamp mismatch、state mismatch、unreconciled position 都 fail closed。
+- Runtime run/verdict 可 append-only readback，technical status 與 strategy outcome 分欄，不覆寫 historical experiment identity。
 - Paper 仍不會讓 `promotion_eligible=true`；還缺 Demo execution verdict。
 - Launchd 與資料同步互不依賴，外接碟掛載不新增第二排程或複雜 wrapper。
 
@@ -309,16 +330,16 @@ shared FamilyStrategy
 
 ### 實作順序
 
-1. Config trust boundary只接受 `DEMO`，必要且經重新查證時才接受 `TESTNET`；明確拒絕 `LIVE`、production URL override、真金 account ID 與缺失 risk limits。
-2. Credentials 只從執行時環境取得，預設使用官方 adapter 的 `BINANCE_DEMO_API_KEY`／`BINANCE_DEMO_API_SECRET`。專用 Demo key 的建立、交易權限、IP 限制與模擬餘額是 operator prerequisite；key/secret 永不寫 artifact。
+1. Config trust boundary只接受 `DEMO`，必要且經重新查證時才接受 `TESTNET`；明確拒絕 `LIVE`、production URL override、真金 account ID 與缺失 risk limits。Demo 與 Testnet 必須是不同 credential profile、runtime identity 與 evidence cohort，不能混成一級。
+2. Credentials 只從執行時環境取得，預設使用官方 adapter 的 `BINANCE_DEMO_API_KEY`／`BINANCE_DEMO_API_SECRET`。專用 Demo key 的建立、交易權限、IP 限制與模擬餘額是 operator prerequisite；若另驗 Testnet，使用獨立的 Testnet credentials；key/secret 永不寫 artifact。
 3. 先做 signed connectivity／server time／account／instrument filters readback，再允許任何 order。
-4. 用 bounded、低 notional 的 deterministic lifecycle suite 驗證：
-   - market accept/fill；
-   - limit submit/cancel；
+4. 用 bounded runtime、低 notional、固定最大 orders／position／timeout／flatten-on-exit 的 deterministic lifecycle suite 驗證：
+   - passive GTC accept → modify → cancel；
+   - 最小 market open → fill；
+   - reduce-only close → fill；
    - conditional order（adapter 支援面內）；
-   - reduce-only close；
    - user-stream order/fill/position/account event；
-   - reconnect + restart reconciliation；
+   - 接受一張 passive order 後進行 reconnect + process restart，reconciliation 必須啟用；
    - deterministic client-order ID 與 duplicate suppression。
 5. Binance `503` unknown execution outcome 不得直接重送；先以 user stream／order query reconcile，再決定下一步。[2]
 6. Infrastructure lifecycle PASS 後，再讓一個 Paper survivor 使用同 `FamilyStrategy` 與 risk/order mapping 在 Demo 跑 bounded window，核對 signal/order identity。
@@ -328,8 +349,10 @@ shared FamilyStrategy
 ### 驗收
 
 - 實際 environment readback 為 `DEMO`（或經記錄理由的 `TESTNET`），絕非 `LIVE`。
+- Demo／Testnet 使用不同 credential profile、runtime ID 與 cohort；任一環境證據不得冒充另一個環境。
 - 上述 lifecycle 每一條都有 venue/user-stream evidence。
-- 受控斷線與 process restart 後，open orders/positions/account reconciliation 一致。
+- 受控斷線與 process restart 後，已接受的 passive order、positions/account reconciliation 一致，沒有 duplicate client-order ID。
+- 每次 bounded suite 結束 terminal flat、沒有 open orders；超出 max orders／position／timeout 時自動 fail closed 並 flatten。
 - Unknown outcome 不產生 duplicate order。
 - 一個 Paper survivor 的 signal/order mapping 在 Demo 通過；Demo PnL 不進 alpha promotion metric。
 
@@ -349,6 +372,7 @@ shared FamilyStrategy
 - Create: `tests/test_strategy_promotion.py`
 - Create: `config/strategy_promotion_policy.json`
 - Create: `docs/contracts/strategy-promotion-v1.md`
+- Create: `docs/contracts/strategy-funnel-v2.md`
 - Modify: `src/nautilus_quant/strategy_lab.py`
 - Modify: `tests/test_strategy_lab.py`
 
@@ -358,7 +382,7 @@ shared FamilyStrategy
 2. `promotion_eligible` 只能由 ledger 查得的完整 chain 導出：family tests/parity → research screen → Nautilus historical → robustness → Paper → Demo。
 3. 缺少 stage、artifact、hash、policy identity 或 prospective boundary 一律 `N/A/BLOCKED`，不得當成零或 PASS。
 4. 產出 `latest-operator-summary.json`／`.md`：survivors、attrition、top reason codes、current tier、Paper/Demo health、next action、data/policy/runtime IDs。
-5. Funnel 的後兩級改讀真實 ledger evidence，移除 hard-coded `(0,0,0)`。
+5. 產出 canonical `strategy-funnel-v2`，所有層級只讀 ledger/runtime evidence；後兩級移除 hard-coded `(0,0,0)`，technical invalid 另列且不算 strategy attrition。
 6. 增加 canonical ledger/artifact manifest，供外部備份工具驗 hash；備份目的地與 retention 另由 operator 指定，不把 runtime artifacts塞進 Git。
 7. 完成後仍只得到「可進入另立 Live plan 的候選」，不自動部署真金。
 
