@@ -1,0 +1,447 @@
+# Strategy Loop：Family → Robustness → Paper → Binance Demo 建置計畫
+
+> **狀態：2026-08-14 已形成可執行計畫，尚未授權開始功能實作。**
+>
+> 本文件把 [`../architecture/strategy-loop-operating-model.md`](../architecture/strategy-loop-operating-model.md) 的已接受方向拆成可驗收的建置卡。執行基線為 `bce9603b37de28a211a29d9946e7f4a6c64ae0c7`；既有 historical strategy-loop v1 已在 `2e424a38fcf9993d142cb31a53960066534f84a1` 完成並驗活。
+
+## 1. 目標與完成邊界
+
+把目前「單一 momentum family 的歷史兩代回饋證明」擴成下列可長期經營的閉環：
+
+```text
+Hermes 自主建立／修改 family 與公式
+        ↓
+同一份 deterministic family kernel
+        ↓
+PyBroker campaign + provisional screen
+        ↓
+Nautilus historical + robustness
+        ↓
+production-data Shadow / Sandbox Paper
+        ↓
+Binance Demo（必要時既有 Testnet）execution validation
+        ↓
+ledger verdict → Hermes bounded next action
+        ├─ MUTATE
+        ├─ NEW_FAMILY
+        ├─ KILL
+        ├─ ADVANCE
+        └─ FIX_TECHNICAL
+```
+
+本計畫完成時，系統可以把新 family 從公式一路送到 Paper 與 Binance 模擬環境，並保留可稽核證據；**不包含真金 Live 啟用**。Live 必須另立資金、風險、停機與授權契約。
+
+## 2. 已有能力與真實缺口
+
+| 面向 | 現況 | 缺口／決定 |
+|---|---|---|
+| Historical loop | H0 → Nautilus verdict → H1 已真實跑通；失敗、lineage、hash、funnel 可查 | 保留，不重寫 |
+| Hypothesis | `strategy-hypothesis-v1` 只接受 `lookback-momentum-long-flat`、BTCUSDT 1H 與兩個固定參數 | 需 generic v2 + family version |
+| Ledger | `strategies` 固定欄位是 `lookback_bars` / `entry_threshold`；`stage_results` 只允許三個 historical stage | 需保留舊 row 與外鍵的 migration；不可 reset ledger |
+| Formula | momentum 公式內嵌在 `research/pybroker_research.py` | 需一份純 stdlib、historical/live 共用 kernel |
+| Candidate | `pybroker-candidate-v1` 已允許任意 plain-JSON 參數，但 intent 僅 LONG/FLAT | LONG/FLAT family 可沿用；只有要 SHORT／更豐富 intent 時才升 v2 |
+| Campaign | 一次 CLI 只跑一個 hypothesis | 需 deterministic campaign expander、budget、dedupe、cohort summary |
+| PyBroker screen | 現在只驗 candidate 結構與 hash，合法就 `PASSED` | 需預先釘住的 provisional metrics 與 rejection policy |
+| Historical evaluator | Nautilus 真正負責 fills、fees、Funding、positions、accounting | 沿用；補 bounded window／stress 輸入 |
+| Robustness | Funnel 的 `Robustness passed` 與 `Promotion eligible` 目前硬寫 `0` | 需真實 walk-forward／regime／cost evidence |
+| Paper | 無 live bar strategy、Shadow、sandbox account、prospective cohort | 需 LiveNode + shared kernel + state/restart evidence |
+| Demo/Testnet | 無 adapter runtime、credentials、order lifecycle、reconciliation | 需明確非 LIVE 的 bounded validation |
+| Loop action | 現在只有 `REVISE`／`RETAIN_FOR_RESEARCH` | 需 canonical next-action artifact 與跨 tier routing |
+| Operator view | Funnel 可讀，但後兩級為未實作零值 | 最後改為 ledger-derived 真值；仍先不做 Web Dashboard |
+
+### 已完成的 runtime 可行性探測
+
+本機 root venv 為 NautilusTrader `2.0.0rc2`。實際安裝 API 與部分舊文件範例名稱不同，實作時以本機 `.pyi` 與窄 smoke 為準：
+
+- `nautilus_trader.live.LiveNode` 可用；不是舊路徑的 `TradingNode`。
+- `LiveNode.builder(...)` 已用「`BinanceDataClientConfig(environment=LIVE)` + `SandboxExecutionClientConfig`」完成離線 composition build / dispose；這只證明接線 API 可組合，不冒充真實網路／成交驗活。
+- `nautilus_trader.adapters.binance` 提供 `BinanceDataClientConfig`、`BinanceExecClientConfig`、`BinanceDataClientFactory`、`BinanceExecutionClientFactory`。
+- `BinanceEnvironment` 明確有 `LIVE`、`DEMO`、`TESTNET`；新 Binance Futures 模擬建置預設選 `DEMO`。[1]
+
+因此目前**不需要為 Paper 先升級 Nautilus 或新增套件**；但每一個 adapter 接線仍須由安裝版本的實跑證據驗活，不能複製舊版範例就宣稱完成。
+
+## 3. 不可跨越的邊界
+
+1. Canonical data sync、catalog 與 Funding store 繼續獨立於 Hermes、PyBroker、Paper、Demo、Dashboard。
+2. Family kernel 只能持有 formula／parameters／warm-up／signal semantics；不得持有 credentials、quantity、leverage、fees、Funding policy、order type或 accounting truth。
+3. Hermes 只在 experiment、Paper window、Demo lifecycle 或 campaign 邊界被喚起；不進入每根 bar 或每張 order 的事件路徑。
+4. PyBroker 指標與績效一律 provisional；正式 historical accounting 只看 Nautilus。
+5. 全歷史資料已被既有 runner 檢視，不能重新包裝成 sealed holdout。Historical robustness 是「已檢視歷史的壓力證據」，真正的新資料證據來自策略版本凍結後的 prospective Paper。
+6. Paper 使用 production market data，但成交與帳務仍是模擬；Paper PnL 不代表 venue execution quality。
+7. Demo/Testnet 主要驗 execution engineering，不可拿模擬 order book 反覆調 alpha。
+8. `LIVE` environment、production endpoint、真金 credentials 與真金 order 一律 fail closed；本計畫不授權它們。
+9. 不新增 Qlib、AutoML、ORM、queue、MCP、Web Dashboard、第二套資料同步或 Hermes cron。
+10. Runtime secrets 不進 repo、memory、logs、artifact 或 command line；只接受執行時注入。
+11. 一次只有一個 writer。沒有實際命令輸出、測試、commit、push、remote readback 與 read-only audit，不得把卡片標成完成。
+
+## 4. Kanban 管制方式
+
+使用既有 dedicated board `quant-strategy-loop-20260814`，建立下列 **6 張順序卡**。它們是六個可獨立驗活的 coherent diff，不是六個同時開工的 phase umbrella：
+
+1. `FAMILY-KERNEL-V2`
+2. `CAMPAIGN-SCREEN-V1`
+3. `ROBUSTNESS-LOOP-V1`
+4. `PAPER-PROSPECTIVE-V1`
+5. `BINANCE-DEMO-EXEC-V1`
+6. `PROMOTION-PROJECTION-V1`
+
+每張卡固定走：
+
+```text
+RED tests
+  → minimum implementation
+  → focused GREEN
+  → root + research full suites
+  → data status + secrets + diff checks
+  → commit + push + remote readback
+  → independent read-only audit
+  → 才能啟動下一張卡
+```
+
+控制規則：
+
+- 同時最多一張卡 `in_progress`，不得 fan-out 多個 writer 修改同一 repo。
+- Auditor 只能回 PASS／FAIL + evidence；FAIL 不得自行開 remediation swarm。
+- Strategy hypothesis、mutation、funnel stage 不建立 Kanban 卡；它們進 immutable ledger。
+- 技術故障標 `FIX_TECHNICAL`，不能算成 strategy reject。
+- 任何 scope 擴張先更新本計畫並由 operator 讀回，不在施工途中偷偷加功能。
+
+## 5. Card 1 — `FAMILY-KERNEL-V2`
+
+### 目的
+
+先把單一內嵌公式抽成 historical／Paper／Demo 都能呼叫的唯一 signal truth，並讓 hypothesis／ledger 能安全表示多 family。
+
+### 預期檔案
+
+- Create: `src/nautilus_quant/strategy_families.py`
+- Create: `tests/test_strategy_families.py`
+- Create: `docs/contracts/strategy-hypothesis-v2.md`
+- Modify: `src/nautilus_quant/strategy_lab.py`
+- Modify: `tests/test_strategy_lab.py`
+- Modify: `research/pybroker_research.py`
+- Modify: `research/test_pybroker_research.py`
+
+### 實作順序
+
+1. **先寫 RED golden-vector tests**：同一組 closed OHLCV bars + family version + parameters，root 與 research 必須得到相同 timestamp、score、LONG/FLAT intent、reason。
+2. 建立純 stdlib 的最小 kernel：
+   - `ClosedBar`；
+   - `FamilyDecision`；
+   - 小型 tracked registry；
+   - 每個 family 明確的 `version`、warm-up、parameter validator 與 evaluator。
+3. 把現有 `lookback-momentum-long-flat` 原樣搬入 kernel；此卡先證明 parity，不趁機改公式。
+4. Research runtime 直接從 repo `src/` 載入這個純模組，不把 Nautilus dependency 加進 Python 3.12 research lock；repo-local path shortcut 要加 `ponytail:` ceiling 註解與 import-boundary test。
+5. 新增 canonical `strategy-hypothesis-v2`：含 `family_version`、任意 plain-JSON parameters、approved instrument／bar type、thesis、falsification 與 lineage；新 v2 strategy ID 必須包含 family version。
+6. `pybroker-candidate-v1` 保持不變，只要 intent 仍是 LONG/FLAT。
+7. 先用 copied legacy ledger 寫 migration RED test，再在單一 transaction 內把固定 strategy parameter 欄位遷成 canonical `parameters_json` + `family_version` + `identity_schema`；完整保留 v1 strategy／hypothesis／experiment／verdict／stage／error row 與外鍵。既有 row 標為 `strategy-id-v1` 並保留原 ID；只有新 row 使用包含 family version 的 `strategy-id-v2`，不得為了統一格式重算歷史 lineage。
+8. Migration 前後做 row count、content ID、foreign-key、artifact hash 與 append-only trigger readback；任何不一致必須 rollback，禁止清空 `var/strategy-loop`。
+
+### 驗收
+
+- 舊 v1 hypothesis 仍可讀、舊 ledger row 全數保留。
+- v2 可註冊不同 parameter shape 的第二個測試 family。
+- 同 bars 下 research/root kernel bytes 完全一致。
+- Registry test 固定 family version + golden vectors；formula 行為變更必須同步 bump version，read-only audit 以 diff 拒絕「只改 expected output、不改 version」。
+- Candidate v1 validator 與既有 H0/H1 artifact 仍可讀。
+- 無新 runtime dependency。
+
+### 停止線
+
+若 SQLite migration 無法在 copied legacy ledger 上保留 ID、foreign key 與 immutable trigger，就停止此卡；不得用「刪 ledger 重跑」繞過。
+
+## 6. Card 2 — `CAMPAIGN-SCREEN-V1`
+
+### 目的
+
+讓 Hermes 一次提出 bounded campaign，deterministic runner 展開、去重、執行與 provisional screen；禁止一個 strategy 一次 LLM call。
+
+### 預期檔案
+
+- Create: `src/nautilus_quant/strategy_campaign.py`
+- Create: `tests/test_strategy_campaign.py`
+- Create: `config/strategy_research_policy.json`
+- Create: `docs/contracts/strategy-campaign-v1.md`
+- Modify: `src/nautilus_quant/strategy_lab.py`
+- Modify: `tests/test_strategy_lab.py`
+- Modify: `research/pybroker_research.py`
+- Modify: `research/test_pybroker_research.py`
+
+### 實作順序
+
+1. 定義 canonical `strategy-campaign-v1`：family/version、approved instruments/bar types、deterministic parameter values、seed、data-as-of、maximum candidates、screen policy ID。
+2. 用 stdlib `itertools.product` 依 canonical 順序展開；在讀資料或啟 subprocess 前先 budget check、content-ID dedupe 與 ledger reuse。
+3. PyBroker result 增加有限且 finite 的 provisional metrics：至少 trade count、signal count、total return、max drawdown；必要時從 positions/orders 直接導出 turnover／exposure，但不複製完整 dataframe。
+4. `strategy_research_policy.json` 在看 campaign 結果前釘住最低活動量、最大 provisional drawdown、turnover 上限與 no-signal rejection；policy hash 進 experiment identity。
+5. `Research screened` 必須能真實 `PASSED` 或 `REJECTED`，不能再只做結構驗證。
+6. 產生 bounded cohort summary：survivors、top reason codes、policy/data IDs、每個 family 的進出數；不把 PyBroker PnL寫成正式績效。
+7. 此卡最後由小蒨自主建立一個**新的 tracked family/formula 作為機制證明**：先寫 thesis、falsification、golden vectors 和 family version，再放進 campaign；不能先看 campaign 結果才補公式理由。
+8. 寫 canonical `loop-action-v1` artifact；Hermes 在 cohort boundary 只能選 `MUTATE`、`NEW_FAMILY`、`KILL` 或 `ADVANCE`，並記錄 changed dimension。
+
+### 驗收
+
+- 同 campaign spec 重跑得到相同 expansion IDs，沒有重複 experiment。
+- 超出 budget 在任何研究 process 啟動前 fail closed。
+- Screen threshold 改動會改 policy/experiment identity。
+- 至少一個合法但無活動或違反 screen policy 的 candidate 真實被 `REJECTED`。
+- 新 family 與既有 momentum 都使用同一 registry/kernel。
+- 一個 campaign 只交給 Hermes 一份 bounded summary。
+
+### 停止線
+
+若 provisional metric 不 finite、data cohort 不一致，或 campaign 在 threshold 未凍結前已執行，整個 cohort 標 technical invalid；不得事後調門檻再沿用同一結果。
+
+## 7. Card 3 — `ROBUSTNESS-LOOP-V1`
+
+### 目的
+
+讓 historical survivor 通過可重現的 walk-forward／regime／cost stress，並把經濟失敗與技術失敗送回不同 loop。
+
+### 預期檔案
+
+- Create: `src/nautilus_quant/strategy_robustness.py`
+- Create: `tests/test_strategy_robustness.py`
+- Create: `config/strategy_robustness_policy.json`
+- Create: `docs/contracts/strategy-robustness-v1.md`
+- Modify: `src/nautilus_quant/candidate_backtest.py`
+- Modify: `tests/test_candidate_backtest.py`
+- Modify: `src/nautilus_quant/strategy_lab.py`
+- Modify: `tests/test_strategy_lab.py`
+
+### 實作順序
+
+1. 先寫 window generator RED tests：UTC boundaries、無倒序、無未完成 bar、每個 window 有 immutable ID；data-as-of 之後的資料永遠不可讀。
+2. 讓 `CandidateBacktestRequest` 接受明確 evaluation start/end 與 tracked cost policy，不改 candidate payload。
+3. 建立固定 robustness matrix：expanding／rolling windows、trend／range／high-volatility labels、fee/funding stress，以及經測試的 deterministic slippage-bps stress。Regime label 必須由預先定義的 deterministic rule 產生；若 rc2 無法在不繞過 Nautilus accounting 的情況下注入 slippage，該 stress 保持 `unmodeled` 並阻止 robustness PASS，不得用文字假裝已測。
+4. 每一格仍呼叫 Nautilus formal evaluator；PyBroker 不接管 fees、Funding、fills 或 accounting。
+5. 聚合 verdict 只保留 bounded metrics、worst window、reason codes、Funding truth、claimability 與 artifact hash。
+6. `Robustness passed` 從 ledger evidence 查詢，不再硬寫零。
+7. Economic fail → `MUTATE`／`NEW_FAMILY`／`KILL`；engine/data/runtime fail → `FIX_TECHNICAL`，且不污染 strategy attrition。
+8. 任何 strategy/family 變更都建立 child version，重新跑 historical + robustness；不可沿用舊 robustness verdict。
+
+### 驗收
+
+- 相同 policy/data/strategy 重跑完全 reuse，不膨脹 funnel。
+- Window 或 cost policy 變更會產生不同 experiment ID。
+- 至少一個 robustness rejection 與一個 technical failure 都被正確分類。
+- Funnel 第六級由真實 ledger stage 計算。
+- Verdict 明確寫出 historical data 已 inspected，不能自稱 sealed holdout 或 production evidence。
+
+### 停止線
+
+只要任何 window 越過 data-as-of、Funding truth 不明、slippage label 被弱化，或 technical failure 被算成 economic rejection，就停止 promotion。
+
+## 8. Card 4 — `PAPER-PROSPECTIVE-V1`
+
+### 目的
+
+凍結 survivor 後，從未來到達的 production closed bars 產生 Shadow／Sandbox Paper 證據；這是每個 trading-eligible strategy 必經段，不能跳過。
+
+### 預期檔案
+
+- Create: `src/nautilus_quant/live_strategy.py`
+- Create: `src/nautilus_quant/paper_runtime.py`
+- Create: `tests/test_live_strategy.py`
+- Create: `tests/test_paper_runtime.py`
+- Create: `config/strategy_paper_policy.json`
+- Create: `docs/contracts/strategy-paper-evidence-v1.md`
+- Modify: `src/nautilus_quant/strategy_lab.py`
+- Modify: `tests/test_strategy_lab.py`
+- Modify: `pyproject.toml`
+- Create only after bounded smoke passes: `ops/ai.nautilus.quant.paper.plist`
+- Modify only after bounded smoke passes: `tests/test_launchd_plist.py`
+
+### Runtime 接線
+
+```text
+BinanceDataClientConfig(
+    product_type=BinanceProductType.USD_M,
+    environment=BinanceEnvironment.LIVE,
+)
+        ↓ production market data only
+LiveNode.builder(name, trader_id, Environment.SANDBOX)
+        ↓
+shared FamilyStrategy
+        ├─ SHADOW: canonical signal/order intent only
+        └─ PAPER: SandboxExecutionClientConfig simulated fills/account
+```
+
+### 實作順序
+
+1. `FamilyStrategy` 只吃 completed bars；維護 bounded warm-up window，呼叫 Card 1 kernel，產出 canonical `signal_id`、score、intent、reason。
+2. 同一 strategy class 支援 `SHADOW` 與 `PAPER`，不複製公式；mode 只決定是否把 intent 交給 risk/order mapping。
+3. 寫 synthetic event tests：warm-up、late/revised bar、gap、duplicate bar、restart、同 signal 不重送 order、flat idempotency、shutdown flatten policy。
+4. 寫 historical/live parity fixture：同 canonical bars 必須與 PyBroker signal identity 一致；fill 不要求一致。
+5. 先完成 bounded CLI smoke；只有 live data subscription、bar close、signal artifact、sandbox account/order readback都成功，才加一個原生 launchd plist 長跑。不得用 Hermes cron 承擔 trading runtime。
+6. Prospective cohort 從 strategy code + family version + parameters + policy 凍結之後開始；策略修改後舊 Paper 窗口作廢，新版本重新計時。
+7. Evidence 至少含：cohort start/end、completed/missing/revised bars、signal IDs、intent/order mapping、sandbox fills/fees/positions/account、restart/reconnect、duplicate suppression、technical/economic status、artifact hashes。
+8. Paper technical fail → `FIX_TECHNICAL`；修好後先重跑 parity，再為同 strategy logic 開新 prospective window。Paper economic fail → child/new family，完整重跑 historical + robustness + Paper。
+
+### 驗收
+
+- LiveNode + production data + sandbox execution 真實啟動，不是 mock-only。
+- Shadow 與 Paper 對同 bars 的 signal bytes 一致。
+- 至少完成一次受控 restart/reconnect，無 duplicate signal/order。
+- 任何 gap、timestamp mismatch、state mismatch、unreconciled position 都 fail closed。
+- Paper 仍不會讓 `promotion_eligible=true`；還缺 Demo execution verdict。
+- Launchd 與資料同步互不依賴，外接碟掛載不新增第二排程或複雜 wrapper。
+
+### 停止線
+
+若 production data 與 canonical historical bar semantics 無法證明 parity、sandbox state 無法 restart/reconcile，或 runtime 依賴 Hermes session 才能維持，就不能開始長期 Paper。
+
+## 9. Card 5 — `BINANCE-DEMO-EXEC-V1`
+
+### 目的
+
+以專用模擬 credentials 驗證 Binance USD-M 真實 adapter 的 order lifecycle、user stream、unknown outcome 與 reconciliation；不拿 Demo 流動性做 alpha 優化。
+
+### 預期檔案
+
+- Create: `src/nautilus_quant/binance_demo_runtime.py`
+- Create: `tests/test_binance_demo_runtime.py`
+- Create: `config/binance_demo_policy.json`
+- Create: `docs/contracts/binance-demo-evidence-v1.md`
+- Modify: `src/nautilus_quant/live_strategy.py`
+- Modify: `src/nautilus_quant/strategy_lab.py`
+- Modify: `tests/test_strategy_lab.py`
+- Modify: `pyproject.toml`
+
+### 實作順序
+
+1. Config trust boundary只接受 `DEMO`，必要且經重新查證時才接受 `TESTNET`；明確拒絕 `LIVE`、production URL override、真金 account ID 與缺失 risk limits。
+2. Credentials 只從執行時環境取得，預設使用官方 adapter 的 `BINANCE_DEMO_API_KEY`／`BINANCE_DEMO_API_SECRET`。專用 Demo key 的建立、交易權限、IP 限制與模擬餘額是 operator prerequisite；key/secret 永不寫 artifact。
+3. 先做 signed connectivity／server time／account／instrument filters readback，再允許任何 order。
+4. 用 bounded、低 notional 的 deterministic lifecycle suite 驗證：
+   - market accept/fill；
+   - limit submit/cancel；
+   - conditional order（adapter 支援面內）；
+   - reduce-only close；
+   - user-stream order/fill/position/account event；
+   - reconnect + restart reconciliation；
+   - deterministic client-order ID 與 duplicate suppression。
+5. Binance `503` unknown execution outcome 不得直接重送；先以 user stream／order query reconcile，再決定下一步。[2]
+6. Infrastructure lifecycle PASS 後，再讓一個 Paper survivor 使用同 `FamilyStrategy` 與 risk/order mapping 在 Demo 跑 bounded window，核對 signal/order identity。
+7. Execution defect → `FIX_TECHNICAL`；signal mismatch → 回 Card 1 並重跑 parity/Paper/Demo；不得因 Demo fill 好壞修改 alpha。
+8. Evidence 保存 request intent、client/venue IDs、ack/fill/cancel/reconciliation、environment、endpoint class、timestamps、reason codes與 hashes，但移除 credentials／signatures／敏感 headers。
+
+### 驗收
+
+- 實際 environment readback 為 `DEMO`（或經記錄理由的 `TESTNET`），絕非 `LIVE`。
+- 上述 lifecycle 每一條都有 venue/user-stream evidence。
+- 受控斷線與 process restart 後，open orders/positions/account reconciliation 一致。
+- Unknown outcome 不產生 duplicate order。
+- 一個 Paper survivor 的 signal/order mapping 在 Demo 通過；Demo PnL 不進 alpha promotion metric。
+
+### 停止線
+
+沒有 dedicated simulated credentials、environment 無法讀回、帳戶已有未知 open position/order、或任一 production endpoint guard 失效時，禁止送出 order。
+
+## 10. Card 6 — `PROMOTION-PROJECTION-V1`
+
+### 目的
+
+把完整證據鏈變成一個可查詢的 promotion verdict 與簡潔 operator view；不先建 Dashboard。
+
+### 預期檔案
+
+- Create: `src/nautilus_quant/strategy_promotion.py`
+- Create: `tests/test_strategy_promotion.py`
+- Create: `config/strategy_promotion_policy.json`
+- Create: `docs/contracts/strategy-promotion-v1.md`
+- Modify: `src/nautilus_quant/strategy_lab.py`
+- Modify: `tests/test_strategy_lab.py`
+
+### 實作順序
+
+1. Promotion policy 在讀 survivor 結果前凍結，至少含 required tier/version、Paper cohort要求、signal mismatch上限、technical status、Demo lifecycle requirements、risk policy ID。
+2. `promotion_eligible` 只能由 ledger 查得的完整 chain 導出：family tests/parity → research screen → Nautilus historical → robustness → Paper → Demo。
+3. 缺少 stage、artifact、hash、policy identity 或 prospective boundary 一律 `N/A/BLOCKED`，不得當成零或 PASS。
+4. 產出 `latest-operator-summary.json`／`.md`：survivors、attrition、top reason codes、current tier、Paper/Demo health、next action、data/policy/runtime IDs。
+5. Funnel 的後兩級改讀真實 ledger evidence，移除 hard-coded `(0,0,0)`。
+6. 增加 canonical ledger/artifact manifest，供外部備份工具驗 hash；備份目的地與 retention 另由 operator 指定，不把 runtime artifacts塞進 Git。
+7. 完成後仍只得到「可進入另立 Live plan 的候選」，不自動部署真金。
+
+### 驗收
+
+- 缺任一 tier 時 promotion fail closed。
+- 修改任何 artifact byte、policy ID、family version 或 prospective cohort 會使既有 promotion verdict失效。
+- Funnel、operator summary 與 direct SQLite query一致。
+- Live authorization欄位不存在或固定為 `NOT_AUTHORIZED`。
+
+## 11. 尚缺的 operator／外部輸入
+
+下列不是程式碼能自說自話補出的資料；必須在對應卡開始實跑前一次性凍結：
+
+1. **Research/campaign budget**：每 cohort 最大 strategy 數、可用 instruments/bar types、最大 CPU／wall time。
+2. **Screen/robustness policy**：最低活動量、最大 drawdown/turnover、window 定義、cost/slippage stress；必須在看結果前固定。
+3. **Paper admission policy**：最短 prospective wall-clock／completed-bar 數、允許 gap/revised bar、至少幾次 restart/reconnect、technical/economic rejection條件。
+4. **Demo risk envelope**：專用模擬帳戶、最大 notional、leverage/margin mode、允許 order types、order-rate上限與 emergency flatten規則。
+5. **Dedicated Demo credentials**：由 operator 在 Binance Demo 建立與注入；目前 repo 中沒有、也不應有。
+6. **Runtime backup target**：ledger/artifact 備份位置、retention、restore drill頻率；Git只保存程式與 contract，不保存實跑帳務／交易 artifacts。
+7. **Notification policy**：Paper/Demo technical failure、strategy attrition、promotion candidate 要送到哪個 Discord channel，以及哪些只記 ledger 不打擾 operator。
+8. **Live policy**：不在本計畫內；未來需另決定真金額度、風險、kill switch、值守與授權。
+
+小蒨可自主決定新 family／formula、提出上述 policy 建議並執行已凍結規則；但不能在看過結果後偷偷放寬 gate，也不能替 operator 建立或猜測 credentials。
+
+## 12. 每卡共同驗證
+
+每張功能卡完成最後一次 write 後都執行：
+
+```bash
+# Card-specific focused tests
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest <focused modules> -v
+
+# Entire root suite
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -q
+
+# Entire isolated research suite
+PYTHONDONTWRITEBYTECODE=1 research/.venv/bin/python -m unittest \
+  discover -s research -p 'test*.py' -q
+
+# Canonical data health
+.venv/bin/nautilus-data status --config config/market_data.json
+
+# Tracked diff before staging
+git diff --check
+git status --short
+```
+
+接著：
+
+```bash
+git add <card-scoped tracked files>
+.venv/bin/python scripts/check_secrets.py --staged
+git diff --cached --check
+git commit -m "<card-specific message>"
+git push origin main
+git fetch origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+git status --short
+```
+
+不得使用 `--no-verify`。`data/`、`var/`、`.venv/`、research runtime output、credentials 都不得 staged。
+
+Paper 與 Demo 卡另須附真實 runtime evidence；mock/unit tests只能證明 trust boundary，不能代替 live market data、sandbox account 或 venue adapter實跑。
+
+## 13. 建置 readiness 結論
+
+- **Card 1～3：現在即可施工**，不需要 credentials，也不會碰 Live/Paper order。
+- **Card 4 程式與 synthetic tests：現在即可施工**；正式 prospective Paper evidence 需先凍結 Paper admission policy，並經過真實 production-data smoke。
+- **Card 5 程式與 fail-closed tests：現在即可施工**；venue 驗活會卡在 dedicated Binance Demo credentials 與 Demo risk envelope，這是正當外部 gate。
+- **Card 6：必須等 Paper + Demo 真證據存在**，否則只能產生 `N/A/BLOCKED`，不得造假完成度。
+- **Live：未授權、未規劃、不可因前六卡成功而自動發生。**
+
+## 14. Sources
+
+[1] NautilusTrader Binance integration — environments、Demo/Testnet 建議與 adapter能力：<https://nautilustrader.io/docs/latest/integrations/binance>
+
+[2] Binance USD-M General Info — simulated endpoints、503 unknown-outcome reconciliation：<https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/general-info>
+
+[3] NautilusTrader Live Trading — live node lifecycle、startup reconciliation與 coordinated shutdown：<https://nautilustrader.io/docs/latest/concepts/live>
+
+本機安裝介面證據：
+
+- `.venv/lib/python3.13/site-packages/nautilus_trader/live/__init__.pyi`
+- `.venv/lib/python3.13/site-packages/nautilus_trader/adapters/sandbox/__init__.pyi`
+- `.venv/lib/python3.13/site-packages/nautilus_trader/adapters/binance/__init__.pyi`

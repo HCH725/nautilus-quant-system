@@ -7,6 +7,7 @@ Related implemented contracts and evidence:
 
 - [`../contracts/strategy-loop-v1.md`](../contracts/strategy-loop-v1.md)
 - [`../plans/2026-08-14-strategy-loop-v1.md`](../plans/2026-08-14-strategy-loop-v1.md)
+- [`../plans/2026-08-14-strategy-loop-family-paper-demo.md`](../plans/2026-08-14-strategy-loop-family-paper-demo.md)
 - [`hybrid-pybroker-nautilus.md`](hybrid-pybroker-nautilus.md)
 
 ## Decision summary
