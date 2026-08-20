@@ -51,3 +51,5 @@ NautilusTrader：後續正式驗證
 ## 何時才擴充
 
 只有實測出現需求，才考慮多檔 capsule、immutable snapshot service、cross-framework parity、promotion state machine、sealed holdout、批量 benchmark 或研究 Dashboard；它們不是第一條縱切的前置條件。
+
+> **V2 scope clarification, 2026-08-20：** 上句保存的是 v1 第一條縱切的歷史決策，不代表 Candidate v2 可以略過 parity。V2 已接受的 formal Signal Parity Gate 必須在 Candidate v2 進入 Nautilus historical accounting 前 fail closed；見 [`strategy-loop-operating-model.md`](strategy-loop-operating-model.md) 與 [`../plans/2026-08-14-strategy-loop-family-paper-demo.md`](../plans/2026-08-14-strategy-loop-family-paper-demo.md)。
