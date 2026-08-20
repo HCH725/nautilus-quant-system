@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+from dataclasses import asdict
 from hashlib import sha256
 from io import StringIO
 import json
@@ -14,6 +15,15 @@ import pyarrow.parquet as parquet
 
 import pybroker_research
 from pybroker_research import BAR_TYPE, decode_fixed, run, write_candidate
+from nautilus_quant.strategy_families import (
+    ClosedBar,
+    FamilyDefinition,
+    FamilyEvaluation,
+    FamilyRegistry,
+    KERNEL_HASH,
+    KERNEL_VERSION,
+    evaluate_batch,
+)
 
 
 def hypothesis_document() -> dict[str, object]:
@@ -27,6 +37,14 @@ def hypothesis_document() -> dict[str, object]:
         "schema_version": "strategy-hypothesis-v1",
         "strategy_family": "lookback-momentum-long-flat",
         "thesis": "Momentum persists into the next event",
+    }
+
+
+def hypothesis_document_v2() -> dict[str, object]:
+    return {
+        **hypothesis_document(),
+        "family_version": "lookback-momentum-long-flat-v1",
+        "schema_version": "strategy-hypothesis-v2",
     }
 
 
@@ -61,6 +79,40 @@ def write_catalog(root: Path, closes: list[int]) -> Path:
 
 
 class CandidateWriterTests(unittest.TestCase):
+    def test_v2_hypothesis_family_acceptance_is_owned_by_the_tracked_registry(self):
+        document = hypothesis_document_v2()
+        document["strategy_family"] = "minimum-close-long-flat"
+        document["family_version"] = "minimum-close-long-flat-v1"
+        document["parameters"] = {"minimum_close": 100.0}
+        registry = FamilyRegistry(
+            (
+                FamilyDefinition(
+                    family_id="minimum-close-long-flat",
+                    family_version="minimum-close-long-flat-v1",
+                    warmup_bars=lambda _parameters: 1,
+                    validate_parameters=lambda parameters: {
+                        "minimum_close": float(parameters["minimum_close"])
+                    },
+                    evaluate=lambda bars, parameters: FamilyEvaluation(
+                        score=bars[-1].close,
+                        target_intent=(
+                            "LONG"
+                            if bars[-1].close > parameters["minimum_close"]
+                            else "FLAT"
+                        ),
+                        reason="CLOSE_COMPARED_WITH_MINIMUM",
+                    ),
+                ),
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            path = write_hypothesis(Path(tmp), document)
+            with patch.object(pybroker_research, "DEFAULT_REGISTRY", registry):
+                loaded = pybroker_research.load_hypothesis(path)
+
+        self.assertEqual(loaded.family_id, "minimum-close-long-flat")
+        self.assertEqual(loaded.parameters, {"minimum_close": 100.0})
+
     def test_repository_canonical_data_is_forbidden_even_with_an_external_catalog(self):
         with TemporaryDirectory() as tmp:
             external_catalog = Path(tmp) / "catalog"
@@ -208,10 +260,53 @@ class ParameterizedResearchTests(unittest.TestCase):
         self.assertEqual(first_output.read_bytes(), second_output.read_bytes())
         self.assertEqual(first["candidate_id"], second["candidate_id"])
 
+    def test_v2_emits_full_shared_kernel_decisions_and_control_plane_identity(self):
+        hypothesis = write_hypothesis(self.root, hypothesis_document_v2())
+        output = self.root / "v2" / "candidate.json"
+
+        result = run(
+            self.catalog,
+            output,
+            hypothesis=hypothesis,
+            evaluation_context_id="e" * 64,
+            environment_id="d" * 64,
+        )
+
+        candidate = json.loads(output.read_bytes())
+        bars = tuple(
+            ClosedBar(
+                ts_event_ns=(index + 1) * 3_600_000_000_000,
+                open=float(close),
+                high=float(close),
+                low=float(close),
+                close=float(close),
+                volume=1.0,
+            )
+            for index, close in enumerate([100, 104, 110, 100, 100])
+        )
+        expected = evaluate_batch(
+            family_id="lookback-momentum-long-flat",
+            family_version="lookback-momentum-long-flat-v1",
+            parameters={"entry_threshold": 0.05, "lookback_bars": 2},
+            bars=bars,
+        )
+        self.assertEqual(candidate["schema_version"], "pybroker-candidate-v2")
+        self.assertEqual(candidate["signals"], [asdict(item) for item in expected])
+        self.assertEqual(candidate["evaluation_context_id"], "e" * 64)
+        self.assertEqual(candidate["runtime"]["environment_id"], "d" * 64)
+        self.assertEqual(candidate["source"]["data_snapshot_id"], candidate["source"]["sha256"])
+        self.assertEqual(candidate["source"]["data_as_of_ns"], candidate["source"]["last_ts_event_ns"])
+        self.assertEqual(candidate["strategy"]["kernel_version"], KERNEL_VERSION)
+        self.assertEqual(candidate["strategy"]["kernel_hash"], KERNEL_HASH)
+        self.assertEqual(result["provisional_metrics"]["signals"], len(expected))
+
+    def test_shared_kernel_import_keeps_nautilus_runtime_out_of_research_frontend(self):
+        self.assertNotIn("nautilus_trader", pybroker_research.sys.modules)
+
     def test_strictly_rejects_invalid_hypothesis_boundary(self):
         cases = []
         for field, value in (
-            ("schema_version", "strategy-hypothesis-v2"),
+            ("schema_version", "strategy-hypothesis-v999"),
             ("instrument_id", "ETHUSDT-PERP.BINANCE"),
             ("bar_type", "BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL"),
         ):
@@ -296,7 +391,11 @@ class ParameterizedResearchTests(unittest.TestCase):
                 self.assertEqual(pybroker_research.main(), 0)
 
         mocked_run.assert_called_once_with(
-            self.catalog, output, hypothesis=self.hypothesis,
+            self.catalog,
+            output,
+            hypothesis=self.hypothesis,
+            evaluation_context_id=None,
+            environment_id=None,
         )
         self.assertEqual(stdout.getvalue().splitlines(), [json.dumps(expected, sort_keys=True)])
 

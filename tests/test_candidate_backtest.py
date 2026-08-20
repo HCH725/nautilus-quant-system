@@ -1,7 +1,7 @@
 # noqa: E501  # noqa: SIZE_OK — Task C keeps its fixture and acceptance points together.
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -24,10 +24,18 @@ from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_quant.candidate_backtest import (
     CandidateBacktestRequest,
     run_candidate_backtest,
+    run_signal_parity_gate,
 )
 from nautilus_quant.funding_observation import migrate_funding_observations
 from nautilus_quant.nautilus_io import make_bar
 from nautilus_quant.pybroker_candidate import load_pybroker_candidate
+from nautilus_quant.strategy_families import (
+    ClosedBar,
+    KERNEL_HASH,
+    KERNEL_VERSION,
+    derive_signal_id,
+    evaluate_batch,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -200,6 +208,60 @@ class CandidateBacktestTests(unittest.TestCase):
                 "decision_timing": "bar-close; effective no earlier than next event",
                 "name": "lookback-momentum-long-flat",
                 "parameters": {"entry_threshold": 0.0, "lookback_bars": 2},
+            },
+            "truth_status": "provisional",
+        }
+
+    def _candidate_v2(self) -> dict[str, JsonValue]:
+        parameters: dict[str, JsonValue] = {
+            "entry_threshold": 0.0,
+            "lookback_bars": 2,
+        }
+        bars = [
+            ClosedBar(
+                ts_event_ns=hour * HOUR_NS,
+                open=1000,
+                high=1000,
+                low=1000,
+                close=1000,
+                volume=10,
+            )
+            for hour in range(1, 11)
+        ]
+        decisions = evaluate_batch(
+            family_id="lookback-momentum-long-flat",
+            family_version="lookback-momentum-long-flat-v1",
+            parameters=parameters,
+            bars=bars,
+        )
+        source_hash = _catalog_digest(self.catalog_path)
+        return {
+            "bar_type": BAR_TYPE,
+            "evaluation_context_id": "e" * 64,
+            "instrument_id": INSTRUMENT_ID,
+            "runtime": {
+                "environment_id": "d" * 64,
+                "pybroker_version": "1.2.14",
+                "python_version": "3.12.13",
+                "seed": 42,
+            },
+            "schema_version": "pybroker-candidate-v2",
+            "signals": [asdict(item) for item in decisions],
+            "source": {
+                "data_as_of_ns": 10 * HOUR_NS,
+                "data_snapshot_id": source_hash,
+                "first_ts_event_ns": HOUR_NS,
+                "last_ts_event_ns": 10 * HOUR_NS,
+                "row_count": 10,
+                "sha256": source_hash,
+            },
+            "strategy": {
+                "decision_timing": "bar-close; effective no earlier than next event",
+                "family_id": "lookback-momentum-long-flat",
+                "family_version": "lookback-momentum-long-flat-v1",
+                "kernel_hash": KERNEL_HASH,
+                "kernel_version": KERNEL_VERSION,
+                "parameters": parameters,
             },
             "truth_status": "provisional",
         }
@@ -472,6 +534,93 @@ class CandidateBacktestTests(unittest.TestCase):
         )
 
         self.assertEqual(result.verdict["funding"]["events"][0]["mark_price"], "1000.00")
+
+    def test_v2_parity_pass_recomputes_signals_before_nautilus_accounting(self) -> None:
+        candidate = self._candidate_v2()
+        self._write_candidate(candidate)
+
+        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
+        result = run_candidate_backtest(replace(self.request, signal_parity=parity))
+
+        self.assertEqual(parity.outcome, "PASS")
+        self.assertEqual(parity.reason_code, "SIGNAL_PARITY_MATCH")
+        self.assertIsNone(parity.required_action)
+        self.assertEqual(
+            [asdict(item) for item in parity.decisions],
+            candidate["signals"],
+        )
+        self.assertEqual(result.verdict["candidate_id"], parity.candidate_id)
+        self.assertEqual(
+            result.verdict["signal_parity"],
+            {
+                "artifact_sha256": parity.artifact_sha256,
+                "outcome": "PASS",
+                "reason_code": "SIGNAL_PARITY_MATCH",
+            },
+        )
+
+    def test_v2_rejects_forged_pass_decisions_before_engine_construction(self) -> None:
+        self._write_candidate(self._candidate_v2())
+        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
+        first = parity.decisions[0]
+        forged = replace(
+            parity,
+            decisions=(
+                replace(
+                    first,
+                    target_intent="FLAT" if first.target_intent == "LONG" else "LONG",
+                ),
+                *parity.decisions[1:],
+            ),
+        )
+
+        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
+            with self.assertRaisesRegex(RuntimeError, "signal parity artifact content mismatch"):
+                run_candidate_backtest(replace(self.request, signal_parity=forged))
+
+        engine.assert_not_called()
+
+    def test_v2_parity_mismatch_is_fix_technical_and_engine_never_starts(self) -> None:
+        candidate = self._candidate_v2()
+        strategy = candidate["strategy"]
+        signals = candidate["signals"]
+        self.assertIsInstance(strategy, dict)
+        self.assertIsInstance(signals, list)
+        signal = signals[0]
+        self.assertIsInstance(signal, dict)
+        signal["score"] = "0.000000000001"
+        signal["signal_id"] = derive_signal_id(
+            family_id=strategy["family_id"],
+            family_version=strategy["family_version"],
+            kernel_hash=strategy["kernel_hash"],
+            kernel_version=strategy["kernel_version"],
+            parameters=strategy["parameters"],
+            reason=signal["reason"],
+            score=signal["score"],
+            target_intent=signal["target_intent"],
+            ts_event_ns=signal["ts_event_ns"],
+        )
+        self._write_candidate(candidate)
+
+        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
+        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
+            with self.assertRaisesRegex(RuntimeError, "signal parity gate did not pass"):
+                run_candidate_backtest(replace(self.request, signal_parity=parity))
+
+        self.assertEqual(parity.outcome, "ERROR")
+        self.assertEqual(parity.reason_code, "SIGNAL_PARITY_MISMATCH")
+        self.assertEqual(parity.required_action, "FIX_TECHNICAL")
+        self.assertEqual(parity.mismatch_index, 0)
+        engine.assert_not_called()
+
+    def test_v2_without_gate_pass_fails_before_engine_construction(self) -> None:
+        self._write_candidate(self._candidate_v2())
+
+        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
+            with self.assertRaisesRegex(RuntimeError, "requires a passed signal parity gate"):
+                run_candidate_backtest(self.request)
+
+        engine.assert_not_called()
 
     def test_technical_engine_error_raises_instead_of_returning_revise(self) -> None:
         with patch(

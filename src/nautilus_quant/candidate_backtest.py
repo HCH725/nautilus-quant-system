@@ -1,7 +1,7 @@
 # noqa: E501  # noqa: SIZE_OK — Task C is explicitly scoped to one evaluator module.
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -48,6 +48,13 @@ from .funding_observation import (
     read_funding_observations,
 )
 from .pybroker_candidate import load_pybroker_candidate
+from .strategy_families import (
+    ClosedBar,
+    FamilyDecision,
+    FamilyKernelError,
+    IncrementalFamilyEvaluator,
+    canonical_decision_bytes,
+)
 
 
 type JsonScalar = str | int | float | bool | None
@@ -71,6 +78,18 @@ _VENUE: Final = Venue("BINANCE")
 
 
 @dataclass(frozen=True, slots=True)
+class SignalParityResult:
+    candidate_id: str
+    outcome: Literal["PASS", "ERROR"]
+    reason_code: str
+    required_action: Literal["FIX_TECHNICAL"] | None
+    mismatch_index: int | None
+    decisions: tuple[FamilyDecision, ...]
+    canonical_bytes: bytes
+    artifact_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateBacktestRequest:
     candidate_path: Path
     catalog_path: Path
@@ -80,6 +99,7 @@ class CandidateBacktestRequest:
     strategy_id: str
     experiment_id: str
     code_commit: str
+    signal_parity: SignalParityResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +266,183 @@ def _source_bars(
     if times != sorted(set(times)):
         raise CandidateBacktestError("catalog bars must be unique and strictly ordered")
     return bars
+
+
+def _parity_result(
+    *,
+    candidate_id: str,
+    outcome: Literal["PASS", "ERROR"],
+    reason_code: str,
+    mismatch_index: int | None,
+    decisions: tuple[FamilyDecision, ...],
+    candidate_signal_count: int,
+    detail: str | None,
+) -> SignalParityResult:
+    decision_payload = b"".join(canonical_decision_bytes(item) for item in decisions)
+    document: dict[str, JsonValue] = {
+        "candidate_id": candidate_id,
+        "candidate_signal_count": candidate_signal_count,
+        "detail": detail,
+        "mismatch_index": mismatch_index,
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "recomputed_signal_count": len(decisions),
+        "recomputed_signals_sha256": sha256(decision_payload).hexdigest(),
+        "required_action": None if outcome == "PASS" else "FIX_TECHNICAL",
+        "schema_version": "signal-parity-result-v1",
+    }
+    payload = _canonical(document)
+    return SignalParityResult(
+        candidate_id=candidate_id,
+        outcome=outcome,
+        reason_code=reason_code,
+        required_action=None if outcome == "PASS" else "FIX_TECHNICAL",
+        mismatch_index=mismatch_index,
+        decisions=decisions,
+        canonical_bytes=payload,
+        artifact_sha256=sha256(payload).hexdigest(),
+    )
+
+
+def _verified_parity_decisions(
+    parity: SignalParityResult,
+    candidate_id: str,
+) -> tuple[FamilyDecision, ...]:
+    if parity.outcome != "PASS" or parity.required_action is not None:
+        raise CandidateBacktestError("signal parity gate did not pass")
+    if parity.candidate_id != candidate_id:
+        raise CandidateBacktestError("signal parity candidate_id mismatch")
+    if sha256(parity.canonical_bytes).hexdigest() != parity.artifact_sha256:
+        raise CandidateBacktestError("signal parity artifact hash mismatch")
+    if not isinstance(parity.decisions, tuple) or not all(
+        isinstance(item, FamilyDecision) for item in parity.decisions
+    ):
+        raise CandidateBacktestError("signal parity decisions are invalid")
+    try:
+        document = json.loads(parity.canonical_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CandidateBacktestError("signal parity artifact must be UTF-8 JSON") from error
+    decision_payload = b"".join(
+        canonical_decision_bytes(item) for item in parity.decisions
+    )
+    expected: dict[str, JsonValue] = {
+        "candidate_id": candidate_id,
+        "candidate_signal_count": len(parity.decisions),
+        "detail": None,
+        "mismatch_index": None,
+        "outcome": "PASS",
+        "reason_code": "SIGNAL_PARITY_MATCH",
+        "recomputed_signal_count": len(parity.decisions),
+        "recomputed_signals_sha256": sha256(decision_payload).hexdigest(),
+        "required_action": None,
+        "schema_version": "signal-parity-result-v1",
+    }
+    if (
+        parity.reason_code != "SIGNAL_PARITY_MATCH"
+        or parity.mismatch_index is not None
+        or document != expected
+        or parity.canonical_bytes != _canonical(expected)
+    ):
+        raise CandidateBacktestError("signal parity artifact content mismatch")
+    return parity.decisions
+
+
+def run_signal_parity_gate(
+    candidate_path: Path,
+    catalog_path: Path,
+) -> SignalParityResult:
+    """Independently recompute Candidate v2 signals from canonical closed bars."""
+    candidate, candidate_id = load_pybroker_candidate(candidate_path)
+    if candidate.get("schema_version") != "pybroker-candidate-v2":
+        raise CandidateBacktestError("signal parity gate requires Candidate v2")
+    rows = candidate.get("signals")
+    if not isinstance(rows, list):
+        raise CandidateBacktestError("validated Candidate v2 signals are invalid")
+    try:
+        catalog = ParquetDataCatalog(str(catalog_path))
+        source_bars = _source_bars(candidate, catalog, Path(catalog_path))
+        strategy = _mapping(candidate["strategy"], "candidate strategy")
+        family_id = strategy.get("family_id")
+        family_version = strategy.get("family_version")
+        parameters = strategy.get("parameters")
+        if (
+            not isinstance(family_id, str)
+            or not isinstance(family_version, str)
+            or not isinstance(parameters, dict)
+        ):
+            raise CandidateBacktestError("validated Candidate v2 strategy is invalid")
+        evaluator = IncrementalFamilyEvaluator(
+            family_id=family_id,
+            family_version=family_version,
+            parameters=parameters,
+        )
+        recomputed: list[FamilyDecision] = []
+        for bar in source_bars:
+            decision = evaluator.push(
+                ClosedBar(
+                    ts_event_ns=bar.ts_event,
+                    open=float(str(bar.open)),
+                    high=float(str(bar.high)),
+                    low=float(str(bar.low)),
+                    close=float(str(bar.close)),
+                    volume=float(str(bar.volume)),
+                )
+            )
+            if decision is not None:
+                recomputed.append(decision)
+    except (ArithmeticError, FamilyKernelError, LookupError, OSError, RuntimeError, ValueError) as error:
+        return _parity_result(
+            candidate_id=candidate_id,
+            outcome="ERROR",
+            reason_code="SIGNAL_PARITY_RECOMPUTE_FAILED",
+            mismatch_index=None,
+            decisions=(),
+            candidate_signal_count=len(rows),
+            detail=f"{type(error).__name__}: {error}",
+        )
+
+    decisions = tuple(recomputed)
+    expected_rows = [asdict(item) for item in decisions]
+    mismatch_index: int | None = None
+    detail: str | None = None
+    if len(rows) != len(expected_rows):
+        mismatch_index = min(len(rows), len(expected_rows))
+        detail = f"sequence length differs: candidate={len(rows)}, recomputed={len(expected_rows)}"
+    else:
+        for index, (candidate_row, expected_row) in enumerate(
+            zip(rows, expected_rows, strict=True)
+        ):
+            if candidate_row != expected_row:
+                mismatch_index = index
+                if isinstance(candidate_row, dict):
+                    changed = sorted(
+                        key
+                        for key in set(candidate_row) | set(expected_row)
+                        if candidate_row.get(key) != expected_row.get(key)
+                    )
+                    detail = "fields differ: " + ",".join(changed)
+                else:
+                    detail = "candidate signal is not an object"
+                break
+    if mismatch_index is not None:
+        return _parity_result(
+            candidate_id=candidate_id,
+            outcome="ERROR",
+            reason_code="SIGNAL_PARITY_MISMATCH",
+            mismatch_index=mismatch_index,
+            decisions=decisions,
+            candidate_signal_count=len(rows),
+            detail=detail,
+        )
+    return _parity_result(
+        candidate_id=candidate_id,
+        outcome="PASS",
+        reason_code="SIGNAL_PARITY_MATCH",
+        mismatch_index=None,
+        decisions=decisions,
+        candidate_signal_count=len(rows),
+        detail=None,
+    )
 
 
 def _signals(candidate: dict[str, JsonValue]) -> list[_Signal]:
@@ -460,6 +657,16 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
     catalog_path = Path(request.catalog_path)
     catalog = ParquetDataCatalog(str(catalog_path))
     source_bars = _source_bars(candidate, catalog, catalog_path)
+    if candidate.get("schema_version") == "pybroker-candidate-v2":
+        parity = request.signal_parity
+        if parity is None:
+            raise CandidateBacktestError("Candidate v2 requires a passed signal parity gate")
+        replay_signals = [
+            _Signal(item.target_intent, item.ts_event_ns)
+            for item in _verified_parity_decisions(parity, candidate_id)
+        ]
+    else:
+        replay_signals = _signals(candidate)
     bars = [bar for bar in source_bars if bar.ts_event >= policy.historical_start_ns]
     if not bars:
         raise CandidateBacktestError("catalog has no bars at or after historical_start")
@@ -499,7 +706,7 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             instrument.id,
             BarType.from_str(bar_type_text),
             policy.quantity,
-            _signals(candidate),
+            replay_signals,
             bars[-1].ts_event,
         ),
     )
@@ -694,6 +901,15 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             "strategy_id": request.strategy_id,
             "accounting_reconciled": True,
         }
+        if candidate.get("schema_version") == "pybroker-candidate-v2":
+            parity = request.signal_parity
+            if parity is None:  # Defensive: the gate check above already rejects this.
+                raise CandidateBacktestError("Candidate v2 parity result disappeared")
+            verdict["signal_parity"] = {
+                "artifact_sha256": parity.artifact_sha256,
+                "outcome": parity.outcome,
+                "reason_code": parity.reason_code,
+            }
         verdict["canonical_result_hash"] = sha256(_canonical(verdict)).hexdigest()
         payload = _canonical(verdict)
         return CandidateBacktestResult(verdict, payload, sha256(payload).hexdigest())

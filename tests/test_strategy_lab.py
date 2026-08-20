@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import asdict
 from hashlib import sha256
 import json
 import math
@@ -19,6 +20,16 @@ from nautilus_trader.persistence import ParquetDataCatalog
 import nautilus_quant.strategy_lab as strategy_lab
 from nautilus_quant.funding_observation import migrate_funding_observations
 from nautilus_quant.nautilus_io import make_bar
+from nautilus_quant.strategy_families import (
+    ClosedBar,
+    FamilyDefinition,
+    FamilyEvaluation,
+    FamilyRegistry,
+    KERNEL_HASH,
+    KERNEL_VERSION,
+    derive_signal_id,
+    evaluate_batch,
+)
 from nautilus_quant.strategy_lab import load_strategy_hypothesis
 from tests.test_candidate_backtest import (
     BAR_TYPE,
@@ -64,6 +75,157 @@ def valid_hypothesis() -> dict[str, JsonValue]:
     }
 
 
+def valid_hypothesis_v2() -> dict[str, JsonValue]:
+    return {
+        "bar_type": "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",
+        "based_on_verdict_id": None,
+        "falsification": "Momentum does not survive formal accounting",
+        "family_version": "lookback-momentum-long-flat-v1",
+        "instrument_id": "BTCUSDT-PERP.BINANCE",
+        "parameters": {"entry_threshold": 0.05, "lookback_bars": 2},
+        "parent_strategy_id": None,
+        "schema_version": "strategy-hypothesis-v2",
+        "strategy_family": "lookback-momentum-long-flat",
+        "thesis": "Positive momentum persists into the next event",
+    }
+
+
+def create_legacy_v1_ledger(path: Path, *, valid: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE strategies (
+                strategy_id TEXT PRIMARY KEY,
+                family TEXT NOT NULL,
+                lookback_bars INTEGER NOT NULL,
+                entry_threshold REAL NOT NULL,
+                instrument_id TEXT NOT NULL,
+                bar_type TEXT NOT NULL
+            );
+            CREATE TABLE hypotheses (
+                hypothesis_id TEXT PRIMARY KEY,
+                strategy_id TEXT NOT NULL,
+                parent_strategy_id TEXT,
+                based_on_verdict_id TEXT,
+                artifact_path TEXT NOT NULL,
+                artifact_sha256 TEXT NOT NULL CHECK (artifact_sha256 = hypothesis_id),
+                UNIQUE (hypothesis_id, strategy_id),
+                CHECK ((parent_strategy_id IS NULL) = (based_on_verdict_id IS NULL)),
+                FOREIGN KEY (strategy_id) REFERENCES strategies(strategy_id),
+                FOREIGN KEY (parent_strategy_id, based_on_verdict_id)
+                    REFERENCES verdicts(strategy_id, verdict_id)
+            );
+            CREATE TABLE experiments (
+                experiment_id TEXT PRIMARY KEY,
+                hypothesis_id TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                data_source_id TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                engine_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                UNIQUE (experiment_id, strategy_id),
+                UNIQUE (strategy_id, data_source_id, policy_id, engine_id, runtime_id),
+                FOREIGN KEY (hypothesis_id, strategy_id)
+                    REFERENCES hypotheses(hypothesis_id, strategy_id)
+            );
+            CREATE TABLE verdicts (
+                verdict_id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL UNIQUE,
+                strategy_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (outcome IN ('SUCCESS', 'REJECTION')),
+                reason_code TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                artifact_sha256 TEXT NOT NULL,
+                UNIQUE (strategy_id, verdict_id),
+                FOREIGN KEY (experiment_id, strategy_id)
+                    REFERENCES experiments(experiment_id, strategy_id)
+            );
+            CREATE TABLE errors (
+                error_id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                artifact_sha256 TEXT NOT NULL,
+                FOREIGN KEY (experiment_id) REFERENCES experiments(experiment_id)
+            );
+            CREATE TABLE stage_results (
+                experiment_id TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                stage TEXT NOT NULL CHECK (stage IN (
+                    'PyBroker completed', 'Research screened', 'Nautilus replayed'
+                )),
+                outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED', 'ERROR')),
+                reason_code TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                artifact_sha256 TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, stage),
+                FOREIGN KEY (experiment_id, strategy_id)
+                    REFERENCES experiments(experiment_id, strategy_id)
+            );
+            """
+        )
+        strategy_id = "1" * 64
+        hypothesis_id = "2" * 64
+        experiment_id = "3" * 64
+        verdict_id = "4" * 64
+        connection.execute(
+            "INSERT INTO strategies VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                strategy_id,
+                "lookback-momentum-long-flat" if valid else "unknown-family",
+                24,
+                0.0,
+                "BTCUSDT-PERP.BINANCE",
+                "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO hypotheses VALUES (?, ?, NULL, NULL, ?, ?)",
+            (hypothesis_id, strategy_id, "/legacy/hypothesis.json", hypothesis_id),
+        )
+        connection.execute(
+            "INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (experiment_id, hypothesis_id, strategy_id, "data", "policy", "engine", "runtime"),
+        )
+        connection.execute(
+            "INSERT INTO verdicts VALUES (?, ?, ?, 'SUCCESS', ?, ?, ?)",
+            (verdict_id, experiment_id, strategy_id, "RETAINED", "/legacy/verdict.json", "5" * 64),
+        )
+        connection.execute(
+            "INSERT INTO errors VALUES (?, ?, ?, ?, ?, ?)",
+            ("6" * 64, experiment_id, "PYBROKER", "OLD_ERROR", "/legacy/error.json", "7" * 64),
+        )
+        connection.execute(
+            "INSERT INTO stage_results VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                experiment_id,
+                strategy_id,
+                "Nautilus replayed",
+                "PASSED",
+                "OLD_STAGE",
+                "/legacy/stage.json",
+                "8" * 64,
+            ),
+        )
+        for table in (
+            "strategies",
+            "hypotheses",
+            "experiments",
+            "verdicts",
+            "errors",
+            "stage_results",
+        ):
+            for action in ("UPDATE", "DELETE"):
+                connection.execute(
+                    f"""CREATE TRIGGER {table}_immutable_{action.lower()}
+                    BEFORE {action} ON {table}
+                    BEGIN SELECT RAISE(ABORT, '{table} records are immutable'); END"""
+                )
+
+
 class StrategyHypothesisTests(unittest.TestCase):
     def _load(self, payload: bytes):
         temporary_directory = TemporaryDirectory()
@@ -80,7 +242,69 @@ class StrategyHypothesisTests(unittest.TestCase):
 
         self.assertEqual(loaded.hypothesis_id, sha256(payload).hexdigest())
         self.assertEqual(loaded.parameters.lookback_bars, 24)
+        self.assertEqual(loaded.identity_schema, "strategy-id-v1")
         self.assertIsNone(loaded.parent_strategy_id)
+
+    def test_accepts_v2_and_binds_family_version_into_strategy_identity(self):
+        first_document = valid_hypothesis_v2()
+        first = self._load(canonical_bytes(first_document))
+        second_document = valid_hypothesis_v2()
+        parameters = second_document["parameters"]
+        self.assertIsInstance(parameters, dict)
+        parameters["entry_threshold"] = 0.06
+        second = self._load(canonical_bytes(second_document))
+
+        self.assertEqual(first.identity_schema, "strategy-id-v2")
+        self.assertEqual(first.family_id, "lookback-momentum-long-flat")
+        self.assertEqual(first.family_version, "lookback-momentum-long-flat-v1")
+        self.assertEqual(first.parameters.values, {"entry_threshold": 0.05, "lookback_bars": 2})
+        self.assertNotEqual(first.strategy_id, second.strategy_id)
+
+    def test_v2_family_acceptance_is_owned_by_the_tracked_registry(self):
+        document = valid_hypothesis_v2()
+        document["strategy_family"] = "minimum-close-long-flat"
+        document["family_version"] = "minimum-close-long-flat-v1"
+        document["parameters"] = {"minimum_close": 100.0}
+        registry = FamilyRegistry(
+            (
+                FamilyDefinition(
+                    family_id="minimum-close-long-flat",
+                    family_version="minimum-close-long-flat-v1",
+                    warmup_bars=lambda _parameters: 1,
+                    validate_parameters=lambda parameters: {
+                        "minimum_close": float(parameters["minimum_close"])
+                    },
+                    evaluate=lambda bars, parameters: FamilyEvaluation(
+                        score=bars[-1].close,
+                        target_intent=(
+                            "LONG"
+                            if bars[-1].close > parameters["minimum_close"]
+                            else "FLAT"
+                        ),
+                        reason="CLOSE_COMPARED_WITH_MINIMUM",
+                    ),
+                ),
+            ),
+        )
+
+        with patch.object(strategy_lab, "DEFAULT_REGISTRY", registry):
+            loaded = self._load(canonical_bytes(document))
+
+        self.assertEqual(loaded.family_id, "minimum-close-long-flat")
+        self.assertEqual(loaded.parameters.values, {"minimum_close": 100.0})
+
+    def test_v2_rejects_untracked_family_version_and_forbidden_parameters(self):
+        wrong_version = valid_hypothesis_v2()
+        wrong_version["family_version"] = "lookback-momentum-long-flat-v999"
+        with self.assertRaisesRegex(ValueError, "family_version"):
+            self._load(canonical_bytes(wrong_version))
+
+        forbidden = valid_hypothesis_v2()
+        parameters = forbidden["parameters"]
+        self.assertIsInstance(parameters, dict)
+        parameters["leverage"] = 2
+        with self.assertRaisesRegex(ValueError, "forbidden hypothesis field"):
+            self._load(canonical_bytes(forbidden))
 
     def test_rejects_unknown_strategy_family(self):
         hypothesis = valid_hypothesis()
@@ -239,6 +463,76 @@ class StrategyLedgerTests(unittest.TestCase):
             {"strategies", "hypotheses", "experiments", "verdicts", "errors"} <= tables
         )
 
+    def test_initialize_migrates_copied_v1_ledger_without_reidentifying_or_losing_rows(self):
+        create_legacy_v1_ledger(self.ledger.path)
+        preserved_tables = ("hypotheses", "experiments", "verdicts", "errors", "stage_results")
+        with closing(sqlite3.connect(self.ledger.path)) as connection:
+            before = {
+                table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                for table in preserved_tables
+            }
+            stage_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'"
+            ).fetchone()[0]
+
+        self.ledger.initialize()
+
+        with closing(sqlite3.connect(self.ledger.path)) as connection:
+            columns = [row[1] for row in connection.execute("PRAGMA table_info(strategies)")]
+            migrated = connection.execute("SELECT * FROM strategies").fetchone()
+            after = {
+                table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                for table in preserved_tables
+            }
+            migrated_stage_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'"
+            ).fetchone()[0]
+            foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+            triggers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+
+        self.assertEqual(
+            columns,
+            [
+                "strategy_id",
+                "family",
+                "family_version",
+                "parameters_json",
+                "instrument_id",
+                "bar_type",
+                "identity_schema",
+            ],
+        )
+        self.assertEqual(migrated[0], "1" * 64)
+        self.assertEqual(migrated[1:4], (
+            "lookback-momentum-long-flat",
+            "lookback-momentum-long-flat-v1",
+            canonical_bytes({"entry_threshold": 0.0, "lookback_bars": 24}).decode(),
+        ))
+        self.assertEqual(migrated[-1], "strategy-id-v1")
+        self.assertEqual(after, before)
+        self.assertEqual(migrated_stage_sql, stage_sql)
+        self.assertEqual(foreign_key_errors, [])
+        for table in (*preserved_tables, "strategies", "signal_parity_results"):
+            self.assertIn(f"{table}_immutable_update", triggers)
+            self.assertIn(f"{table}_immutable_delete", triggers)
+
+    def test_invalid_legacy_strategy_rolls_back_migration_instead_of_resetting(self):
+        create_legacy_v1_ledger(self.ledger.path, valid=False)
+
+        with self.assertRaisesRegex(ValueError, "legacy strategy family"):
+            self.ledger.initialize()
+
+        with closing(sqlite3.connect(self.ledger.path)) as connection:
+            columns = [row[1] for row in connection.execute("PRAGMA table_info(strategies)")]
+            row = connection.execute("SELECT family FROM strategies").fetchone()
+        self.assertIn("lookback_bars", columns)
+        self.assertEqual(row, ("unknown-family",))
+
     def test_initialize_migrates_legacy_stage_outcomes_without_losing_rows(self):
         self.ledger.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
@@ -281,6 +575,78 @@ class StrategyLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger.path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_signal_parity_result_is_hashed_append_only_evidence(self):
+        self.ledger.initialize()
+        hypothesis = self._hypothesis(24)
+        self.ledger.record_hypothesis(hypothesis)
+        experiment_id = self._experiment(hypothesis, "parity")
+        candidate_id = "a" * 64
+        artifact = {
+            "candidate_id": candidate_id,
+            "candidate_signal_count": 2,
+            "detail": None,
+            "mismatch_index": None,
+            "outcome": "PASS",
+            "reason_code": "SIGNAL_PARITY_MATCH",
+            "recomputed_signal_count": 2,
+            "recomputed_signals_sha256": "b" * 64,
+            "required_action": None,
+            "schema_version": "signal-parity-result-v1",
+        }
+        path = self.root / "signal-parity-result.json"
+        path.write_bytes(canonical_bytes(artifact))
+        record = strategy_lab.SignalParityRecord(
+            experiment_id=experiment_id,
+            candidate_id=candidate_id,
+            evaluation_context_id="c" * 64,
+            data_snapshot_id="d" * 64,
+            outcome="PASS",
+            reason_code="SIGNAL_PARITY_MATCH",
+            required_action=None,
+            artifact_path=str(path),
+            artifact_sha256=sha256(path.read_bytes()).hexdigest(),
+        )
+
+        first_id = self.ledger.record_signal_parity(record)
+        second_id = self.ledger.record_signal_parity(record)
+
+        self.assertEqual(first_id, second_id)
+        with closing(sqlite3.connect(self.ledger.path)) as connection:
+            stored = connection.execute(
+                "SELECT * FROM signal_parity_results",
+            ).fetchone()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    "UPDATE signal_parity_results SET reason_code = 'TAMPERED'",
+                )
+        self.assertEqual(stored[0], first_id)
+        self.assertEqual(stored[1:8], (
+            experiment_id,
+            candidate_id,
+            "c" * 64,
+            "d" * 64,
+            "PASS",
+            "SIGNAL_PARITY_MATCH",
+            None,
+        ))
+
+        conflict_artifact = {**artifact, "reason_code": "DIFFERENT"}
+        conflict_path = self.root / "signal-parity-conflict.json"
+        conflict_path.write_bytes(canonical_bytes(conflict_artifact))
+        conflict = strategy_lab.SignalParityRecord(
+            experiment_id=record.experiment_id,
+            candidate_id=record.candidate_id,
+            evaluation_context_id=record.evaluation_context_id,
+            data_snapshot_id=record.data_snapshot_id,
+            outcome=record.outcome,
+            reason_code="DIFFERENT",
+            required_action=record.required_action,
+            artifact_path=str(conflict_path),
+            artifact_sha256=sha256(conflict_path.read_bytes()).hexdigest(),
+        )
+        with self.assertRaisesRegex(ValueError, "parity record conflict"):
+            self.ledger.record_signal_parity(conflict)
 
     def test_existing_hypothesis_and_stage_artifacts_are_reverified_on_conflict(self):
         self.ledger.initialize()
@@ -619,6 +985,16 @@ class StrategyLoopControllerTests(unittest.TestCase):
         path.write_bytes(canonical_bytes(document))
         return path
 
+    def _hypothesis_v2(self, lookback_bars: int = 2) -> Path:
+        document = valid_hypothesis_v2()
+        parameters = document["parameters"]
+        self.assertIsInstance(parameters, dict)
+        parameters["entry_threshold"] = 0.0
+        parameters["lookback_bars"] = lookback_bars
+        path = self.root / f"hypothesis-v2-{lookback_bars}.json"
+        path.write_bytes(canonical_bytes(document))
+        return path
+
     def _candidate(
         self, lookback_bars: int, *, source_hash: str | None = None
     ) -> bytes:
@@ -666,6 +1042,89 @@ class StrategyLoopControllerTests(unittest.TestCase):
                 {
                     "candidate_id": candidate_id,
                     "provisional_metrics": {"orders": 2, "signals": 2},
+                },
+            )
+            return strategy_lab._ProcessResult(0, stdout, b"", False, False, False)
+
+        return run
+
+    def _process_v2(self, *, tamper: bool = False) -> Callable[..., strategy_lab._ProcessResult]:
+        bars = tuple(
+            ClosedBar(
+                ts_event_ns=hour * HOUR_NS,
+                open=1000,
+                high=1000,
+                low=1000,
+                close=1000,
+                volume=10,
+            )
+            for hour in range(1, 11)
+        )
+
+        def run(argv, **_kwargs):
+            context = argv[argv.index("--evaluation-context-id") + 1]
+            environment = argv[argv.index("--environment-id") + 1]
+            decisions = [
+                asdict(item)
+                for item in evaluate_batch(
+                    family_id="lookback-momentum-long-flat",
+                    family_version="lookback-momentum-long-flat-v1",
+                    parameters={"entry_threshold": 0.0, "lookback_bars": 2},
+                    bars=bars,
+                )
+            ]
+            if tamper:
+                decisions[0]["score"] = "0.1"
+                decisions[0]["signal_id"] = derive_signal_id(
+                    family_id=str(decisions[0]["family_id"]),
+                    family_version=str(decisions[0]["family_version"]),
+                    kernel_hash=str(decisions[0]["kernel_hash"]),
+                    kernel_version=str(decisions[0]["kernel_version"]),
+                    parameters={"entry_threshold": 0.0, "lookback_bars": 2},
+                    reason=str(decisions[0]["reason"]),
+                    score=str(decisions[0]["score"]),
+                    target_intent=str(decisions[0]["target_intent"]),
+                    ts_event_ns=int(decisions[0]["ts_event_ns"]),
+                )
+            source_hash = _catalog_digest(self.catalog_path)
+            candidate = canonical_bytes(
+                {
+                    "bar_type": BAR_TYPE,
+                    "evaluation_context_id": context,
+                    "instrument_id": INSTRUMENT_ID,
+                    "runtime": {
+                        "environment_id": environment,
+                        "pybroker_version": "1.2.14",
+                        "python_version": "3.12.13",
+                        "seed": 42,
+                    },
+                    "schema_version": "pybroker-candidate-v2",
+                    "signals": decisions,
+                    "source": {
+                        "data_as_of_ns": 10 * HOUR_NS,
+                        "data_snapshot_id": source_hash,
+                        "first_ts_event_ns": HOUR_NS,
+                        "last_ts_event_ns": 10 * HOUR_NS,
+                        "row_count": 10,
+                        "sha256": source_hash,
+                    },
+                    "strategy": {
+                        "decision_timing": "bar-close; effective no earlier than next event",
+                        "family_id": "lookback-momentum-long-flat",
+                        "family_version": "lookback-momentum-long-flat-v1",
+                        "kernel_hash": KERNEL_HASH,
+                        "kernel_version": KERNEL_VERSION,
+                        "parameters": {"entry_threshold": 0.0, "lookback_bars": 2},
+                    },
+                    "truth_status": "provisional",
+                },
+            )
+            output = Path(argv[argv.index("--output") + 1])
+            output.write_bytes(candidate)
+            stdout = canonical_bytes(
+                {
+                    "candidate_id": sha256(candidate).hexdigest(),
+                    "provisional_metrics": {"orders": 0, "signals": len(decisions)},
                 },
             )
             return strategy_lab._ProcessResult(0, stdout, b"", False, False, False)
@@ -787,6 +1246,61 @@ class StrategyLoopControllerTests(unittest.TestCase):
         feedback_path.write_bytes(canonical_bytes(tampered))
         with self.assertRaisesRegex(ValueError, "cached feedback mismatch"):
             strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
+
+    def test_v2_controller_records_parity_before_nautilus_and_passes_recomputed_signals(self):
+        hypothesis_path = self._hypothesis_v2()
+        with (
+            patch(
+                "nautilus_quant.strategy_lab._run_bounded_process",
+                side_effect=self._process_v2(),
+            ) as run_process,
+            patch(
+                "nautilus_quant.strategy_lab.run_candidate_backtest",
+                wraps=strategy_lab.run_candidate_backtest,
+            ) as run_nautilus,
+        ):
+            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
+
+        self.assertEqual(feedback["status"], "EVALUATED")
+        argv = run_process.call_args.args[0]
+        context = argv[argv.index("--evaluation-context-id") + 1]
+        environment = argv[argv.index("--environment-id") + 1]
+        self.assertRegex(context, r"^[0-9a-f]{64}$")
+        self.assertRegex(environment, r"^[0-9a-f]{64}$")
+        request = run_nautilus.call_args.args[0]
+        self.assertIsNotNone(request.signal_parity)
+        self.assertEqual(request.signal_parity.outcome, "PASS")
+        run_directory = self.paths.state_path / "runs" / feedback["experiment_id"]
+        self.assertTrue((run_directory / "signal-parity-result.json").is_file())
+        with closing(sqlite3.connect(self.paths.state_path / "ledger.sqlite3")) as connection:
+            parity = connection.execute(
+                """SELECT outcome, reason_code, required_action,
+                evaluation_context_id FROM signal_parity_results""",
+            ).fetchone()
+        self.assertEqual(parity, ("PASS", "SIGNAL_PARITY_MATCH", None, context))
+
+    def test_v2_parity_mismatch_is_fix_technical_and_never_calls_nautilus(self):
+        hypothesis_path = self._hypothesis_v2()
+        with (
+            patch(
+                "nautilus_quant.strategy_lab._run_bounded_process",
+                side_effect=self._process_v2(tamper=True),
+            ),
+            patch("nautilus_quant.strategy_lab.run_candidate_backtest") as run_nautilus,
+        ):
+            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
+
+        run_nautilus.assert_not_called()
+        self.assertEqual(feedback["status"], "ERROR")
+        self.assertEqual(feedback["failed_stage"], "RESEARCH")
+        self.assertEqual(feedback["reason_codes"], ["SIGNAL_PARITY_MISMATCH"])
+        with closing(sqlite3.connect(self.paths.state_path / "ledger.sqlite3")) as connection:
+            parity = connection.execute(
+                "SELECT outcome, reason_code, required_action FROM signal_parity_results",
+            ).fetchone()
+            verdict_count = connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0]
+        self.assertEqual(parity, ("ERROR", "SIGNAL_PARITY_MISMATCH", "FIX_TECHNICAL"))
+        self.assertEqual(verdict_count, 0)
 
     def test_cached_experiment_reverifies_stage_artifacts(self):
         hypothesis_path = self._hypothesis(24)

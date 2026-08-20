@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
-import math
 import os
 from pathlib import Path
 import sys
 from tempfile import NamedTemporaryFile
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+# ponytail: the isolated research venv imports only the pure shared kernel from src;
+# installing the full Nautilus package here would couple the two runtimes.
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+from nautilus_quant.strategy_families import (  # noqa: E402
+    DEFAULT_REGISTRY,
+    KERNEL_HASH,
+    KERNEL_VERSION,
+    ClosedBar,
+    FamilyKernelError,
+    evaluate_batch,
+)
 
 
 INSTRUMENT_ID = "BTCUSDT-PERP.BINANCE"
@@ -26,9 +40,18 @@ HYPOTHESIS_FIELDS = {
     "strategy_family",
     "thesis",
 }
+HYPOTHESIS_FIELDS_V2 = HYPOTHESIS_FIELDS | {"family_version"}
 PARAMETER_FIELDS = {"entry_threshold", "lookback_bars"}
 HEX_DIGITS = frozenset("0123456789abcdef")
 REPOSITORY_DATA = Path(__file__).resolve().parents[1] / "data"
+
+
+@dataclass(frozen=True, slots=True)
+class HypothesisSpec:
+    schema_version: str
+    family_id: str
+    family_version: str
+    parameters: dict[str, object]
 
 
 def canonical_json(value: object) -> bytes:
@@ -54,17 +77,31 @@ def _reject_constant(value: str) -> object:
     raise ValueError(f"hypothesis must contain only finite JSON values: {value}")
 
 
-def load_hypothesis(path: Path) -> tuple[int, float]:
+def load_hypothesis(path: Path) -> HypothesisSpec:
     payload = Path(path).read_bytes()
     try:
         root = json.loads(payload, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("hypothesis must be UTF-8 JSON") from error
-    if not isinstance(root, dict) or set(root) != HYPOTHESIS_FIELDS:
+    if not isinstance(root, dict):
         raise ValueError("invalid hypothesis fields")
-    if root["schema_version"] != "strategy-hypothesis-v1":
+    schema_version = root.get("schema_version")
+    if schema_version == "strategy-hypothesis-v1":
+        expected_fields = HYPOTHESIS_FIELDS
+        family_version = "lookback-momentum-long-flat-v1"
+    elif schema_version == "strategy-hypothesis-v2":
+        expected_fields = HYPOTHESIS_FIELDS_V2
+        family_version = root.get("family_version")
+        if not isinstance(family_version, str) or not family_version:
+            raise ValueError("family_version must be a non-empty string")
+    else:
         raise ValueError("unsupported hypothesis schema_version")
-    if root["strategy_family"] != "lookback-momentum-long-flat":
+    if set(root) != expected_fields:
+        raise ValueError("invalid hypothesis fields")
+    family_id = root["strategy_family"]
+    if not isinstance(family_id, str) or not family_id:
+        raise ValueError("unsupported strategy family")
+    if schema_version == "strategy-hypothesis-v1" and family_id != "lookback-momentum-long-flat":
         raise ValueError("unsupported strategy family")
     if root["instrument_id"] != INSTRUMENT_ID:
         raise ValueError("unsupported instrument_id")
@@ -84,26 +121,27 @@ def load_hypothesis(path: Path) -> tuple[int, float]:
     if (parent is None) != (verdict is None):
         raise ValueError("lineage fields must both be null or both be populated")
     parameters = root["parameters"]
-    if not isinstance(parameters, dict) or set(parameters) != PARAMETER_FIELDS:
+    if not isinstance(parameters, dict):
         raise ValueError("invalid parameters fields")
-    lookback_bars = parameters["lookback_bars"]
-    if isinstance(lookback_bars, bool) or not isinstance(lookback_bars, int):
-        raise ValueError("lookback_bars must be an integer")
-    if not 1 <= lookback_bars <= 8_760:
-        raise ValueError("lookback_bars must be between 1 and 8760")
-    entry_threshold = parameters["entry_threshold"]
-    if isinstance(entry_threshold, bool) or not isinstance(entry_threshold, (int, float)):
-        raise ValueError("entry_threshold must be a number")
-    if not math.isfinite(entry_threshold) or entry_threshold < 0:
-        raise ValueError("entry_threshold must be finite and non-negative")
-    normalized_threshold = 0.0 if entry_threshold == 0 else float(entry_threshold)
+    if schema_version == "strategy-hypothesis-v1" and set(parameters) != PARAMETER_FIELDS:
+        raise ValueError("invalid parameters fields")
+    try:
+        definition = DEFAULT_REGISTRY.resolve(family_id, family_version)
+        normalized_parameters = definition.validate_parameters(parameters)
+    except FamilyKernelError as error:
+        raise ValueError(str(error)) from error
     normalized = dict(
         root,
-        parameters={"entry_threshold": normalized_threshold, "lookback_bars": lookback_bars},
+        parameters=normalized_parameters,
     )
     if payload != canonical_json(normalized):
         raise ValueError("hypothesis must use canonical JSON encoding")
-    return lookback_bars, normalized_threshold
+    return HypothesisSpec(
+        schema_version=str(schema_version),
+        family_id=family_id,
+        family_version=family_version,
+        parameters=normalized_parameters,
+    )
 
 
 def validate_output_path(catalog: Path, output: Path) -> Path:
@@ -200,8 +238,25 @@ def load_bars(catalog: Path):
     return data, source_hash
 
 
-def run(catalog: Path, output: Path, *, hypothesis: Path) -> dict[str, object]:
-    lookback_bars, entry_threshold = load_hypothesis(hypothesis)
+def _content_id(value: str | None, field: str) -> str:
+    if value is None or len(value) != 64 or not set(value) <= HEX_DIGITS:
+        raise ValueError(f"{field} must be lowercase SHA-256")
+    return value
+
+
+def run(
+    catalog: Path,
+    output: Path,
+    *,
+    hypothesis: Path,
+    evaluation_context_id: str | None = None,
+    environment_id: str | None = None,
+) -> dict[str, object]:
+    specification = load_hypothesis(hypothesis)
+    is_v2 = specification.schema_version == "strategy-hypothesis-v2"
+    if is_v2:
+        evaluation_context_id = _content_id(evaluation_context_id, "evaluation_context_id")
+        environment_id = _content_id(environment_id, "environment_id")
     catalog_path = Path(catalog)
     catalog = catalog_path.resolve()
     output = validate_output_path(catalog_path, output)
@@ -212,23 +267,44 @@ def run(catalog: Path, output: Path, *, hypothesis: Path) -> dict[str, object]:
     pybroker.disable_logging()
     pybroker.register_columns("ts_event_ns")
     data, source_hash = load_bars(catalog)
-    signals: list[dict[str, object]] = []
+    closed_bars = tuple(
+        ClosedBar(
+            ts_event_ns=int(row.ts_event_ns),
+            open=float(row.open),
+            high=float(row.high),
+            low=float(row.low),
+            close=float(row.close),
+            volume=float(row.volume),
+        )
+        for row in data.itertuples(index=False)
+    )
+    decisions = evaluate_batch(
+        family_id=specification.family_id,
+        family_version=specification.family_version,
+        parameters=specification.parameters,
+        bars=closed_bars,
+    )
+    decisions_by_time = {decision.ts_event_ns: decision for decision in decisions}
+    signals: list[dict[str, object]] = (
+        [asdict(decision) for decision in decisions] if is_v2 else []
+    )
 
     def execute(ctx) -> None:
-        if len(ctx.close) < lookback_bars:
+        decision = decisions_by_time.get(int(ctx.ts_event_ns[-1]))
+        if decision is None:
             return
-        score = round(float(ctx.close[-1] / ctx.close[-lookback_bars] - 1), 12)
-        wants_long = score > entry_threshold
+        wants_long = decision.target_intent == "LONG"
         is_long = ctx.long_pos() is not None
         if wants_long == is_long:
             return
-        signals.append(
-            {
-                "intent": "LONG" if wants_long else "FLAT",
-                "score": score,
-                "ts_event_ns": int(ctx.ts_event_ns[-1]),
-            },
-        )
+        if not is_v2:
+            signals.append(
+                {
+                    "intent": decision.target_intent,
+                    "score": float(decision.score),
+                    "ts_event_ns": decision.ts_event_ns,
+                },
+            )
         if wants_long:
             ctx.buy_shares = 1
         else:
@@ -246,32 +322,51 @@ def run(catalog: Path, output: Path, *, hypothesis: Path) -> dict[str, object]:
     if result.portfolio.empty:
         raise RuntimeError("PyBroker returned an empty portfolio")
 
-    candidate = {
+    runtime: dict[str, object] = {
+        "pybroker_version": pybroker.__version__,
+        "python_version": sys.version.split()[0],
+        "seed": SEED,
+    }
+    source: dict[str, object] = {
+        "first_ts_event_ns": int(data.iloc[0]["ts_event_ns"]),
+        "last_ts_event_ns": int(data.iloc[-1]["ts_event_ns"]),
+        "row_count": len(data),
+        "sha256": source_hash,
+    }
+    strategy_contract: dict[str, object]
+    candidate: dict[str, object] = {
         "bar_type": BAR_TYPE,
         "instrument_id": INSTRUMENT_ID,
-        "runtime": {
-            "pybroker_version": pybroker.__version__,
-            "python_version": sys.version.split()[0],
-            "seed": SEED,
-        },
-        "schema_version": "pybroker-candidate-v1",
+        "runtime": runtime,
+        "schema_version": "pybroker-candidate-v2" if is_v2 else "pybroker-candidate-v1",
         "signals": signals,
-        "source": {
-            "first_ts_event_ns": int(data.iloc[0]["ts_event_ns"]),
-            "last_ts_event_ns": int(data.iloc[-1]["ts_event_ns"]),
-            "row_count": len(data),
-            "sha256": source_hash,
-        },
-        "strategy": {
-            "decision_timing": "bar-close; effective no earlier than next event",
-            "name": "lookback-momentum-long-flat",
-            "parameters": {
-                "entry_threshold": entry_threshold,
-                "lookback_bars": lookback_bars,
-            },
-        },
+        "source": source,
         "truth_status": "provisional",
     }
+    if is_v2:
+        runtime["environment_id"] = environment_id
+        source.update(
+            {
+                "data_as_of_ns": source["last_ts_event_ns"],
+                "data_snapshot_id": source_hash,
+            },
+        )
+        strategy_contract = {
+            "decision_timing": "bar-close; effective no earlier than next event",
+            "family_id": specification.family_id,
+            "family_version": specification.family_version,
+            "kernel_hash": KERNEL_HASH,
+            "kernel_version": KERNEL_VERSION,
+            "parameters": specification.parameters,
+        }
+        candidate["evaluation_context_id"] = evaluation_context_id
+    else:
+        strategy_contract = {
+            "decision_timing": "bar-close; effective no earlier than next event",
+            "name": specification.family_id,
+            "parameters": specification.parameters,
+        }
+    candidate["strategy"] = strategy_contract
     candidate_id = write_candidate(candidate, output)
     return {
         "candidate_id": candidate_id,
@@ -284,11 +379,15 @@ def main() -> int:
     parser.add_argument("--hypothesis", type=Path, required=True)
     parser.add_argument("--catalog", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--evaluation-context-id")
+    parser.add_argument("--environment-id")
     args = parser.parse_args()
     result = run(
         args.catalog,
         args.output,
         hypothesis=args.hypothesis,
+        evaluation_context_id=args.evaluation_context_id,
+        environment_id=args.environment_id,
     )
     print(json.dumps(result, sort_keys=True))
     return 0

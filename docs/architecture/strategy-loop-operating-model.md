@@ -1,11 +1,15 @@
 # Strategy Loop Operating Model
 
-> **Status — accepted architecture decision, 2026-08-14; V2 control/evidence clarification accepted 2026-08-20.**
-> This document records the long-term operating model agreed with the operator. It distinguishes accepted direction from implemented capability: the historical two-generation v1 loop is real and verified; the shared family kernel, formal Signal Parity Gate, cross-tier policy control plane, robustness, shared live signal execution, Paper, Binance Demo/Testnet, promotion, and runtime qualification are not yet implemented.
+> **Status — accepted architecture decision, 2026-08-14; V2 control/evidence clarification accepted and Card 1 implemented 2026-08-20.**
+> This document records the long-term operating model agreed with the operator. It distinguishes accepted direction from implemented capability: the historical two-generation V1 loop and Card 1 family-kernel/parity slice are real; campaign screening, robustness, Risk & Execution Policy, shared live execution, Paper, Binance Demo/Testnet, promotion, and runtime qualification remain planned.
 
 Related implemented contracts and evidence:
 
 - [`../contracts/strategy-loop-v1.md`](../contracts/strategy-loop-v1.md)
+- [`../contracts/strategy-hypothesis-v2.md`](../contracts/strategy-hypothesis-v2.md)
+- [`../contracts/pybroker-candidate-v2.md`](../contracts/pybroker-candidate-v2.md)
+- [`../contracts/signal-parity-gate-v1.md`](../contracts/signal-parity-gate-v1.md)
+- [`../contracts/strategy-evidence-envelope-v2.md`](../contracts/strategy-evidence-envelope-v2.md)
 - [`../plans/2026-08-14-strategy-loop-v1.md`](../plans/2026-08-14-strategy-loop-v1.md)
 - [`../plans/2026-08-14-strategy-loop-family-paper-demo.md`](../plans/2026-08-14-strategy-loop-family-paper-demo.md)
 - [`hybrid-pybroker-nautilus.md`](hybrid-pybroker-nautilus.md)
@@ -307,7 +311,7 @@ Xiaoqian/Hermes may, without per-trial approval:
 
 ## Current implementation truth
 
-Implemented and independently verified at `2e424a38fcf9993d142cb31a53960066534f84a1`:
+Historical V1 implemented and independently verified at `2e424a38fcf9993d142cb31a53960066534f84a1`:
 
 - canonical `strategy-hypothesis-v1` trust boundary;
 - isolated parameterized PyBroker execution;
@@ -318,11 +322,21 @@ Implemented and independently verified at `2e424a38fcf9993d142cb31a53960066534f8
 - deterministic rerun reuse;
 - stages through `Nautilus replayed` derived from evidence.
 
-Accepted direction but not yet implemented:
+Card 1 `FAMILY-KERNEL-V2` implemented in the current repository change:
 
-- multi-family registry and shared historical/live signal kernel;
-- candidate v2 and formal Signal Parity Gate;
-- shared evidence-identity envelope and versioned gate-policy control plane;
+- pure-stdlib tracked family registry and deterministic batch/incremental kernel;
+- unchanged momentum formula moved out of the isolated PyBroker callback;
+- canonical signal identity, score, target intent, reason, family version, and kernel identity;
+- `strategy-hypothesis-v2`, `pybroker-candidate-v2`, and V1 schema dispatch;
+- formal fail-closed Signal Parity Gate before Nautilus accounting;
+- Nautilus consumption of only the independently recomputed PASS sequence;
+- evaluation-context identity and V2 experiment reuse invalidation;
+- append-only parity artifacts/ledger rows with technical `FIX_TECHNICAL` separation;
+- transactional V1-safe strategy-ledger migration without historical re-ID;
+- golden vectors, batch/incremental/restart/save-load/duplicate tests, and V1 regression coverage.
+
+Accepted direction but not yet implemented after Card 1:
+
 - deterministic campaign expander/controller;
 - substantive PyBroker provisional ranking/rejection policy;
 - immutable multiple-testing trial census and walk-forward/regime/cost robustness tier;
@@ -333,7 +347,7 @@ Accepted direction but not yet implemented:
 - promotion policy and compact operator projection;
 - post-promotion runtime qualification and a separately authorized bounded Live contract.
 
-The current V1 Nautilus consumer validates the candidate/source contract and replays Candidate v1 intent timestamps; it does not independently recompute family signals. Therefore Signal Parity Gate is accepted V2 work, not current implementation evidence.
+The legacy V1 Nautilus path still validates and replays Candidate v1 intent timestamps for backward compatibility. New V2 experiments require formal parity recomputation and cannot enter accounting on a missing or failed gate. Card 1 does not implement the future live delivery path, execution policy, or promotion tiers.
 
 This separation is load-bearing: an accepted architecture decision is not implementation evidence.
 
@@ -341,8 +355,8 @@ This separation is load-bearing: an accepted architecture decision is not implem
 
 This is an ordering record, not execution authorization:
 
-1. Shared deterministic family kernel, Candidate v2, evidence identities, and formal Signal Parity Gate.
-2. Substantive provisional PyBroker screen, deterministic campaign expansion, and complete trial census.
+1. **Completed Card 1:** shared deterministic family kernel, Candidate v2, evidence identities, and formal Signal Parity Gate.
+2. **Next planned, not implicitly authorized:** substantive provisional PyBroker screen, deterministic campaign expansion, and complete trial census.
 3. Historical robustness verdict, multiple-testing context, and feedback routing.
 4. Strategy freeze, versioned Risk & Execution Policy, production-data Shadow, and Sandbox Paper prospective evidence.
 5. Binance execution/risk metadata truth plus Demo/Testnet order-lifecycle and reconciliation suite.

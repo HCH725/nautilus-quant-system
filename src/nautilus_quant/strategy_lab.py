@@ -20,8 +20,19 @@ from typing import Final, IO, Literal, assert_never
 
 import nautilus_trader
 
-from .candidate_backtest import CandidateBacktestRequest, run_candidate_backtest
+from .candidate_backtest import (
+    CandidateBacktestRequest,
+    SignalParityResult,
+    run_candidate_backtest,
+    run_signal_parity_gate,
+)
 from .pybroker_candidate import load_pybroker_candidate
+from .strategy_families import (
+    DEFAULT_REGISTRY,
+    KERNEL_HASH,
+    KERNEL_VERSION,
+    FamilyKernelError,
+)
 
 
 type JsonScalar = str | int | float | bool | None
@@ -29,7 +40,9 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
 
 _SCHEMA_VERSION: Final = "strategy-hypothesis-v1"
+_SCHEMA_VERSION_V2: Final = "strategy-hypothesis-v2"
 _STRATEGY_FAMILY: Final = "lookback-momentum-long-flat"
+_FAMILY_VERSION: Final = "lookback-momentum-long-flat-v1"
 _INSTRUMENT_ID: Final = "BTCUSDT-PERP.BINANCE"
 _BAR_TYPE: Final = "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL"
 _MAX_LOOKBACK_BARS: Final = 8_760
@@ -63,6 +76,7 @@ _TOP_LEVEL_FIELDS: Final = frozenset(
         "thesis",
     },
 )
+_TOP_LEVEL_FIELDS_V2: Final = _TOP_LEVEL_FIELDS | frozenset({"family_version"})
 _PARAMETER_FIELDS: Final = frozenset({"entry_threshold", "lookback_bars"})
 _FORBIDDEN_FIELDS: Final = frozenset(
     {
@@ -92,10 +106,13 @@ _SCHEMA: Final = """
 CREATE TABLE IF NOT EXISTS strategies (
     strategy_id TEXT PRIMARY KEY,
     family TEXT NOT NULL,
-    lookback_bars INTEGER NOT NULL,
-    entry_threshold REAL NOT NULL,
+    family_version TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
     instrument_id TEXT NOT NULL,
-    bar_type TEXT NOT NULL
+    bar_type TEXT NOT NULL,
+    identity_schema TEXT NOT NULL CHECK (
+        identity_schema IN ('strategy-id-v1', 'strategy-id-v2')
+    )
 );
 CREATE TABLE IF NOT EXISTS hypotheses (
     hypothesis_id TEXT PRIMARY KEY,
@@ -158,6 +175,24 @@ CREATE TABLE IF NOT EXISTS stage_results (
     FOREIGN KEY (experiment_id, strategy_id)
         REFERENCES experiments(experiment_id, strategy_id)
 );
+CREATE TABLE IF NOT EXISTS signal_parity_results (
+    parity_result_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    evaluation_context_id TEXT NOT NULL,
+    data_snapshot_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('PASS', 'ERROR')),
+    reason_code TEXT NOT NULL,
+    required_action TEXT,
+    artifact_path TEXT NOT NULL,
+    artifact_sha256 TEXT NOT NULL,
+    UNIQUE (experiment_id, candidate_id),
+    CHECK (
+        (outcome = 'PASS' AND required_action IS NULL)
+        OR (outcome = 'ERROR' AND required_action = 'FIX_TECHNICAL')
+    ),
+    FOREIGN KEY (experiment_id) REFERENCES experiments(experiment_id)
+);
 """
 _IMMUTABLE_TABLES: Final = (
     "strategies",
@@ -166,6 +201,7 @@ _IMMUTABLE_TABLES: Final = (
     "verdicts",
     "errors",
     "stage_results",
+    "signal_parity_results",
 )
 
 
@@ -175,8 +211,21 @@ class StrategyLabError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class StrategyParameters:
-    lookback_bars: int
-    entry_threshold: float
+    values: dict[str, JsonValue]
+
+    @property
+    def lookback_bars(self) -> int:
+        value = self.values.get("lookback_bars")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise StrategyLabError("strategy has no integer lookback_bars")
+        return value
+
+    @property
+    def entry_threshold(self) -> float:
+        value = self.values.get("entry_threshold")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise StrategyLabError("strategy has no numeric entry_threshold")
+        return float(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +236,9 @@ class StrategyHypothesis:
     thesis: str
     falsification: str
     parameters: StrategyParameters
+    family_id: str
+    family_version: str
+    identity_schema: Literal["strategy-id-v1", "strategy-id-v2"]
     strategy_id: str
     hypothesis_id: str
 
@@ -243,6 +295,19 @@ class StageRecord:
     stage: Literal["PyBroker completed", "Research screened", "Nautilus replayed"]
     outcome: Literal["PASSED", "REJECTED", "ERROR"]
     reason_code: str
+    artifact_path: str
+    artifact_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class SignalParityRecord:
+    experiment_id: str
+    candidate_id: str
+    evaluation_context_id: str
+    data_snapshot_id: str
+    outcome: Literal["PASS", "ERROR"]
+    reason_code: str
+    required_action: Literal["FIX_TECHNICAL"] | None
     artifact_path: str
     artifact_sha256: str
 
@@ -383,24 +448,28 @@ def _lineage_id(value: JsonValue, field: str) -> str | None:
 
 
 def _document(hypothesis: StrategyHypothesis) -> dict[str, JsonValue]:
-    return {
+    document: dict[str, JsonValue] = {
         "bar_type": _BAR_TYPE,
         "based_on_verdict_id": hypothesis.based_on_verdict_id,
         "falsification": hypothesis.falsification,
         "instrument_id": _INSTRUMENT_ID,
-        "parameters": {
-            "entry_threshold": hypothesis.parameters.entry_threshold,
-            "lookback_bars": hypothesis.parameters.lookback_bars,
-        },
+        "parameters": hypothesis.parameters.values,
         "parent_strategy_id": hypothesis.parent_strategy_id,
-        "schema_version": _SCHEMA_VERSION,
-        "strategy_family": _STRATEGY_FAMILY,
+        "schema_version": (
+            _SCHEMA_VERSION
+            if hypothesis.identity_schema == "strategy-id-v1"
+            else _SCHEMA_VERSION_V2
+        ),
+        "strategy_family": hypothesis.family_id,
         "thesis": hypothesis.thesis,
     }
+    if hypothesis.identity_schema == "strategy-id-v2":
+        document["family_version"] = hypothesis.family_version
+    return document
 
 
 def load_strategy_hypothesis(path: Path) -> StrategyHypothesis:
-    """Load one canonical v1 hypothesis and derive its immutable content IDs."""
+    """Load one canonical v1/v2 hypothesis and derive immutable content IDs."""
     source_path = Path(path)
     payload = source_path.read_bytes()
     try:
@@ -412,28 +481,53 @@ def load_strategy_hypothesis(path: Path) -> StrategyHypothesis:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise StrategyLabError("hypothesis must be UTF-8 JSON") from error
 
-    root = _mapping(decoded, _TOP_LEVEL_FIELDS, "hypothesis")
-    _reject_forbidden_fields(root["parameters"])
-    if root["schema_version"] != _SCHEMA_VERSION:
+    if not isinstance(decoded, dict):
+        raise StrategyLabError("hypothesis must be an object")
+    schema_version = decoded.get("schema_version")
+    if schema_version == _SCHEMA_VERSION:
+        root = _mapping(decoded, _TOP_LEVEL_FIELDS, "hypothesis")
+        identity_schema: Literal["strategy-id-v1", "strategy-id-v2"] = "strategy-id-v1"
+        family_version = _FAMILY_VERSION
+    elif schema_version == _SCHEMA_VERSION_V2:
+        root = _mapping(decoded, _TOP_LEVEL_FIELDS_V2, "hypothesis v2")
+        identity_schema = "strategy-id-v2"
+        family_version = _nonempty_text(root["family_version"], "family_version")
+    else:
         raise StrategyLabError("unsupported hypothesis schema")
-    if root["strategy_family"] != _STRATEGY_FAMILY:
-        raise StrategyLabError("unsupported strategy family")
+
+    family_id = _nonempty_text(root["strategy_family"], "strategy_family")
     if root["instrument_id"] != _INSTRUMENT_ID or root["bar_type"] != _BAR_TYPE:
         raise StrategyLabError("unsupported instrument_id or bar_type")
 
-    parameters = _mapping(root["parameters"], _PARAMETER_FIELDS, "parameters")
-    lookback = parameters["lookback_bars"]
-    if isinstance(lookback, bool) or not isinstance(lookback, int):
-        raise StrategyLabError("parameters.lookback_bars must be an integer")
-    if not 1 <= lookback <= _MAX_LOOKBACK_BARS:
-        raise StrategyLabError("parameters.lookback_bars must be between 1 and 8760")
-    threshold = parameters["entry_threshold"]
-    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
-        raise StrategyLabError("parameters.entry_threshold must be a number")
-    if not math.isfinite(threshold) or threshold < 0:
-        raise StrategyLabError(
-            "parameters.entry_threshold must be finite and non-negative"
-        )
+    _reject_forbidden_fields(root["parameters"])
+    if identity_schema == "strategy-id-v1":
+        if family_id != _STRATEGY_FAMILY:
+            raise StrategyLabError("unsupported strategy family")
+        parameters = _mapping(root["parameters"], _PARAMETER_FIELDS, "parameters")
+        lookback = parameters["lookback_bars"]
+        if isinstance(lookback, bool) or not isinstance(lookback, int):
+            raise StrategyLabError("parameters.lookback_bars must be an integer")
+        if not 1 <= lookback <= _MAX_LOOKBACK_BARS:
+            raise StrategyLabError("parameters.lookback_bars must be between 1 and 8760")
+        threshold = parameters["entry_threshold"]
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise StrategyLabError("parameters.entry_threshold must be a number")
+        if not math.isfinite(threshold) or threshold < 0:
+            raise StrategyLabError(
+                "parameters.entry_threshold must be finite and non-negative"
+            )
+        normalized_parameters: dict[str, JsonValue] = {
+            "entry_threshold": 0.0 if threshold == 0 else float(threshold),
+            "lookback_bars": lookback,
+        }
+    else:
+        if not isinstance(root["parameters"], dict):
+            raise StrategyLabError("parameters must be a plain JSON object")
+        try:
+            definition = DEFAULT_REGISTRY.resolve(family_id, family_version)
+            normalized_parameters = definition.validate_parameters(root["parameters"])
+        except FamilyKernelError as error:
+            raise StrategyLabError(str(error)) from error
 
     parent_strategy_id = _lineage_id(root["parent_strategy_id"], "parent_strategy_id")
     based_on_verdict_id = _lineage_id(
@@ -442,20 +536,29 @@ def load_strategy_hypothesis(path: Path) -> StrategyHypothesis:
     if (parent_strategy_id is None) != (based_on_verdict_id is None):
         raise StrategyLabError("lineage fields must both be null or both be populated")
 
-    normalized_threshold = 0.0 if threshold == 0 else float(threshold)
     strategy_document: dict[str, JsonValue] = {
         "bar_type": _BAR_TYPE,
         "instrument_id": _INSTRUMENT_ID,
-        "parameters": {"entry_threshold": normalized_threshold, "lookback_bars": lookback},
-        "strategy_family": _STRATEGY_FAMILY,
+        "parameters": normalized_parameters,
+        "strategy_family": family_id,
     }
+    if identity_schema == "strategy-id-v2":
+        strategy_document.update(
+            {
+                "family_version": family_version,
+                "identity_schema": identity_schema,
+            }
+        )
     hypothesis = StrategyHypothesis(
         source_path=source_path,
         parent_strategy_id=parent_strategy_id,
         based_on_verdict_id=based_on_verdict_id,
         thesis=_nonempty_text(root["thesis"], "thesis"),
         falsification=_nonempty_text(root["falsification"], "falsification"),
-        parameters=StrategyParameters(lookback, normalized_threshold),
+        parameters=StrategyParameters(normalized_parameters),
+        family_id=family_id,
+        family_version=family_version,
+        identity_schema=identity_schema,
         strategy_id=sha256(_canonical_json(strategy_document)).hexdigest(),
         hypothesis_id=sha256(payload).hexdigest(),
     )
@@ -515,6 +618,131 @@ def _error_record_id(record: ErrorRecord) -> str:
     return sha256(_canonical_json(values)).hexdigest()
 
 
+def _signal_parity_record_id(record: SignalParityRecord) -> str:
+    values: dict[str, JsonValue] = {
+        "artifact_path": _identifier(record.artifact_path, "artifact_path"),
+        "artifact_sha256": _content_id(record.artifact_sha256, "artifact_sha256"),
+        "candidate_id": _content_id(record.candidate_id, "candidate_id"),
+        "data_snapshot_id": _content_id(record.data_snapshot_id, "data_snapshot_id"),
+        "evaluation_context_id": _content_id(
+            record.evaluation_context_id,
+            "evaluation_context_id",
+        ),
+        "experiment_id": _content_id(record.experiment_id, "experiment_id"),
+        "outcome": record.outcome,
+        "reason_code": _identifier(record.reason_code, "reason_code"),
+        "required_action": record.required_action,
+    }
+    if (record.outcome == "PASS") != (record.required_action is None):
+        raise StrategyLabError("invalid signal parity outcome/action pairing")
+    return sha256(_canonical_json(values)).hexdigest()
+
+
+def _execute_schema(connection: sqlite3.Connection) -> None:
+    statement = ""
+    for line in _SCHEMA.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        sql = statement.strip()
+        if sql:
+            connection.execute(sql)
+        statement = ""
+    if statement.strip():
+        raise StrategyLabError("internal ledger schema is incomplete")
+
+
+def _strategy_columns(connection: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(row[1] for row in connection.execute("PRAGMA table_info(strategies)"))
+
+
+def _migrate_legacy_strategies(connection: sqlite3.Connection) -> bool:
+    columns = _strategy_columns(connection)
+    if not columns:
+        return False
+    target = (
+        "strategy_id",
+        "family",
+        "family_version",
+        "parameters_json",
+        "instrument_id",
+        "bar_type",
+        "identity_schema",
+    )
+    if columns == target:
+        return False
+    legacy = (
+        "strategy_id",
+        "family",
+        "lookback_bars",
+        "entry_threshold",
+        "instrument_id",
+        "bar_type",
+    )
+    if columns != legacy:
+        raise StrategyLabError("unsupported strategies ledger schema")
+
+    migrated: list[tuple[str, str, str, str, str, str, str]] = []
+    definition = DEFAULT_REGISTRY.resolve(_STRATEGY_FAMILY, _FAMILY_VERSION)
+    for (
+        strategy_id,
+        family,
+        lookback_bars,
+        entry_threshold,
+        instrument_id,
+        bar_type,
+    ) in connection.execute("SELECT * FROM strategies ORDER BY rowid"):
+        if family != _STRATEGY_FAMILY:
+            raise StrategyLabError(f"unsupported legacy strategy family: {family}")
+        if instrument_id != _INSTRUMENT_ID or bar_type != _BAR_TYPE:
+            raise StrategyLabError("unsupported legacy strategy instrument or bar type")
+        try:
+            parameters = definition.validate_parameters(
+                {
+                    "entry_threshold": entry_threshold,
+                    "lookback_bars": lookback_bars,
+                },
+            )
+        except FamilyKernelError as error:
+            raise StrategyLabError(f"invalid legacy strategy parameters: {error}") from error
+        migrated.append(
+            (
+                _content_id(strategy_id, "legacy strategy_id"),
+                family,
+                definition.family_version,
+                _canonical_json(parameters).decode(),
+                instrument_id,
+                bar_type,
+                "strategy-id-v1",
+            ),
+        )
+
+    for action in ("update", "delete"):
+        connection.execute(f"DROP TRIGGER IF EXISTS strategies_immutable_{action}")
+    connection.execute(
+        """CREATE TABLE strategies_v2 (
+            strategy_id TEXT PRIMARY KEY,
+            family TEXT NOT NULL,
+            family_version TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            instrument_id TEXT NOT NULL,
+            bar_type TEXT NOT NULL,
+            identity_schema TEXT NOT NULL CHECK (
+                identity_schema IN ('strategy-id-v1', 'strategy-id-v2')
+            )
+        )""",
+    )
+    connection.executemany(
+        "INSERT INTO strategies_v2 VALUES (?, ?, ?, ?, ?, ?, ?)",
+        migrated,
+    )
+    connection.execute("DROP TABLE strategies")
+    connection.execute("ALTER TABLE strategies_v2 RENAME TO strategies")
+    if connection.execute("SELECT COUNT(*) FROM strategies").fetchone()[0] != len(migrated):
+        raise StrategyLabError("legacy strategy migration row count mismatch")
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyLedger:
     """Append-only SQLite persistence for strategy-loop identities and outcomes."""
@@ -524,37 +752,38 @@ class StrategyLedger:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path)) as connection:
-            connection.executescript(_SCHEMA)
-            stage_schema = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'",
-            ).fetchone()
-            if stage_schema is not None and "'ERROR'" not in stage_schema[0]:
-                connection.execute("DROP TRIGGER IF EXISTS stage_results_immutable_update")
-                connection.execute("DROP TRIGGER IF EXISTS stage_results_immutable_delete")
-                connection.execute("ALTER TABLE stage_results RENAME TO legacy_stage_results")
-                connection.execute(
-                    """CREATE TABLE stage_results (
-                        experiment_id TEXT NOT NULL,
-                        strategy_id TEXT NOT NULL,
-                        stage TEXT NOT NULL CHECK (stage IN (
-                            'PyBroker completed', 'Research screened', 'Nautilus replayed'
-                        )),
-                        outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED', 'ERROR')),
-                        reason_code TEXT NOT NULL,
-                        artifact_path TEXT NOT NULL,
-                        artifact_sha256 TEXT NOT NULL,
-                        PRIMARY KEY (experiment_id, stage),
-                        FOREIGN KEY (experiment_id, strategy_id)
-                            REFERENCES experiments(experiment_id, strategy_id)
-                    )""",
-                )
-                connection.execute(
-                    "INSERT INTO stage_results SELECT * FROM legacy_stage_results",
-                )
-                connection.execute("DROP TABLE legacy_stage_results")
-            connection.commit()
-            connection.execute("PRAGMA foreign_keys = ON")
-            with connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                migrated_strategies = _migrate_legacy_strategies(connection)
+                _execute_schema(connection)
+                stage_schema = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'",
+                ).fetchone()
+                if stage_schema is not None and "'ERROR'" not in stage_schema[0]:
+                    connection.execute("DROP TRIGGER IF EXISTS stage_results_immutable_update")
+                    connection.execute("DROP TRIGGER IF EXISTS stage_results_immutable_delete")
+                    connection.execute("ALTER TABLE stage_results RENAME TO legacy_stage_results")
+                    connection.execute(
+                        """CREATE TABLE stage_results (
+                            experiment_id TEXT NOT NULL,
+                            strategy_id TEXT NOT NULL,
+                            stage TEXT NOT NULL CHECK (stage IN (
+                                'PyBroker completed', 'Research screened', 'Nautilus replayed'
+                            )),
+                            outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED', 'ERROR')),
+                            reason_code TEXT NOT NULL,
+                            artifact_path TEXT NOT NULL,
+                            artifact_sha256 TEXT NOT NULL,
+                            PRIMARY KEY (experiment_id, stage),
+                            FOREIGN KEY (experiment_id, strategy_id)
+                                REFERENCES experiments(experiment_id, strategy_id)
+                        )""",
+                    )
+                    connection.execute(
+                        "INSERT INTO stage_results SELECT * FROM legacy_stage_results",
+                    )
+                    connection.execute("DROP TABLE legacy_stage_results")
                 for table in _IMMUTABLE_TABLES:
                     for action in ("UPDATE", "DELETE"):
                         connection.execute(
@@ -562,23 +791,52 @@ class StrategyLedger:
                             BEFORE {action} ON {table}
                             BEGIN SELECT RAISE(ABORT, '{table} records are immutable'); END""",
                         )
+                if migrated_strategies:
+                    foreign_key_errors = connection.execute(
+                        "PRAGMA foreign_key_check",
+                    ).fetchall()
+                    if foreign_key_errors:
+                        raise StrategyLabError(
+                            f"legacy strategy migration broke foreign keys: {foreign_key_errors!r}",
+                        )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            connection.execute("PRAGMA foreign_keys = ON")
 
     def record_hypothesis(self, hypothesis: StrategyHypothesis) -> None:
         _verified_artifact(hypothesis.source_path, hypothesis.hypothesis_id)
+        parameters_json = _canonical_json(hypothesis.parameters.values).decode()
+        expected_strategy = (
+            hypothesis.family_id,
+            hypothesis.family_version,
+            parameters_json,
+            _INSTRUMENT_ID,
+            _BAR_TYPE,
+            hypothesis.identity_schema,
+        )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute(
-                """INSERT INTO strategies VALUES (?, ?, ?, ?, ?, ?)
+                """INSERT INTO strategies (
+                    strategy_id, family, family_version, parameters_json,
+                    instrument_id, bar_type, identity_schema
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(strategy_id) DO NOTHING""",
                 (
                     hypothesis.strategy_id,
-                    _STRATEGY_FAMILY,
-                    hypothesis.parameters.lookback_bars,
-                    hypothesis.parameters.entry_threshold,
-                    _INSTRUMENT_ID,
-                    _BAR_TYPE,
+                    *expected_strategy,
                 ),
             )
+            stored_strategy = connection.execute(
+                """SELECT family, family_version, parameters_json,
+                instrument_id, bar_type, identity_schema
+                FROM strategies WHERE strategy_id = ?""",
+                (hypothesis.strategy_id,),
+            ).fetchone()
+            if stored_strategy != expected_strategy:
+                raise StrategyLabError("strategy record conflict")
             connection.execute(
                 """INSERT INTO hypotheses VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hypothesis_id) DO NOTHING""",
@@ -717,12 +975,66 @@ class StrategyLedger:
             raise StrategyLabError("stage record conflict")
         _verified_artifact(Path(stored[2]), stored[3])
 
+    def record_signal_parity(self, record: SignalParityRecord) -> str:
+        artifact_path = Path(_identifier(record.artifact_path, "artifact_path"))
+        _verified_artifact(
+            artifact_path,
+            _content_id(record.artifact_sha256, "artifact_sha256"),
+        )
+        document = _load_canonical_json(artifact_path)
+        if not isinstance(document, dict) or (
+            document.get("schema_version") != "signal-parity-result-v1"
+            or document.get("candidate_id") != record.candidate_id
+            or document.get("outcome") != record.outcome
+            or document.get("reason_code") != record.reason_code
+            or document.get("required_action") != record.required_action
+        ):
+            raise StrategyLabError("signal parity artifact does not match record")
+        parity_result_id = _signal_parity_record_id(record)
+        expected = (
+            record.experiment_id,
+            record.candidate_id,
+            record.evaluation_context_id,
+            record.data_snapshot_id,
+            record.outcome,
+            record.reason_code,
+            record.required_action,
+            record.artifact_path,
+            record.artifact_sha256,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                """INSERT INTO signal_parity_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING""",
+                (parity_result_id, *expected),
+            )
+            stored = connection.execute(
+                """SELECT experiment_id, candidate_id, evaluation_context_id,
+                data_snapshot_id, outcome, reason_code, required_action,
+                artifact_path, artifact_sha256
+                FROM signal_parity_results WHERE parity_result_id = ?""",
+                (parity_result_id,),
+            ).fetchone()
+            duplicate = connection.execute(
+                """SELECT parity_result_id FROM signal_parity_results
+                WHERE experiment_id = ? AND candidate_id = ?""",
+                (record.experiment_id, record.candidate_id),
+            ).fetchone()
+        if stored != expected or duplicate != (parity_result_id,):
+            raise StrategyLabError("parity record conflict")
+        _verified_artifact(Path(stored[7]), stored[8])
+        return parity_result_id
+
     def verify_experiment_artifacts(self, experiment_id: str) -> None:
         with closing(sqlite3.connect(self.path)) as connection:
             rows = connection.execute(
                 """SELECT artifact_path, artifact_sha256 FROM stage_results
+                WHERE experiment_id = ?
+                UNION ALL
+                SELECT artifact_path, artifact_sha256 FROM signal_parity_results
                 WHERE experiment_id = ?""",
-                (experiment_id,),
+                (experiment_id, experiment_id),
             ).fetchall()
         for artifact_path, artifact_hash in rows:
             _verified_artifact(Path(artifact_path), artifact_hash)
@@ -862,12 +1174,41 @@ def _engine_identity() -> str:
         _REPO_ROOT / "src/nautilus_quant/candidate_backtest.py",
         _REPO_ROOT / "src/nautilus_quant/funding_observation.py",
         _REPO_ROOT / "src/nautilus_quant/pybroker_candidate.py",
+        _REPO_ROOT / "src/nautilus_quant/strategy_families.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_lab.py",
     ):
         digest.update(path.relative_to(_REPO_ROOT).as_posix().encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
     return f"nautilus-{nautilus_trader.__version__}-{digest.hexdigest()}"
+
+
+def _evaluation_context_id(
+    hypothesis: StrategyHypothesis,
+    *,
+    data_source_id: str,
+    policy_id: str,
+    engine_id: str,
+    runtime_id: str,
+    code_commit: str,
+) -> str:
+    return sha256(
+        _canonical_json(
+            {
+                "code_commit": _identifier(code_commit, "code_commit"),
+                "data_source_id": _content_id(data_source_id, "data_source_id"),
+                "engine_id": _identifier(engine_id, "engine_id"),
+                "family_id": hypothesis.family_id,
+                "family_version": hypothesis.family_version,
+                "kernel_hash": KERNEL_HASH,
+                "kernel_version": KERNEL_VERSION,
+                "runtime_id": _content_id(runtime_id, "runtime_id"),
+                "schema_version": "evaluation-context-v1",
+                "screen_policy_id": _content_id(policy_id, "screen_policy_id"),
+                "strategy_id": hypothesis.strategy_id,
+            },
+        ),
+    ).hexdigest()
 
 
 def _code_commit() -> str:
@@ -1103,6 +1444,7 @@ def _research_result(payload: bytes) -> dict[str, JsonValue]:
 def _candidate_matches_hypothesis(
     candidate: dict[str, JsonValue],
     hypothesis: StrategyHypothesis,
+    evaluation_context_id: str | None,
 ) -> None:
     strategy = candidate.get("strategy")
     if not isinstance(strategy, dict):
@@ -1110,13 +1452,28 @@ def _candidate_matches_hypothesis(
     parameters = strategy.get("parameters")
     if not isinstance(parameters, dict):
         raise StrategyLabError("validated candidate parameters are invalid")
-    if (
+    common_mismatch = (
         candidate.get("instrument_id") != _INSTRUMENT_ID
         or candidate.get("bar_type") != _BAR_TYPE
-        or strategy.get("name") != _STRATEGY_FAMILY
-        or parameters.get("lookback_bars") != hypothesis.parameters.lookback_bars
-        or parameters.get("entry_threshold") != hypothesis.parameters.entry_threshold
-    ):
+        or parameters != hypothesis.parameters.values
+    )
+    if hypothesis.identity_schema == "strategy-id-v1":
+        mismatch = (
+            candidate.get("schema_version") != "pybroker-candidate-v1"
+            or strategy.get("name") != hypothesis.family_id
+            or common_mismatch
+        )
+    else:
+        mismatch = (
+            candidate.get("schema_version") != "pybroker-candidate-v2"
+            or candidate.get("evaluation_context_id") != evaluation_context_id
+            or strategy.get("family_id") != hypothesis.family_id
+            or strategy.get("family_version") != hypothesis.family_version
+            or strategy.get("kernel_version") != KERNEL_VERSION
+            or strategy.get("kernel_hash") != KERNEL_HASH
+            or common_mismatch
+        )
+    if mismatch:
         raise StrategyLabError("candidate does not match immutable hypothesis")
 
 
@@ -1128,12 +1485,27 @@ def run_strategy_loop(
     source_hypothesis = load_strategy_hypothesis(Path(hypothesis_path))
     data_source_id = _hash_tree(paths)
     policy_id, _policy_version = _policy_identity(paths.policy_path)
+    base_engine_id = _engine_identity()
+    runtime_id = _runtime_identity()
+    code_commit = _code_commit()
+    evaluation_context_id: str | None = None
+    engine_id = base_engine_id
+    if source_hypothesis.identity_schema == "strategy-id-v2":
+        evaluation_context_id = _evaluation_context_id(
+            source_hypothesis,
+            data_source_id=data_source_id,
+            policy_id=policy_id,
+            engine_id=base_engine_id,
+            runtime_id=runtime_id,
+            code_commit=code_commit,
+        )
+        engine_id = f"{base_engine_id}-evaluation-{evaluation_context_id}"
     identity = ExperimentIdentity(
         strategy_id=source_hypothesis.strategy_id,
         data_source_id=data_source_id,
         policy_id=policy_id,
-        engine_id=_engine_identity(),
-        runtime_id=_runtime_identity(),
+        engine_id=engine_id,
+        runtime_id=runtime_id,
     )
     experiment_id = _experiment_id(identity)
     ledger = StrategyLedger(paths.state_path / "ledger.sqlite3")
@@ -1164,6 +1536,15 @@ def run_strategy_loop(
         "--output",
         str(candidate_path),
     ]
+    if evaluation_context_id is not None:
+        argv.extend(
+            [
+                "--evaluation-context-id",
+                evaluation_context_id,
+                "--environment-id",
+                runtime_id,
+            ],
+        )
     try:
         completed = _run_bounded_process(
             argv,
@@ -1259,7 +1640,11 @@ def run_strategy_loop(
         candidate_document = _load_canonical_json(candidate_path)
         if not isinstance(candidate_document, dict):
             raise StrategyLabError("validated candidate must be an object")
-        _candidate_matches_hypothesis(candidate_document, hypothesis)
+        _candidate_matches_hypothesis(
+            candidate_document,
+            hypothesis,
+            evaluation_context_id,
+        )
     except (OSError, ValueError) as error:
         return _finish_failure(
             run,
@@ -1274,6 +1659,64 @@ def run_strategy_loop(
         )
     candidate_hash = candidate_id
     _verified_artifact(candidate_path, candidate_hash)
+    signal_parity: SignalParityResult | None = None
+    if evaluation_context_id is not None:
+        try:
+            signal_parity = run_signal_parity_gate(candidate_path, paths.catalog_path)
+            parity_path = directory / "signal-parity-result.json"
+            parity_hash = _atomic_publish(parity_path, signal_parity.canonical_bytes)
+            if parity_hash != signal_parity.artifact_sha256:
+                raise StrategyLabError("signal parity artifact hash mismatch")
+            source = candidate_document.get("source")
+            if not isinstance(source, dict):
+                raise StrategyLabError("validated candidate source is invalid")
+            data_snapshot_id = source.get("data_snapshot_id")
+            if not isinstance(data_snapshot_id, str):
+                raise StrategyLabError("validated candidate data snapshot is invalid")
+            parity_record = SignalParityRecord(
+                experiment_id=experiment_id,
+                candidate_id=candidate_id,
+                evaluation_context_id=evaluation_context_id,
+                data_snapshot_id=data_snapshot_id,
+                outcome=signal_parity.outcome,
+                reason_code=signal_parity.reason_code,
+                required_action=signal_parity.required_action,
+                artifact_path=str(parity_path),
+                artifact_sha256=parity_hash,
+            )
+            parity_result_id = ledger.record_signal_parity(parity_record)
+        except (ArithmeticError, LookupError, OSError, RuntimeError, ValueError) as error:
+            return _finish_failure(
+                run,
+                _TechnicalFailure(
+                    "Research screened",
+                    "RESEARCH",
+                    "ERROR",
+                    "SIGNAL_PARITY_GATE_FAILED",
+                    "research-error.json",
+                    {
+                        "detail": str(error),
+                        "required_action": "FIX_TECHNICAL",
+                    },
+                ),
+            )
+        if signal_parity.outcome != "PASS":
+            return _finish_failure(
+                run,
+                _TechnicalFailure(
+                    "Research screened",
+                    "RESEARCH",
+                    "ERROR",
+                    signal_parity.reason_code,
+                    "research-error.json",
+                    {
+                        "parity_artifact_path": str(parity_path),
+                        "parity_artifact_sha256": parity_hash,
+                        "parity_result_id": parity_result_id,
+                        "required_action": "FIX_TECHNICAL",
+                    },
+                ),
+            )
     ledger.record_stage(
         StageRecord(
             experiment_id,
@@ -1295,7 +1738,8 @@ def run_strategy_loop(
                 hypothesis_id=hypothesis.hypothesis_id,
                 strategy_id=hypothesis.strategy_id,
                 experiment_id=experiment_id,
-                code_commit=_code_commit(),
+                code_commit=code_commit,
+                signal_parity=signal_parity,
             ),
         )
     except (ArithmeticError, LookupError, OSError, RuntimeError, ValueError) as error:

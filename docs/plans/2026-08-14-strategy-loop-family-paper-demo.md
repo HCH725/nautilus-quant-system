@@ -1,8 +1,8 @@
 # Strategy Loop：Family → Robustness → Paper → Binance Demo 建置計畫
 
-> **狀態：2026-08-20 已吸收 V2 control/evidence 審查，仍未授權開始功能實作。**
+> **狀態：2026-08-20 已吸收 V2 control/evidence 審查；Card 1 `FAMILY-KERNEL-V2` 已獲授權並在本次變更實作，Card 2～6 尚未開工且不因 Card 1 完成自動取得授權。**
 >
-> 本文件把 [`../architecture/strategy-loop-operating-model.md`](../architecture/strategy-loop-operating-model.md) 的已接受方向拆成可驗收的建置卡。本輪審查基線為 `e745dfd0e24280359d8cec68441ce64e84311952`；既有 historical strategy-loop v1 已在 `2e424a38fcf9993d142cb31a53960066534f84a1` 完成並驗活。
+> 本文件把 [`../architecture/strategy-loop-operating-model.md`](../architecture/strategy-loop-operating-model.md) 的已接受方向拆成可驗收的建置卡。Card 1 施工基線為 `f2c88b2e6fd4244f7bc2ce39ff75b962d49defb7`；既有 historical strategy-loop V1 已在 `2e424a38fcf9993d142cb31a53960066534f84a1` 完成並驗活。
 
 ## 1. 目標與完成邊界
 
@@ -50,12 +50,12 @@ Bounded Live（另立、未授權）
 | 面向 | 現況 | 缺口／決定 |
 |---|---|---|
 | Historical loop | H0 → Nautilus verdict → H1 已真實跑通；失敗、lineage、hash、funnel 可查 | 保留，不重寫 |
-| Hypothesis | `strategy-hypothesis-v1` 只接受 `lookback-momentum-long-flat`、BTCUSDT 1H 與兩個固定參數 | 需 generic v2 + family version |
-| Ledger | `strategies` 固定欄位是 `lookback_bars` / `entry_threshold`；`stage_results` 只允許三個 historical stage | 需保留舊 row 與外鍵的 migration；不可 reset ledger |
-| Formula | momentum 公式內嵌在 `research/pybroker_research.py` | 需一份純 stdlib、historical/live 共用 kernel |
-| Candidate | `pybroker-candidate-v1` 只保存 `intent`／`score`／`ts_event_ns`；Nautilus 回放還會丟掉 score | v1 必須持續可讀；所有新 experiment 改寫 v2，補 signal identity、reason、target intent 與 family/kernel version |
-| Signal parity | 現行 Nautilus consumer 重新驗 source digest 後直接回放 Candidate v1 intent/timestamp，沒有重算 family signals | Candidate v2 與 Nautilus accounting 中間新增正式 fail-closed Signal Parity Gate |
-| Control plane | V1 已有 strategy/data/policy/engine/runtime/artifact identity；V2 計畫已有 family、kernel、screen policy、evaluation context 的部分設計 | 需一份跨 tier evidence envelope，明定每級必填 policy/data/runtime/environment identity 與 reuse 規則 |
+| Hypothesis | V1 保持原 bytes／ID；Card 1 已新增 registry 驗證的 `strategy-hypothesis-v2` 與 family version | 新 family 仍須 tracked code + validator + golden vectors |
+| Ledger | Card 1 已把 legacy `strategies` transactionally 遷成 `parameters_json`／family version／identity schema，保留舊 row、ID、外鍵與三個 V1 stage semantics | 正式 ledger 不 reset；後續 tier 只新增專用 append-only evidence |
+| Formula | Card 1 已把既有 momentum 公式原樣移入純 stdlib shared kernel；PyBroker 不再持有第二份公式 | live runtime adapter 仍在 Card 4 |
+| Candidate | V1 持續可讀；Card 1 已新增 Candidate v2、完整 signal/family/kernel/source/context identities | Candidate 永遠 provisional |
+| Signal parity | Card 1 已新增正式 fail-closed gate，獨立 incremental 重算，PASS 後只把重算序列交給 Nautilus | live/historical parity 延伸留在 Card 4 |
+| Control plane | Card 1 已新增 evaluation context、V2 experiment invalidation、evidence-envelope contract 與 append-only parity evidence | robustness/cost/risk/promotion policy IDs 依後續 tier 版本化 |
 | Campaign | 一次 CLI 只跑一個 hypothesis | 需 deterministic campaign expander、budget、dedupe、cohort summary |
 | PyBroker screen | 現在只驗 candidate 結構與 hash，合法就 `PASSED` | 需預先釘住的 provisional metrics 與 rejection policy |
 | Historical evaluator | Nautilus 真正負責 fills、fees、Funding、positions、accounting | 沿用；補 bounded window／stress 輸入 |
@@ -117,7 +117,7 @@ Bounded Live（另立、未授權）
 
 ## 4. Kanban 管制方式
 
-使用既有 dedicated board `quant-strategy-loop-20260814`，建立下列 **6 張順序卡**。它們是六個可獨立驗活的 coherent diff，不是六個同時開工的 phase umbrella：
+下列 **6 張順序卡**是六個可獨立驗活的 coherent diff，不是六個同時開工的 phase umbrella。Card 1 依 operator 指示由單一 writer 直接執行；後續可直接執行或映射到既有 board，但不以 Kanban 儀式代替驗證：
 
 1. `FAMILY-KERNEL-V2`
 2. `CAMPAIGN-SCREEN-V1`
@@ -150,6 +150,8 @@ RED tests
 - 任何 scope 擴張先更新本計畫並由 operator 讀回，不在施工途中偷偷加功能。
 
 ## 5. Card 1 — `FAMILY-KERNEL-V2`
+
+> **Implementation status：本次變更已完成實作；只有 focused/full tests、copied-ledger migration、固定快照審計、秘密掃描、push 與 remote readback 全綠後才可視為交付完成。**
 
 ### 目的
 
@@ -533,8 +535,8 @@ Paper 與 Demo 卡另須附真實 runtime evidence；mock/unit tests只能證明
 
 ## 14. 建置 readiness 結論
 
-- **下一個唯一 implementation target 是 Card 1 `FAMILY-KERNEL-V2`**；不需要 credentials，也不會碰 Live/Paper order。
-- **Card 2～3：Card 1 驗活後依序施工**；先保存完整 trial census，再做 robustness，不跳階。
+- **Card 1 `FAMILY-KERNEL-V2` 已在本次變更實作**；不需要 credentials，也沒有碰 Live／Paper order。
+- **下一個規劃 target 是 Card 2 `CAMPAIGN-SCREEN-V1`，但尚未因 Card 1 完成而自動授權。**獲得明確授權後才依序施工；先保存完整 trial census，再做 Card 3 robustness，不跳階。
 - **Card 4 程式與 synthetic tests：前 3 卡通過後即可施工**；正式 prospective Paper evidence 需先凍結 Risk & Execution／Paper admission policy，並經過真實 production-data smoke。
 - **Card 5 程式與 fail-closed tests：Card 4 通過後即可施工**；venue 驗活會卡在 dedicated Binance Demo credentials、metadata/fee snapshot 與 Demo envelope，這是正當外部 gate。
 - **Card 6：必須等 Paper + Demo 真證據存在**，否則只能產生 `N/A/BLOCKED`，不得造假完成度。
