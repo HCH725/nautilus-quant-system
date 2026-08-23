@@ -7,6 +7,7 @@ from dataclasses import asdict
 from hashlib import sha256
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -22,11 +23,13 @@ from nautilus_quant.funding_observation import migrate_funding_observations
 from nautilus_quant.nautilus_io import make_bar
 from nautilus_quant.strategy_families import (
     ClosedBar,
+    FamilyDecision,
     FamilyDefinition,
     FamilyEvaluation,
     FamilyRegistry,
     KERNEL_HASH,
     KERNEL_VERSION,
+    canonical_decision_bytes,
     derive_signal_id,
     evaluate_batch,
 )
@@ -582,6 +585,19 @@ class StrategyLedgerTests(unittest.TestCase):
         self.ledger.record_hypothesis(hypothesis)
         experiment_id = self._experiment(hypothesis, "parity")
         candidate_id = "a" * 64
+        decisions = (
+            FamilyDecision(
+                "1" * 64, 1, "1", "LONG", "test",
+                "lookback-momentum-long-flat", "lookback-momentum-long-flat-v1",
+                "strategy-family-kernel-v1", "2" * 64,
+            ),
+            FamilyDecision(
+                "3" * 64, 2, "-1", "FLAT", "test-close",
+                "lookback-momentum-long-flat", "lookback-momentum-long-flat-v1",
+                "strategy-family-kernel-v1", "2" * 64,
+            ),
+        )
+        decision_payload = b"".join(canonical_decision_bytes(item) for item in decisions)
         artifact = {
             "candidate_id": candidate_id,
             "candidate_signal_count": 2,
@@ -590,7 +606,7 @@ class StrategyLedgerTests(unittest.TestCase):
             "outcome": "PASS",
             "reason_code": "SIGNAL_PARITY_MATCH",
             "recomputed_signal_count": 2,
-            "recomputed_signals_sha256": "b" * 64,
+            "recomputed_signals_sha256": sha256(decision_payload).hexdigest(),
             "required_action": None,
             "schema_version": "signal-parity-result-v1",
         }
@@ -606,6 +622,7 @@ class StrategyLedgerTests(unittest.TestCase):
             required_action=None,
             artifact_path=str(path),
             artifact_sha256=sha256(path.read_bytes()).hexdigest(),
+            decisions=decisions,
         )
 
         first_id = self.ledger.record_signal_parity(record)
@@ -645,7 +662,7 @@ class StrategyLedgerTests(unittest.TestCase):
             artifact_path=str(conflict_path),
             artifact_sha256=sha256(conflict_path.read_bytes()).hexdigest(),
         )
-        with self.assertRaisesRegex(ValueError, "parity record conflict"):
+        with self.assertRaisesRegex(ValueError, "signal parity artifact does not match record"):
             self.ledger.record_signal_parity(conflict)
 
     def test_existing_hypothesis_and_stage_artifacts_are_reverified_on_conflict(self):
@@ -816,6 +833,44 @@ class StrategyLedgerTests(unittest.TestCase):
         self.assertEqual(verdicts, [("REJECTION",), ("SUCCESS",)])
         self.assertEqual(errors, [("PROCESS_FAILED",)])
 
+    def test_one_experiment_cannot_have_two_terminal_errors(self):
+        self.ledger.initialize()
+        hypothesis = self._hypothesis(24)
+        self.ledger.record_hypothesis(hypothesis)
+        experiment_id = self._experiment(hypothesis, "duplicate-error")
+        first_path, first_hash = self._artifact("first-error.json", "a")
+        second_path, second_hash = self._artifact("second-error.json", "b")
+        self.ledger.record_error(
+            strategy_lab.ErrorRecord(
+                experiment_id, "PYBROKER", "FIRST", first_path, first_hash
+            ),
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.record_error(
+                strategy_lab.ErrorRecord(
+                    experiment_id, "NAUTILUS", "SECOND", second_path, second_hash
+                ),
+            )
+
+    def test_initialize_rejects_legacy_duplicate_terminal_errors(self):
+        create_legacy_v1_ledger(self.ledger.path)
+        with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO errors VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "9" * 64,
+                    "3" * 64,
+                    "NAUTILUS",
+                    "SECOND_ERROR",
+                    "/legacy/second-error.json",
+                    "a" * 64,
+                ),
+            )
+
+        with self.assertRaisesRegex(ValueError, "duplicate terminal errors"):
+            self.ledger.initialize()
+
     def test_child_requires_an_existing_parent_verdict_pair(self):
         self.ledger.initialize()
         parent = self._hypothesis(24)
@@ -894,6 +949,80 @@ class StrategyLedgerTests(unittest.TestCase):
                     connection.execute(f"UPDATE {table} SET rowid = rowid")
                 with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
                     connection.execute(f"DELETE FROM {table}")
+
+    def test_aggregate_readers_reject_legacy_verdict_error_conflicts(self):
+        self.ledger.initialize()
+        hypothesis = self._hypothesis(24)
+        self.ledger.record_hypothesis(hypothesis)
+        identity = strategy_lab.ExperimentIdentity(
+            strategy_id=hypothesis.strategy_id,
+            data_source_id="a" * 64,
+            policy_id="b" * 64,
+            engine_id="nautilus-test",
+            runtime_id="c" * 64,
+        )
+        experiment_id = self.ledger.record_experiment(hypothesis.hypothesis_id, identity)
+        verdict = {
+            "funding": {"truth_status": "official"},
+            "performance_claimable": True,
+            "source": {"last_ts_event_ns": 1},
+        }
+        verdict_path = self.root / "verdict.json"
+        verdict_path.write_bytes(canonical_bytes(verdict))
+        self.ledger.record_verdict(
+            strategy_lab.VerdictRecord(
+                experiment_id,
+                "SUCCESS",
+                "VALID",
+                str(verdict_path),
+                sha256(verdict_path.read_bytes()).hexdigest(),
+            ),
+        )
+        error_path = self.root / "error.json"
+        error_path.write_bytes(
+            canonical_bytes(
+                {
+                    "experiment_id": experiment_id,
+                    "reason_code": "CONTRADICTORY",
+                    "schema_version": "strategy-loop-error-v1",
+                    "stage": "RESEARCH",
+                },
+            ),
+        )
+        with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
+            connection.execute("DROP TRIGGER errors_reject_existing_verdict")
+            connection.execute(
+                "INSERT INTO errors VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "d" * 64,
+                    experiment_id,
+                    "RESEARCH",
+                    "CONTRADICTORY",
+                    str(error_path),
+                    sha256(error_path.read_bytes()).hexdigest(),
+                ),
+            )
+
+        with self.assertRaisesRegex(ValueError, "contradictory terminal evidence"):
+            self.ledger.funnel_counts()
+        paths = strategy_lab.StrategyLoopPaths(
+            self.root / "market.json",
+            self.root / "policy.json",
+            self.root / "catalog",
+            self.root / "funding",
+            self.root,
+        )
+        with (
+            patch.object(strategy_lab, "_hash_tree", return_value=identity.data_source_id),
+            patch.object(
+                strategy_lab,
+                "_policy_identity",
+                return_value=(identity.policy_id, "test-v1"),
+            ),
+            patch.object(strategy_lab, "load_screen_policy", side_effect=OSError("missing")),
+            self.assertRaisesRegex(ValueError, "contradictory terminal evidence"),
+        ):
+            strategy_lab.write_funnel_reports(paths)
 
     def test_ledger_refuses_missing_or_hash_mismatched_artifacts(self):
         self.ledger.initialize()
@@ -1124,7 +1253,15 @@ class StrategyLoopControllerTests(unittest.TestCase):
             stdout = canonical_bytes(
                 {
                     "candidate_id": sha256(candidate).hexdigest(),
-                    "provisional_metrics": {"orders": 0, "signals": len(decisions)},
+                    "provisional_metrics": {
+                        "max_drawdown": 0.0,
+                        "signal_count": len(decisions),
+                        "total_return": 0.0,
+                        "trade_count": 1,
+                        "turnover": 0.0,
+                    },
+                    "schema_version": "research-result-v2",
+                    "truth_status": "provisional",
                 },
             )
             return strategy_lab._ProcessResult(0, stdout, b"", False, False, False)
@@ -1195,6 +1332,7 @@ class StrategyLoopControllerTests(unittest.TestCase):
             argv,
             [
                 "research/.venv/bin/python",
+                "-I",
                 "research/pybroker_research.py",
                 "--hypothesis",
                 str(experiment_path / f"hypothesis-{first['hypothesis_id']}.json"),
@@ -1278,6 +1416,22 @@ class StrategyLoopControllerTests(unittest.TestCase):
                 evaluation_context_id FROM signal_parity_results""",
             ).fetchone()
         self.assertEqual(parity, ("PASS", "SIGNAL_PARITY_MATCH", None, context))
+
+    def test_funnel_includes_v2_composite_policy_experiments(self):
+        hypothesis_path = self._hypothesis_v2()
+        with patch(
+            "nautilus_quant.strategy_lab._run_bounded_process",
+            side_effect=self._process_v2(),
+        ):
+            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
+
+        report, _markdown = strategy_lab.write_funnel_reports(self.paths)
+
+        self.assertEqual(feedback["status"], "EVALUATED")
+        self.assertEqual(report["stages"][0]["entered"], 1)
+        self.assertEqual(report["stages"][2]["passed"], 1)
+        self.assertEqual(report["stages"][3]["passed"], 1)
+        self.assertEqual(report["stages"][4]["passed"], 1)
 
     def test_v2_parity_mismatch_is_fix_technical_and_never_calls_nautilus(self):
         hypothesis_path = self._hypothesis_v2()
@@ -1575,25 +1729,143 @@ class StrategyLoopIdentityAndConfinementTests(unittest.TestCase):
 
     def test_runtime_identity_hashes_the_actual_isolated_environment(self):
         original = Path.read_bytes
+        site_packages = next(Path("research/.venv/lib").glob("python*/site-packages")).resolve()
         targets = (
             Path("research/.venv/pyvenv.cfg").resolve(),
-            Path("research/.venv/lib/python3.12/site-packages/pandas/__init__.py").resolve(),
+            site_packages / "pandas/__init__.py",
+            site_packages / "joblib/__init__.py",
+            site_packages / "numba/__init__.py",
         )
+        baseline = strategy_lab._runtime_identity()
         for target in targets:
             with self.subTest(target=target):
-                strategy_lab._runtime_identity.cache_clear()
-                baseline = strategy_lab._runtime_identity()
-
                 def changed(path: Path) -> bytes:
                     payload = original(path)
                     return payload + b"changed" if Path(path).resolve() == target else payload
 
-                try:
-                    with patch("pathlib.Path.read_bytes", new=changed):
-                        strategy_lab._runtime_identity.cache_clear()
-                        self.assertNotEqual(strategy_lab._runtime_identity(), baseline)
-                finally:
-                    strategy_lab._runtime_identity.cache_clear()
+                with patch("pathlib.Path.read_bytes", new=changed):
+                    self.assertNotEqual(strategy_lab._runtime_identity(), baseline)
+
+    def test_runtime_attestation_can_require_the_dedicated_interpreter(self):
+        with self.assertRaisesRegex(ValueError, "attested research interpreter"):
+            strategy_lab.research_runtime_identity(Path.cwd(), require_active=True)
+
+    def test_runtime_attestation_hashes_unowned_startup_code(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = root / "research/.venv"
+            site_packages = environment / "lib/python3.12/site-packages"
+            metadata = site_packages / "demo-1.0.dist-info"
+            metadata.mkdir(parents=True)
+            (root / "research/requirements.lock").write_text("demo==1.0\n")
+            (environment / "pyvenv.cfg").write_text("home = /test\n")
+            python = environment / "bin/python"
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b"python")
+            (site_packages / "demo.py").write_bytes(b"VALUE = 1\n")
+            (metadata / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            )
+            (metadata / "RECORD").write_text(
+                "demo.py,,\n"
+                "demo-1.0.dist-info/METADATA,,\n"
+                "demo-1.0.dist-info/RECORD,,\n",
+            )
+
+            baseline = strategy_lab.research_runtime_identity(root)
+            (site_packages / "sitecustomize.py").write_bytes(b"BEHAVIOR = 2\n")
+            with_sitecustomize = strategy_lab.research_runtime_identity(root)
+            (site_packages / "sitecustomize.pyc").write_bytes(b"sourceless bytecode")
+            with_sourceless_sitecustomize = strategy_lab.research_runtime_identity(root)
+            (site_packages / "startup.pth").write_bytes(b"import demo\n")
+            with_pth = strategy_lab.research_runtime_identity(root)
+
+        self.assertNotEqual(baseline, with_sitecustomize)
+        self.assertNotEqual(with_sitecustomize, with_sourceless_sitecustomize)
+        self.assertNotEqual(with_sourceless_sitecustomize, with_pth)
+
+    def test_research_process_uses_isolated_mode_and_sanitized_environment(self):
+        code = (
+            "import json, os, sys;"
+            "print(json.dumps({'isolated': bool(sys.flags.isolated), "
+            "'pythonpath': os.environ.get('PYTHONPATH')}))"
+        )
+        with patch.dict(os.environ, {"PYTHONPATH": "/outside/untrusted"}, clear=False):
+            result = strategy_lab._run_bounded_process(
+                [sys.executable, "-I", "-c", code],
+                cwd=Path.cwd(),
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {"isolated": True, "pythonpath": None})
+
+    def test_bounded_process_reaps_and_closes_pipes_on_submit_or_drain_failure(self):
+        class FakeStream:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.stdout = FakeStream()
+                self.stderr = FakeStream()
+                self.returncode = None
+                self.wait_calls = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                del timeout
+                self.wait_calls += 1
+                if self.returncode is None:
+                    self.returncode = -15
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        for failure in ("submit", "drain"):
+            with self.subTest(failure=failure):
+                process = FakeProcess()
+                patches = [
+                    patch.object(strategy_lab.subprocess, "Popen", return_value=process),
+                    patch.object(strategy_lab.os, "killpg"),
+                ]
+                if failure == "submit":
+                    patches.append(
+                        patch.object(
+                            strategy_lab.ThreadPoolExecutor,
+                            "submit",
+                            side_effect=RuntimeError("submit failed"),
+                        ),
+                    )
+                else:
+                    patches.append(
+                        patch.object(
+                            strategy_lab,
+                            "_drain_bounded",
+                            side_effect=RuntimeError("drain failed"),
+                        ),
+                    )
+                with patches[0], patches[1], patches[2]:
+                    with self.assertRaisesRegex(RuntimeError, f"{failure} failed"):
+                        strategy_lab._run_bounded_process(
+                            ["research/.venv/bin/python", "-I"],
+                            cwd=Path.cwd(),
+                            timeout=10,
+                        )
+                self.assertGreaterEqual(process.wait_calls, 1)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
 
     def test_atomic_publish_never_overwrites_an_immutable_artifact(self):
         with TemporaryDirectory() as tmp:
@@ -1611,6 +1883,7 @@ class StrategyLoopIdentityAndConfinementTests(unittest.TestCase):
         original = Path.read_bytes
         relevant = {
             Path("research/pybroker_research.py").resolve(),
+            Path("src/nautilus_quant/runtime_attestation.py").resolve(),
             Path("src/nautilus_quant/strategy_lab.py").resolve(),
             Path("src/nautilus_quant/pybroker_candidate.py").resolve(),
         }

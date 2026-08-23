@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -14,6 +15,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 # ponytail: the isolated research venv imports only the pure shared kernel from src;
 # installing the full Nautilus package here would couple the two runtimes.
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+from nautilus_quant.runtime_attestation import (  # pyright: ignore[reportMissingImports]  # noqa: E402
+    research_runtime_identity,
+)
 from nautilus_quant.strategy_families import (  # noqa: E402
     DEFAULT_REGISTRY,
     KERNEL_HASH,
@@ -44,6 +48,37 @@ HYPOTHESIS_FIELDS_V2 = HYPOTHESIS_FIELDS | {"family_version"}
 PARAMETER_FIELDS = {"entry_threshold", "lookback_bars"}
 HEX_DIGITS = frozenset("0123456789abcdef")
 REPOSITORY_DATA = Path(__file__).resolve().parents[1] / "data"
+
+
+def _require_isolated_runtime() -> None:
+    """Require the controller's dedicated interpreter and no ambient import path."""
+    if not sys.flags.isolated:
+        raise RuntimeError("research runtime must run in isolated mode")
+    environment = (REPOSITORY_ROOT / "research/.venv").resolve()
+    if Path(sys.executable).resolve() != (environment / "bin/python").resolve():
+        raise RuntimeError("research executable is not the attested interpreter")
+    if Path(sys.prefix).resolve() != environment:
+        raise RuntimeError("research prefix is not the attested environment")
+    if "PYTHONPATH" in os.environ:
+        raise RuntimeError("research runtime received PYTHONPATH")
+
+
+def _require_trusted_origins(pybroker_module: object) -> None:
+    """Ensure imports resolve only to the attested research env and shared source."""
+    if not sys.flags.isolated:
+        return
+    import nautilus_quant.strategy_families as family_kernel
+
+    environment = (REPOSITORY_ROOT / "research/.venv").resolve()
+    pybroker_origin = getattr(pybroker_module, "__file__", None)
+    kernel_origin = getattr(family_kernel, "__file__", None)
+    if not isinstance(pybroker_origin, str) or not isinstance(kernel_origin, str):
+        raise RuntimeError("research module origin is missing")
+    try:
+        Path(pybroker_origin).resolve().relative_to(environment)
+        Path(kernel_origin).resolve().relative_to(REPOSITORY_ROOT / "src")
+    except ValueError as error:
+        raise RuntimeError("research module origin is untrusted") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +226,37 @@ def write_candidate(candidate: dict[str, object], output: Path) -> str:
     return sha256(payload).hexdigest()
 
 
+def _provisional_metrics(result, signal_count: int) -> dict[str, object]:
+    """Derive finite, bounded screen metrics from one PyBroker result."""
+    equity = [float(value) for value in result.portfolio["equity"].tolist()]
+    if not equity or any(not math.isfinite(value) for value in equity):
+        raise RuntimeError("PyBroker equity series must be finite and non-empty")
+    initial_equity = equity[0]
+    if initial_equity <= 0:
+        raise RuntimeError("PyBroker initial equity must be positive")
+    peak = initial_equity
+    drawdowns: list[float] = []
+    for value in equity:
+        peak = max(peak, value)
+        drawdowns.append(max(0.0, (peak - value) / peak))
+    notional = 0.0
+    for order in result.orders.itertuples():
+        notional += abs(float(order.shares) * float(order.fill_price))
+    metrics = {
+        "max_drawdown": round(max(drawdowns), 12),
+        "signal_count": signal_count,
+        "total_return": round(equity[-1] / initial_equity - 1.0, 12),
+        "trade_count": len(result.trades),
+        "turnover": round(notional / initial_equity, 12),
+    }
+    if any(
+        isinstance(value, float) and not math.isfinite(value)
+        for value in metrics.values()
+    ):
+        raise RuntimeError("PyBroker provisional metrics must be finite")
+    return metrics
+
+
 def _catalog_digest(catalog: Path) -> tuple[str, list[Path]]:
     paths = sorted((Path(catalog) / "data" / "bars" / BAR_TYPE).glob("*.parquet"))
     if not paths:
@@ -256,13 +322,18 @@ def run(
     is_v2 = specification.schema_version == "strategy-hypothesis-v2"
     if is_v2:
         evaluation_context_id = _content_id(evaluation_context_id, "evaluation_context_id")
-        environment_id = _content_id(environment_id, "environment_id")
+        expected_environment_id = _content_id(environment_id, "environment_id")
+        environment_id = research_runtime_identity(REPOSITORY_ROOT, require_active=True)
+        if environment_id != expected_environment_id:
+            raise ValueError("environment attestation mismatch")
     catalog_path = Path(catalog)
     catalog = catalog_path.resolve()
     output = validate_output_path(catalog_path, output)
 
     import pybroker
     from pybroker import Strategy, StrategyConfig
+
+    _require_trusted_origins(pybroker)
 
     pybroker.disable_logging()
     pybroker.register_columns("ts_event_ns")
@@ -368,13 +439,27 @@ def run(
         }
     candidate["strategy"] = strategy_contract
     candidate_id = write_candidate(candidate, output)
-    return {
+    provisional_metrics = (
+        _provisional_metrics(result, len(signals))
+        if is_v2
+        else {"orders": len(result.orders), "signals": len(signals)}
+    )
+    research_result: dict[str, object] = {
         "candidate_id": candidate_id,
-        "provisional_metrics": {"orders": len(result.orders), "signals": len(signals)},
+        "provisional_metrics": provisional_metrics,
     }
+    if is_v2:
+        research_result.update(
+            {
+                "schema_version": "research-result-v2",
+                "truth_status": "provisional",
+            },
+        )
+    return research_result
 
 
 def main() -> int:
+    _require_isolated_runtime()
     parser = argparse.ArgumentParser(description="Run the isolated PyBroker research candidate generator")
     parser.add_argument("--hypothesis", type=Path, required=True)
     parser.add_argument("--catalog", type=Path, required=True)
@@ -389,7 +474,10 @@ def main() -> int:
         evaluation_context_id=args.evaluation_context_id,
         environment_id=args.environment_id,
     )
-    print(json.dumps(result, sort_keys=True))
+    if result.get("schema_version") == "research-result-v2":
+        print(canonical_json(result).decode(), end="")
+    else:
+        print(json.dumps(result, sort_keys=True))
     return 0
 
 

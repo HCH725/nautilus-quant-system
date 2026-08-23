@@ -73,8 +73,56 @@ _POLICY_FIELDS: Final = {
     "slippage_status",
     "starting_balance_usdt",
 }
+_DECISION_POLICY_VERSION: Final = "strategy-loop-decision-v1"
+_FIXED_QUANTITY_BTC: Final = Decimal("0.001")
+_SIGNAL_TIMING: Final = "bar-close; effective no earlier than next event"
+_SLIPPAGE_STATUS: Final = "unmodeled"
 _USDT: Final = Currency.from_str("USDT")
 _VENUE: Final = Venue("BINANCE")
+_VERDICT_FIELDS: Final = frozenset(
+    {
+        "accounting_reconciled",
+        "candidate_id",
+        "canonical_result_hash",
+        "code_commit",
+        "decision",
+        "ending_balance",
+        "ending_position",
+        "evaluation_windows",
+        "execution",
+        "experiment_id",
+        "fees",
+        "funding",
+        "gross_trading_result",
+        "hypothesis_id",
+        "net_account_delta",
+        "open_position_count",
+        "performance_claimable",
+        "policy_decision_version",
+        "realized_balance_drawdown",
+        "reason_codes",
+        "runtime_versions",
+        "schema_version",
+        "source",
+        "starting_balance",
+        "status",
+        "strategy_id",
+    },
+)
+_PARITY_FIELDS: Final = frozenset(
+    {
+        "candidate_id",
+        "candidate_signal_count",
+        "detail",
+        "mismatch_index",
+        "outcome",
+        "reason_code",
+        "recomputed_signal_count",
+        "recomputed_signals_sha256",
+        "required_action",
+        "schema_version",
+    },
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +233,464 @@ def _money(value: Decimal) -> str:
     return f"{value:.8f}"
 
 
+def _verdict_object(value: JsonValue, fields: frozenset[str], name: str) -> dict[str, JsonValue]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise CandidateBacktestError(f"invalid Nautilus verdict {name} fields")
+    return value
+
+
+def _verdict_integer(value: JsonValue, name: str, *, nullable: bool = False) -> int | None:
+    if nullable and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CandidateBacktestError(f"Nautilus verdict {name} must be a non-negative integer")
+    return value
+
+
+def _verdict_decimal(value: JsonValue, name: str, *, positive: bool = False) -> Decimal:
+    if not isinstance(value, str):
+        raise CandidateBacktestError(f"Nautilus verdict {name} must be a decimal string")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as error:
+        raise CandidateBacktestError(f"Nautilus verdict {name} must be a decimal string") from error
+    if not parsed.is_finite() or (positive and parsed <= 0):
+        raise CandidateBacktestError(f"Nautilus verdict {name} must be finite")
+    return parsed
+
+
+def _verdict_content_id(value: JsonValue, name: str, *, length: int = 64) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise CandidateBacktestError(f"Nautilus verdict {name} is invalid")
+    return value
+
+
+def _parity_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    value: dict[str, JsonValue] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CandidateBacktestError(f"signal parity artifact has duplicate key: {key}")
+        value[key] = item
+    return value
+
+
+def _parity_constant(value: str) -> JsonValue:
+    raise CandidateBacktestError(f"signal parity artifact contains non-finite value: {value}")
+
+
+def candidate_signal_decisions(
+    candidate: dict[str, JsonValue],
+) -> tuple[FamilyDecision, ...]:
+    """Decode the exact Candidate v2 decision sequence for parity reuse."""
+    rows = candidate.get("signals")
+    if not isinstance(rows, list):
+        raise CandidateBacktestError("Candidate v2 signals are invalid")
+    expected_fields = frozenset(FamilyDecision.__dataclass_fields__)
+    decisions: list[FamilyDecision] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != expected_fields:
+            raise CandidateBacktestError("Candidate v2 decision fields are invalid")
+        try:
+            decisions.append(FamilyDecision(**row))
+        except (TypeError, ValueError) as error:
+            raise CandidateBacktestError("Candidate v2 decision is invalid") from error
+    return tuple(decisions)
+
+
+def load_signal_parity_result(
+    payload: bytes,
+    *,
+    candidate_id: str,
+    candidate_signal_count: int,
+    recomputed_decisions: tuple[FamilyDecision, ...],
+    artifact_sha256: str | None = None,
+) -> SignalParityResult:
+    """Load one exact parity artifact against independently recomputed decisions."""
+    try:
+        value: JsonValue = json.loads(
+            payload,
+            object_pairs_hook=_parity_object,
+            parse_constant=_parity_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CandidateBacktestError("signal parity artifact must be UTF-8 JSON") from error
+    if not isinstance(value, dict) or set(value) != _PARITY_FIELDS:
+        raise CandidateBacktestError("invalid signal parity artifact fields")
+    if payload != _canonical(value):
+        raise CandidateBacktestError("signal parity artifact must use canonical JSON encoding")
+    _verdict_content_id(value["candidate_id"], "signal_parity.candidate_id")
+    if value["candidate_id"] != candidate_id:
+        raise CandidateBacktestError("signal parity candidate_id mismatch")
+    if (
+        isinstance(candidate_signal_count, bool)
+        or not isinstance(candidate_signal_count, int)
+        or candidate_signal_count < 0
+    ):
+        raise CandidateBacktestError("signal parity candidate signal count is invalid")
+    artifact_candidate_count = _verdict_integer(
+        value["candidate_signal_count"],
+        "signal_parity.candidate_signal_count",
+    )
+    recomputed_count = _verdict_integer(
+        value["recomputed_signal_count"],
+        "signal_parity.recomputed_signal_count",
+    )
+    if artifact_candidate_count != candidate_signal_count:
+        raise CandidateBacktestError("signal parity candidate signal count mismatch")
+    if recomputed_count != len(recomputed_decisions):
+        raise CandidateBacktestError("signal parity recomputed signal count mismatch")
+    decision_payload = b"".join(
+        canonical_decision_bytes(item) for item in recomputed_decisions
+    )
+    if value["recomputed_signals_sha256"] != sha256(decision_payload).hexdigest():
+        raise CandidateBacktestError("signal parity recomputed decisions hash mismatch")
+    if value["schema_version"] != "signal-parity-result-v1":
+        raise CandidateBacktestError("unsupported signal parity schema")
+    outcome = value["outcome"]
+    reason_code = value["reason_code"]
+    required_action = value["required_action"]
+    mismatch_index = value["mismatch_index"]
+    detail = value["detail"]
+    if outcome == "PASS":
+        if (
+            reason_code != "SIGNAL_PARITY_MATCH"
+            or required_action is not None
+            or mismatch_index is not None
+            or detail is not None
+            or candidate_signal_count != len(recomputed_decisions)
+        ):
+            raise CandidateBacktestError("signal parity PASS fields are inconsistent")
+    elif outcome == "ERROR":
+        if required_action != "FIX_TECHNICAL" or reason_code not in {
+            "SIGNAL_PARITY_MISMATCH",
+            "SIGNAL_PARITY_RECOMPUTE_FAILED",
+        }:
+            raise CandidateBacktestError("signal parity ERROR fields are inconsistent")
+        if not isinstance(detail, str) or not detail:
+            raise CandidateBacktestError("signal parity ERROR detail is invalid")
+        if reason_code == "SIGNAL_PARITY_RECOMPUTE_FAILED":
+            if mismatch_index is not None:
+                raise CandidateBacktestError("signal parity recompute mismatch index is invalid")
+        elif (
+            isinstance(mismatch_index, bool)
+            or not isinstance(mismatch_index, int)
+            or not 0 <= mismatch_index <= max(candidate_signal_count, len(recomputed_decisions))
+        ):
+            raise CandidateBacktestError("signal parity mismatch index is invalid")
+    else:
+        raise CandidateBacktestError("signal parity outcome is invalid")
+    if artifact_sha256 is not None and sha256(payload).hexdigest() != artifact_sha256:
+        raise CandidateBacktestError("signal parity artifact hash mismatch")
+    return SignalParityResult(
+        candidate_id=candidate_id,
+        outcome=outcome,
+        reason_code=reason_code,
+        required_action=required_action,
+        mismatch_index=mismatch_index,
+        decisions=recomputed_decisions,
+        canonical_bytes=payload,
+        artifact_sha256=sha256(payload).hexdigest(),
+    )
+
+
+def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
+    """Load one canonical, structurally complete Nautilus historical verdict."""
+    try:
+        value: JsonValue = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CandidateBacktestError("Nautilus verdict must be UTF-8 JSON") from error
+    if not isinstance(value, dict) or set(value) not in {
+        _VERDICT_FIELDS,
+        _VERDICT_FIELDS | {"signal_parity"},
+    }:
+        raise CandidateBacktestError("invalid Nautilus verdict fields")
+    try:
+        canonical = _canonical(value)
+    except (TypeError, ValueError) as error:
+        raise CandidateBacktestError("Nautilus verdict contains invalid JSON values") from error
+    if payload != canonical:
+        raise CandidateBacktestError("Nautilus verdict must use canonical JSON encoding")
+
+    document = value
+    claimed_result_hash = _verdict_content_id(
+        document["canonical_result_hash"],
+        "canonical_result_hash",
+    )
+    preimage = dict(document)
+    del preimage["canonical_result_hash"]
+    if sha256(_canonical(preimage)).hexdigest() != claimed_result_hash:
+        raise CandidateBacktestError("Nautilus verdict canonical_result_hash mismatch")
+    for field in ("candidate_id", "experiment_id", "hypothesis_id", "strategy_id"):
+        _verdict_content_id(document[field], field)
+    _verdict_content_id(document["code_commit"], "code_commit", length=40)
+    if (
+        document["schema_version"] != "nautilus-verdict-v1"
+        or document["status"] != "EVALUATED"
+        or document["accounting_reconciled"] is not True
+        or document["ending_position"] != "FLAT"
+        or document["open_position_count"] != 0
+        or not isinstance(document["performance_claimable"], bool)
+        or document["policy_decision_version"] != _DECISION_POLICY_VERSION
+    ):
+        raise CandidateBacktestError("Nautilus verdict terminal fields are invalid")
+    decision = document["decision"]
+    reason_codes = document["reason_codes"]
+    if decision not in {"REVISE", "RETAIN_FOR_RESEARCH"} or (
+        not isinstance(reason_codes, list)
+        or not reason_codes
+        or not all(isinstance(reason, str) and reason for reason in reason_codes)
+    ):
+        raise CandidateBacktestError("Nautilus verdict decision is invalid")
+    starting_balance = _verdict_decimal(
+        document["starting_balance"],
+        "starting_balance",
+        positive=True,
+    )
+    ending_balance = _verdict_decimal(document["ending_balance"], "ending_balance")
+    gross_result = _verdict_decimal(document["gross_trading_result"], "gross_trading_result")
+    net_account_delta = _verdict_decimal(document["net_account_delta"], "net_account_delta")
+    realized_drawdown = _verdict_decimal(
+        document["realized_balance_drawdown"],
+        "realized_balance_drawdown",
+    )
+    if ending_balance <= 0:
+        raise CandidateBacktestError("Nautilus verdict ending_balance must be positive")
+    if realized_drawdown < 0:
+        raise CandidateBacktestError("Nautilus verdict drawdown must be non-negative")
+    if ending_balance - starting_balance != net_account_delta:
+        raise CandidateBacktestError("Nautilus verdict balance delta does not reconcile")
+
+    windows = _verdict_object(
+        document["evaluation_windows"],
+        frozenset(
+            {
+                "actual_first_ts_event_ns",
+                "actual_last_ts_event_ns",
+                "configured_historical_start",
+                "first_official_funding_ns",
+            },
+        ),
+        "evaluation_windows",
+    )
+    first_event = _verdict_integer(windows["actual_first_ts_event_ns"], "actual_first_ts_event_ns")
+    last_event = _verdict_integer(windows["actual_last_ts_event_ns"], "actual_last_ts_event_ns")
+    if (
+        first_event is None
+        or last_event is None
+        or first_event > last_event
+        or not isinstance(windows["configured_historical_start"], str)
+        or not windows["configured_historical_start"]
+    ):
+        raise CandidateBacktestError("Nautilus verdict evaluation window is invalid")
+    _verdict_integer(windows["first_official_funding_ns"], "first_official_funding_ns", nullable=True)
+
+    execution = _verdict_object(
+        document["execution"],
+        frozenset(
+            {
+                "boundary_flattened",
+                "deduped_signal_count",
+                "fill_count",
+                "fills",
+                "fixed_quantity_btc",
+                "order_count",
+                "signal_timing",
+                "slippage_status",
+                "trade_count",
+            },
+        ),
+        "execution",
+    )
+    if not isinstance(execution["boundary_flattened"], bool):
+        raise CandidateBacktestError("Nautilus verdict execution boundary is invalid")
+    if execution["slippage_status"] != _SLIPPAGE_STATUS:
+        raise CandidateBacktestError("Nautilus verdict slippage policy is invalid")
+    fixed_quantity = _verdict_decimal(
+        execution["fixed_quantity_btc"],
+        "fixed_quantity_btc",
+        positive=True,
+    )
+    if execution["signal_timing"] != _SIGNAL_TIMING or fixed_quantity != _FIXED_QUANTITY_BTC:
+        raise CandidateBacktestError("Nautilus verdict execution policy is invalid")
+    counts = {
+        field: _verdict_integer(execution[field], field)
+        for field in ("deduped_signal_count", "fill_count", "order_count", "trade_count")
+    }
+    assert all(value is not None for value in counts.values())
+    fills = execution["fills"]
+    if not isinstance(fills, list) or execution["fill_count"] != len(fills):
+        raise CandidateBacktestError("Nautilus verdict fill count is invalid")
+    fill_commissions: list[Decimal] = []
+    for fill in fills:
+        item = _verdict_object(
+            fill,
+            frozenset(
+                {
+                    "action_ts_event_ns",
+                    "commission",
+                    "fill_ts_event_ns",
+                    "intent",
+                    "quantity",
+                    "source_signal_ts_event_ns",
+                },
+            ),
+            "fill",
+        )
+        action_ts = _verdict_integer(item["action_ts_event_ns"], "action_ts_event_ns")
+        _verdict_integer(item["fill_ts_event_ns"], "fill_ts_event_ns")
+        source_signal_ts = _verdict_integer(
+            item["source_signal_ts_event_ns"],
+            "source_signal_ts_event_ns",
+            nullable=True,
+        )
+        fill_commissions.append(_verdict_decimal(item["commission"], "commission"))
+        if _verdict_decimal(item["quantity"], "quantity", positive=True) != fixed_quantity:
+            raise CandidateBacktestError("Nautilus verdict fill quantity is inconsistent")
+        if source_signal_ts is not None and action_ts <= source_signal_ts:
+            raise CandidateBacktestError("Nautilus verdict fill timing is inconsistent")
+        if item["intent"] not in {"LONG", "FLAT"}:
+            raise CandidateBacktestError("Nautilus verdict fill intent is invalid")
+    if counts["order_count"] != counts["fill_count"] or counts["trade_count"] != sum(
+        item["intent"] == "FLAT" for item in fills
+    ):
+        raise CandidateBacktestError("Nautilus verdict execution counts are inconsistent")
+
+    fees = _verdict_object(
+        document["fees"],
+        frozenset({"maker_rate", "source", "taker_rate", "total"}),
+        "fees",
+    )
+    if fees["source"] != "nautilus_instrument_metadata":
+        raise CandidateBacktestError("Nautilus verdict fee source is invalid")
+    for field in ("maker_rate", "taker_rate", "total"):
+        _verdict_decimal(fees[field], f"fees.{field}")
+    fee_total = _verdict_decimal(fees["total"], "fees.total")
+    if sum(fill_commissions, Decimal()) != fee_total:
+        raise CandidateBacktestError("Nautilus verdict fees do not reconcile with fills")
+
+    funding = _verdict_object(
+        document["funding"],
+        frozenset(
+            {"events", "same_timestamp_order", "source", "total", "truth_counts", "truth_status"},
+        ),
+        "funding",
+    )
+    if (
+        funding["same_timestamp_order"] != "mark_then_funding"
+        or funding["source"] != "canonical_funding_observation_v1"
+        or funding["truth_status"] not in {"official", "modeled_funding", "mixed", "missing"}
+    ):
+        raise CandidateBacktestError("Nautilus verdict funding policy is invalid")
+    funding_total = _verdict_decimal(funding["total"], "funding.total")
+    truth_counts = _verdict_object(
+        funding["truth_counts"],
+        frozenset({"missing_mark", "modeled_funding", "official"}),
+        "funding.truth_counts",
+    )
+    truth_count_values: dict[str, int] = {}
+    for field in truth_counts:
+        truth_count = _verdict_integer(truth_counts[field], f"funding.truth_counts.{field}")
+        assert truth_count is not None
+        truth_count_values[field] = truth_count
+    events = funding["events"]
+    if not isinstance(events, list):
+        raise CandidateBacktestError("Nautilus verdict funding events are invalid")
+    event_total = Decimal()
+    event_counts = {"official": 0, "modeled_funding": 0}
+    for event in events:
+        item = _verdict_object(
+            event,
+            frozenset({"amount", "mark_price", "price_source", "rate", "truth_status", "ts_event_ns"}),
+            "funding event",
+        )
+        event_total += _verdict_decimal(item["amount"], "funding.amount")
+        _verdict_decimal(item["mark_price"], "funding.mark_price", positive=True)
+        _verdict_decimal(item["rate"], "funding.rate")
+        _verdict_integer(item["ts_event_ns"], "funding.ts_event_ns")
+        if (
+            not isinstance(item["price_source"], str)
+            or not item["price_source"]
+            or item["truth_status"] not in {"official", "modeled_funding"}
+        ):
+            raise CandidateBacktestError("Nautilus verdict funding event is invalid")
+        event_counts[str(item["truth_status"])] += 1
+    if event_total != funding_total:
+        raise CandidateBacktestError("Nautilus verdict funding total does not reconcile")
+    if any(event_counts[field] > truth_count_values[field] for field in event_counts):
+        raise CandidateBacktestError("Nautilus verdict funding counts are inconsistent")
+    if truth_count_values["missing_mark"] > truth_count_values["modeled_funding"]:
+        raise CandidateBacktestError("Nautilus verdict funding truth counts are inconsistent")
+
+    source = _verdict_object(
+        document["source"],
+        frozenset({"first_ts_event_ns", "last_ts_event_ns", "row_count", "sha256"}),
+        "source",
+    )
+    source_first = _verdict_integer(source["first_ts_event_ns"], "source.first_ts_event_ns")
+    source_last = _verdict_integer(source["last_ts_event_ns"], "source.last_ts_event_ns")
+    source_rows = _verdict_integer(source["row_count"], "source.row_count")
+    _verdict_content_id(source["sha256"], "source.sha256")
+    if source_first is None or source_last is None or source_rows is None or source_first > source_last or source_rows == 0:
+        raise CandidateBacktestError("Nautilus verdict source range is invalid")
+
+    versions = _verdict_object(
+        document["runtime_versions"],
+        frozenset({"nautilus_trader", "nautilus_python", "pybroker", "research_python"}),
+        "runtime_versions",
+    )
+    if (
+        not all(isinstance(item, str) and item for item in versions.values())
+        or versions["nautilus_trader"] != nautilus_trader.__version__
+        or versions["nautilus_python"] != platform.python_version()
+    ):
+        raise CandidateBacktestError("Nautilus verdict runtime versions are invalid")
+    if document["performance_claimable"] is not False:
+        raise CandidateBacktestError("Nautilus verdict performance claim is inconsistent")
+    expected_truth_status = (
+        "official"
+        if truth_count_values["official"] and not truth_count_values["modeled_funding"]
+        else "modeled_funding"
+        if truth_count_values["modeled_funding"] and not truth_count_values["official"]
+        else "mixed"
+        if truth_count_values["modeled_funding"] and truth_count_values["official"]
+        else "missing"
+    )
+    if funding["truth_status"] != expected_truth_status:
+        raise CandidateBacktestError("Nautilus verdict funding truth status is inconsistent")
+    if gross_result + fee_total + funding_total != net_account_delta:
+        raise CandidateBacktestError("Nautilus verdict gross, fees, and funding do not reconcile")
+    expected_reason_codes = [
+        "POSITIVE_NET_RESEARCH_ONLY" if net_account_delta > 0 else "NON_POSITIVE_NET_RESULT",
+        "UNMODELED_SLIPPAGE",
+    ]
+    if funding["truth_status"] != "official":
+        expected_reason_codes.append(f"FUNDING_TRUTH_{str(funding['truth_status']).upper()}")
+    if document["reason_codes"] != expected_reason_codes:
+        raise CandidateBacktestError("Nautilus verdict decision reasons are inconsistent")
+    expected_decision = "RETAIN_FOR_RESEARCH" if net_account_delta > 0 else "REVISE"
+    if document["decision"] != expected_decision:
+        raise CandidateBacktestError("Nautilus verdict decision is inconsistent with net result")
+
+    parity = document.get("signal_parity")
+    if parity is not None:
+        parity_document = _verdict_object(
+            parity,
+            frozenset({"artifact_sha256", "outcome", "reason_code"}),
+            "signal_parity",
+        )
+        _verdict_content_id(parity_document["artifact_sha256"], "signal_parity.artifact_sha256")
+        if (
+            parity_document["outcome"] != "PASS"
+            or parity_document["reason_code"] != "SIGNAL_PARITY_MATCH"
+        ):
+            raise CandidateBacktestError("Nautilus verdict signal parity is invalid")
+    return document
+
+
 def _load_policy(path: Path) -> _Policy:
     payload = Path(path).read_bytes()
     try:
@@ -200,9 +706,10 @@ def _load_policy(path: Path) -> _Policy:
         or root["fee_source"] != "nautilus_instrument_metadata"
         or root["leverage_enabled"] is not False
         or root["official_only_window_start"] != "first_official_funding_observation"
-        or root["signal_timing"]
-        != "bar-close; effective no earlier than next event"
-        or root["slippage_status"] != "unmodeled"
+        or root["decision_policy_version"] != _DECISION_POLICY_VERSION
+        or root["fixed_quantity_btc"] != str(_FIXED_QUANTITY_BTC)
+        or root["signal_timing"] != _SIGNAL_TIMING
+        or root["slippage_status"] != _SLIPPAGE_STATUS
         or not isinstance(root["historical_start"], str)
         or not isinstance(root["decision_policy_version"], str)
     ):
@@ -268,6 +775,15 @@ def _source_bars(
     return bars
 
 
+def validated_candidate_source_bars(
+    candidate: dict[str, JsonValue],
+    catalog_path: Path,
+) -> list[Bar]:
+    """Validate candidate source identity against the current canonical catalog."""
+    catalog = ParquetDataCatalog(str(catalog_path))
+    return _source_bars(candidate, catalog, Path(catalog_path))
+
+
 def _parity_result(
     *,
     candidate_id: str,
@@ -312,39 +828,20 @@ def _verified_parity_decisions(
         raise CandidateBacktestError("signal parity gate did not pass")
     if parity.candidate_id != candidate_id:
         raise CandidateBacktestError("signal parity candidate_id mismatch")
-    if sha256(parity.canonical_bytes).hexdigest() != parity.artifact_sha256:
-        raise CandidateBacktestError("signal parity artifact hash mismatch")
     if not isinstance(parity.decisions, tuple) or not all(
         isinstance(item, FamilyDecision) for item in parity.decisions
     ):
         raise CandidateBacktestError("signal parity decisions are invalid")
     try:
-        document = json.loads(parity.canonical_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CandidateBacktestError("signal parity artifact must be UTF-8 JSON") from error
-    decision_payload = b"".join(
-        canonical_decision_bytes(item) for item in parity.decisions
-    )
-    expected: dict[str, JsonValue] = {
-        "candidate_id": candidate_id,
-        "candidate_signal_count": len(parity.decisions),
-        "detail": None,
-        "mismatch_index": None,
-        "outcome": "PASS",
-        "reason_code": "SIGNAL_PARITY_MATCH",
-        "recomputed_signal_count": len(parity.decisions),
-        "recomputed_signals_sha256": sha256(decision_payload).hexdigest(),
-        "required_action": None,
-        "schema_version": "signal-parity-result-v1",
-    }
-    if (
-        parity.reason_code != "SIGNAL_PARITY_MATCH"
-        or parity.mismatch_index is not None
-        or document != expected
-        or parity.canonical_bytes != _canonical(expected)
-    ):
-        raise CandidateBacktestError("signal parity artifact content mismatch")
-    return parity.decisions
+        return load_signal_parity_result(
+            parity.canonical_bytes,
+            candidate_id=candidate_id,
+            candidate_signal_count=len(parity.decisions),
+            recomputed_decisions=parity.decisions,
+            artifact_sha256=parity.artifact_sha256,
+        ).decisions
+    except CandidateBacktestError as error:
+        raise CandidateBacktestError("signal parity artifact content mismatch") from error
 
 
 def run_signal_parity_gate(
@@ -359,8 +856,7 @@ def run_signal_parity_gate(
     if not isinstance(rows, list):
         raise CandidateBacktestError("validated Candidate v2 signals are invalid")
     try:
-        catalog = ParquetDataCatalog(str(catalog_path))
-        source_bars = _source_bars(candidate, catalog, Path(catalog_path))
+        source_bars = validated_candidate_source_bars(candidate, Path(catalog_path))
         strategy = _mapping(candidate["strategy"], "candidate strategy")
         family_id = strategy.get("family_id")
         family_version = strategy.get("family_version")
@@ -886,8 +1382,9 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             "reason_codes": reason_codes,
             "runtime_versions": {
                 "nautilus_trader": nautilus_trader.__version__,
+                "nautilus_python": platform.python_version(),
                 "pybroker": str(runtime["pybroker_version"]),
-                "python": platform.python_version(),
+                "research_python": str(runtime["python_version"]),
             },
             "schema_version": "nautilus-verdict-v1",
             "source": {

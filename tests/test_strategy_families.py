@@ -11,6 +11,7 @@ from nautilus_quant.strategy_families import (
     IncrementalFamilyEvaluator,
     KERNEL_HASH,
     KERNEL_VERSION,
+    DEFAULT_REGISTRY,
     canonical_decision_bytes,
     derive_signal_id,
     evaluate_batch,
@@ -21,6 +22,9 @@ from nautilus_quant.strategy_families import (
 FAMILY_ID = "lookback-momentum-long-flat"
 FAMILY_VERSION = "lookback-momentum-long-flat-v1"
 PARAMETERS = {"entry_threshold": 0.05, "lookback_bars": 2}
+SMA_FAMILY_ID = "close-vs-sma-mean-reversion-long-flat"
+SMA_FAMILY_VERSION = "close-vs-sma-mean-reversion-long-flat-v1"
+SMA_PARAMETERS = {"discount_threshold": 0.05, "window_bars": 2}
 
 
 def bar(timestamp: int, close: float) -> ClosedBar:
@@ -35,6 +39,47 @@ def bar(timestamp: int, close: float) -> ClosedBar:
 
 
 class StrategyFamilyGoldenVectorTests(unittest.TestCase):
+    def test_predeclared_sma_mean_reversion_family_has_golden_vectors_and_version_identity(self) -> None:
+        decisions = evaluate_batch(
+            family_id=SMA_FAMILY_ID,
+            family_version=SMA_FAMILY_VERSION,
+            parameters=SMA_PARAMETERS,
+            bars=[bar(1, 100), bar(2, 110), bar(3, 90)],
+        )
+
+        self.assertEqual(
+            [
+                (item.ts_event_ns, item.score, item.target_intent, item.reason)
+                for item in decisions
+            ],
+            [
+                (2, "0.047619047619", "FLAT", "CLOSE_AT_OR_ABOVE_SMA_DISCOUNT_THRESHOLD"),
+                (3, "-0.1", "LONG", "CLOSE_BELOW_SMA_DISCOUNT_THRESHOLD"),
+            ],
+        )
+        self.assertEqual(
+            DEFAULT_REGISTRY.resolve(SMA_FAMILY_ID, SMA_FAMILY_VERSION).family_version,
+            SMA_FAMILY_VERSION,
+        )
+        definition = DEFAULT_REGISTRY.resolve(SMA_FAMILY_ID, SMA_FAMILY_VERSION)
+        self.assertTrue(definition.thesis)
+        self.assertTrue(definition.falsification)
+
+    def test_sma_mean_reversion_compares_the_canonically_rounded_score(self) -> None:
+        decisions = evaluate_batch(
+            family_id=SMA_FAMILY_ID,
+            family_version=SMA_FAMILY_VERSION,
+            parameters=SMA_PARAMETERS,
+            bars=[bar(1, 1.0), bar(2, 0.9047619047611792)],
+        )
+
+        self.assertEqual(decisions[0].score, "-0.05")
+        self.assertEqual(decisions[0].target_intent, "FLAT")
+        self.assertEqual(
+            decisions[0].reason,
+            "CLOSE_AT_OR_ABOVE_SMA_DISCOUNT_THRESHOLD",
+        )
+
     def test_momentum_batch_emits_one_canonical_decision_per_eligible_bar(self) -> None:
         decisions = evaluate_batch(
             family_id=FAMILY_ID,

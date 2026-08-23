@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
 import json
+import platform
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -23,6 +24,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 
 from nautilus_quant.candidate_backtest import (
     CandidateBacktestRequest,
+    load_candidate_backtest_verdict,
     run_candidate_backtest,
     run_signal_parity_gate,
 )
@@ -647,6 +649,86 @@ class CandidateBacktestTests(unittest.TestCase):
         self.assertEqual(claimed_hash, sha256(_canonical(body)).hexdigest())
         self.assertEqual(first.verdict_id, sha256(first.canonical_bytes).hexdigest())
         self.assertEqual(first.canonical_bytes, _canonical(first.verdict))
+
+    def test_v2_verdict_binds_research_and_root_python_separately(self) -> None:
+        candidate = self._candidate_v2()
+        self._write_candidate(candidate)
+        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
+
+        result = run_candidate_backtest(replace(self.request, signal_parity=parity))
+
+        versions = result.verdict["runtime_versions"]
+        self.assertEqual(
+            set(versions),
+            {"nautilus_trader", "nautilus_python", "pybroker", "research_python"},
+        )
+        self.assertEqual(versions["research_python"], candidate["runtime"]["python_version"])
+        self.assertEqual(versions["nautilus_python"], platform.python_version())
+        self.assertNotEqual(versions["research_python"], versions["nautilus_python"])
+
+    def test_verdict_loader_rejects_an_economically_impossible_balance_delta(self) -> None:
+        result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
+        invalid = dict(result.verdict)
+        invalid["ending_balance"] = "1.00000000"
+        invalid.pop("canonical_result_hash")
+        invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+        with self.assertRaisesRegex(RuntimeError, "balance delta"):
+            load_candidate_backtest_verdict(_canonical(invalid))
+
+    def test_verdict_loader_rejects_claimable_modeled_slippage(self) -> None:
+        result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
+        invalid = json.loads(json.dumps(result.verdict))
+        invalid["execution"]["slippage_status"] = "modeled"
+        invalid["performance_claimable"] = True
+        invalid.pop("canonical_result_hash")
+        invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+        with self.assertRaisesRegex(RuntimeError, "slippage"):
+            load_candidate_backtest_verdict(_canonical(invalid))
+
+    def test_verdict_loader_rejects_forged_nautilus_runtime_version(self) -> None:
+        result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
+        invalid = json.loads(json.dumps(result.verdict))
+        invalid["runtime_versions"]["nautilus_trader"] = "forged-not-installed"
+        invalid.pop("canonical_result_hash")
+        invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+        with self.assertRaisesRegex(RuntimeError, "runtime versions"):
+            load_candidate_backtest_verdict(_canonical(invalid))
+
+    def test_verdict_loader_rejects_frozen_execution_policy_drift(self) -> None:
+        result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
+        mutations = (
+            (None, "policy_decision_version", "forged-policy"),
+            ("execution", "signal_timing", "same-bar"),
+            ("execution", "fixed_quantity_btc", "0.002"),
+        )
+        for parent, field, value in mutations:
+            with self.subTest(field=field):
+                invalid = json.loads(json.dumps(result.verdict))
+                target = invalid if parent is None else invalid[parent]
+                target[field] = value
+                invalid.pop("canonical_result_hash")
+                invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+                with self.assertRaisesRegex(RuntimeError, "policy|terminal"):
+                    load_candidate_backtest_verdict(_canonical(invalid))
+
+    def test_verdict_loader_rejects_fill_quantity_and_next_event_timing_drift(self) -> None:
+        result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
+        for field, value in (
+            ("quantity", "0.002"),
+            ("action_ts_event_ns", result.verdict["execution"]["fills"][0]["source_signal_ts_event_ns"]),
+        ):
+            with self.subTest(field=field):
+                invalid = json.loads(json.dumps(result.verdict))
+                invalid["execution"]["fills"][0][field] = value
+                invalid.pop("canonical_result_hash")
+                invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+                with self.assertRaisesRegex(RuntimeError, "quantity|timing"):
+                    load_candidate_backtest_verdict(_canonical(invalid))
 
 
 if __name__ == "__main__":

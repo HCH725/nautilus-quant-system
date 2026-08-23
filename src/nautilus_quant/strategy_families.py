@@ -11,7 +11,10 @@ from typing import Any
 
 KERNEL_VERSION = "strategy-family-kernel-v1"
 _KERNEL_MANIFEST = {
-    "families": {"lookback-momentum-long-flat": "lookback-momentum-long-flat-v1"},
+    "families": {
+        "close-vs-sma-mean-reversion-long-flat": "close-vs-sma-mean-reversion-long-flat-v1",
+        "lookback-momentum-long-flat": "lookback-momentum-long-flat-v1",
+    },
     "kernel_version": KERNEL_VERSION,
     "signal_identity_schema": "strategy-signal-v1",
 }
@@ -62,6 +65,8 @@ class FamilyDefinition:
     warmup_bars: Callable[[Mapping[str, Any]], int]
     validate_parameters: Callable[[Mapping[str, Any]], dict[str, Any]]
     evaluate: Callable[[Sequence[ClosedBar], Mapping[str, Any]], FamilyEvaluation]
+    thesis: str = ""
+    falsification: str = ""
 
 
 class FamilyRegistry:
@@ -175,6 +180,18 @@ def _validate_bar(value: ClosedBar, previous_ts: int | None) -> None:
         raise FamilyKernelError("close must be positive")
 
 
+def _finite_nonnegative_parameter(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FamilyKernelError(f"{name} must be numeric")
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as error:
+        raise FamilyKernelError(f"{name} must be finite and non-negative") from error
+    if not math.isfinite(normalized) or normalized < 0:
+        raise FamilyKernelError(f"{name} must be finite and non-negative")
+    return 0.0 if normalized == 0 else normalized
+
+
 def _validate_momentum_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     if set(parameters) != {"entry_threshold", "lookback_bars"}:
         raise FamilyKernelError(
@@ -186,12 +203,11 @@ def _validate_momentum_parameters(parameters: Mapping[str, Any]) -> dict[str, An
         raise FamilyKernelError("lookback_bars must be an integer")
     if not 1 <= lookback_bars <= 8_760:
         raise FamilyKernelError("lookback_bars must be between 1 and 8760")
-    if isinstance(entry_threshold, bool) or not isinstance(entry_threshold, (int, float)):
-        raise FamilyKernelError("entry_threshold must be numeric")
-    if not math.isfinite(float(entry_threshold)) or entry_threshold < 0:
-        raise FamilyKernelError("entry_threshold must be finite and non-negative")
     return {
-        "entry_threshold": 0.0 if entry_threshold == 0 else float(entry_threshold),
+        "entry_threshold": _finite_nonnegative_parameter(
+            entry_threshold,
+            "entry_threshold",
+        ),
         "lookback_bars": lookback_bars,
     }
 
@@ -213,14 +229,72 @@ def _momentum_evaluation(
     )
 
 
+def _validate_sma_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    if set(parameters) != {"discount_threshold", "window_bars"}:
+        raise FamilyKernelError(
+            "sma mean-reversion parameters must contain only discount_threshold and window_bars"
+        )
+    window_bars = parameters["window_bars"]
+    discount_threshold = parameters["discount_threshold"]
+    if isinstance(window_bars, bool) or not isinstance(window_bars, int):
+        raise FamilyKernelError("window_bars must be an integer")
+    if not 2 <= window_bars <= 8_760:
+        raise FamilyKernelError("window_bars must be between 2 and 8760")
+    return {
+        "discount_threshold": _finite_nonnegative_parameter(
+            discount_threshold,
+            "discount_threshold",
+        ),
+        "window_bars": window_bars,
+    }
+
+
+def _sma_mean_reversion_evaluation(
+    bars: Sequence[ClosedBar], parameters: Mapping[str, Any]
+) -> FamilyEvaluation:
+    mean_close = sum(float(bar.close) for bar in bars) / len(bars)
+    score = round(float(bars[-1].close) / mean_close - 1.0, 12)
+    discount_threshold = float(parameters["discount_threshold"])
+    is_long = score < -discount_threshold
+    return FamilyEvaluation(
+        score=score,
+        target_intent="LONG" if is_long else "FLAT",
+        reason=(
+            "CLOSE_BELOW_SMA_DISCOUNT_THRESHOLD"
+            if is_long
+            else "CLOSE_AT_OR_ABOVE_SMA_DISCOUNT_THRESHOLD"
+        ),
+    )
+
+
 DEFAULT_REGISTRY = FamilyRegistry(
     (
+        FamilyDefinition(
+            family_id="close-vs-sma-mean-reversion-long-flat",
+            family_version="close-vs-sma-mean-reversion-long-flat-v1",
+            warmup_bars=lambda parameters: int(parameters["window_bars"]),
+            validate_parameters=_validate_sma_parameters,
+            evaluate=_sma_mean_reversion_evaluation,
+            thesis=(
+                "A completed-bar close materially below its short-window SMA "
+                "mean-reverts after the next event."
+            ),
+            falsification=(
+                "No activity, excessive provisional drawdown or turnover, or "
+                "failure under later authoritative evaluation."
+            ),
+        ),
         FamilyDefinition(
             family_id="lookback-momentum-long-flat",
             family_version="lookback-momentum-long-flat-v1",
             warmup_bars=lambda parameters: int(parameters["lookback_bars"]),
             validate_parameters=_validate_momentum_parameters,
             evaluate=_momentum_evaluation,
+            thesis="Positive completed-bar momentum persists into the next event.",
+            falsification=(
+                "No activity, excessive provisional drawdown or turnover, or "
+                "failure under later authoritative evaluation."
+            ),
         ),
     )
 )

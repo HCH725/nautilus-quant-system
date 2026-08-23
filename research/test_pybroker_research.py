@@ -6,6 +6,7 @@ from hashlib import sha256
 from io import StringIO
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -264,13 +265,18 @@ class ParameterizedResearchTests(unittest.TestCase):
         hypothesis = write_hypothesis(self.root, hypothesis_document_v2())
         output = self.root / "v2" / "candidate.json"
 
-        result = run(
-            self.catalog,
-            output,
-            hypothesis=hypothesis,
-            evaluation_context_id="e" * 64,
-            environment_id="d" * 64,
-        )
+        with patch.object(
+            pybroker_research,
+            "research_runtime_identity",
+            return_value="d" * 64,
+        ):
+            result = run(
+                self.catalog,
+                output,
+                hypothesis=hypothesis,
+                evaluation_context_id="e" * 64,
+                environment_id="d" * 64,
+            )
 
         candidate = json.loads(output.read_bytes())
         bars = tuple(
@@ -298,7 +304,96 @@ class ParameterizedResearchTests(unittest.TestCase):
         self.assertEqual(candidate["source"]["data_as_of_ns"], candidate["source"]["last_ts_event_ns"])
         self.assertEqual(candidate["strategy"]["kernel_version"], KERNEL_VERSION)
         self.assertEqual(candidate["strategy"]["kernel_hash"], KERNEL_HASH)
-        self.assertEqual(result["provisional_metrics"]["signals"], len(expected))
+        self.assertEqual(result["provisional_metrics"]["signal_count"], len(expected))
+
+    def test_v2_emits_finite_screen_metrics_with_deterministic_turnover(self):
+        hypothesis = write_hypothesis(self.root, hypothesis_document_v2())
+        output = self.root / "v2-metrics" / "candidate.json"
+
+        with patch.object(
+            pybroker_research,
+            "research_runtime_identity",
+            return_value="d" * 64,
+        ):
+            result = run(
+                self.catalog,
+                output,
+                hypothesis=hypothesis,
+                evaluation_context_id="e" * 64,
+                environment_id="d" * 64,
+            )
+
+        metrics = result["provisional_metrics"]
+        self.assertEqual(result["schema_version"], "research-result-v2")
+        self.assertEqual(result["truth_status"], "provisional")
+        self.assertEqual(
+            set(metrics),
+            {"trade_count", "signal_count", "total_return", "max_drawdown", "turnover"},
+        )
+        self.assertTrue(all(isinstance(value, (int, float)) for value in metrics.values()))
+        self.assertTrue(all(value == value and abs(value) != float("inf") for value in metrics.values()))
+
+    def test_v2_rejects_a_cli_environment_id_that_is_not_self_attested(self):
+        hypothesis = write_hypothesis(self.root, hypothesis_document_v2())
+        output = self.root / "v2-runtime-mismatch" / "candidate.json"
+
+        with (
+            patch.object(
+                pybroker_research,
+                "research_runtime_identity",
+                return_value="f" * 64,
+                create=True,
+            ),
+            self.assertRaisesRegex(ValueError, "environment attestation mismatch"),
+        ):
+            run(
+                self.catalog,
+                output,
+                hypothesis=hypothesis,
+                evaluation_context_id="e" * 64,
+                environment_id="d" * 64,
+            )
+
+    def test_provisional_metric_formulas_are_exact_and_reject_invalid_equity(self):
+        class _Series:
+            def __init__(self, values):
+                self.values = values
+
+            def tolist(self):
+                return self.values
+
+        class _Orders:
+            @staticmethod
+            def itertuples():
+                return (
+                    SimpleNamespace(shares=2, fill_price=10),
+                    SimpleNamespace(shares=-1, fill_price=15),
+                )
+
+        result = SimpleNamespace(
+            portfolio={"equity": _Series([100, 120, 90, 110])},
+            orders=_Orders(),
+            trades=(object(), object()),
+        )
+
+        self.assertEqual(
+            pybroker_research._provisional_metrics(result, 3),
+            {
+                "max_drawdown": 0.25,
+                "signal_count": 3,
+                "total_return": 0.1,
+                "trade_count": 2,
+                "turnover": 0.35,
+            },
+        )
+        for equity in ([], [0, 1], [100, float("nan")], [100, float("inf")]):
+            with self.subTest(equity=equity), self.assertRaises(RuntimeError):
+                invalid = SimpleNamespace(
+                    portfolio={"equity": _Series(equity)},
+                    orders=_Orders(),
+                    trades=(),
+                )
+                pybroker_research._provisional_metrics(invalid, 0)
 
     def test_shared_kernel_import_keeps_nautilus_runtime_out_of_research_frontend(self):
         self.assertNotIn("nautilus_trader", pybroker_research.sys.modules)
@@ -386,7 +481,11 @@ class ParameterizedResearchTests(unittest.TestCase):
         ]
         stdout = StringIO()
 
-        with patch("sys.argv", argv), patch.object(pybroker_research, "run", return_value=expected) as mocked_run:
+        with (
+            patch("sys.argv", argv),
+            patch.object(pybroker_research, "_require_isolated_runtime"),
+            patch.object(pybroker_research, "run", return_value=expected) as mocked_run,
+        ):
             with redirect_stdout(stdout):
                 self.assertEqual(pybroker_research.main(), 0)
 
