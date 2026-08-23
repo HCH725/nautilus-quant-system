@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,10 +47,16 @@ def _hypothesis() -> dict[str, object]:
 def _candidate_process(
     metrics: dict[str, float | int],
     *,
+    candidate_family_id: str = "lookback-momentum-long-flat",
+    candidate_family_version: str = "lookback-momentum-long-flat-v1",
+    candidate_parameters: dict[str, object] | None = None,
     candidate_signal_count: int | None = None,
     candidate_environment_id: str | None = None,
+    source_data_snapshot_id: str = "a" * 64,
     source_last_timestamp: int | None = None,
 ) -> Callable[..., strategy_lab._ProcessResult]:
+    parameters = candidate_parameters or {"entry_threshold": 0.0, "lookback_bars": 2}
+
     def research_process(argv: list[str], **_kwargs: object) -> strategy_lab._ProcessResult:
         context = argv[argv.index("--evaluation-context-id") + 1]
         environment = (
@@ -70,18 +77,18 @@ def _candidate_process(
             timestamp = index + 1
             signals.append(
                 {
-                    "family_id": "lookback-momentum-long-flat",
-                    "family_version": "lookback-momentum-long-flat-v1",
+                    "family_id": candidate_family_id,
+                    "family_version": candidate_family_version,
                     "kernel_hash": KERNEL_HASH,
                     "kernel_version": KERNEL_VERSION,
                     "reason": reason,
                     "score": score,
                     "signal_id": derive_signal_id(
-                        family_id="lookback-momentum-long-flat",
-                        family_version="lookback-momentum-long-flat-v1",
+                        family_id=candidate_family_id,
+                        family_version=candidate_family_version,
                         kernel_hash=KERNEL_HASH,
                         kernel_version=KERNEL_VERSION,
-                        parameters={"entry_threshold": 0.0, "lookback_bars": 2},
+                        parameters=parameters,
                         reason=reason,
                         score=score,
                         target_intent=target_intent,
@@ -110,19 +117,19 @@ def _candidate_process(
             "signals": signals,
             "source": {
                 "data_as_of_ns": last_timestamp,
-                "data_snapshot_id": "a" * 64,
+                "data_snapshot_id": source_data_snapshot_id,
                 "first_ts_event_ns": 1,
                 "last_ts_event_ns": last_timestamp,
                 "row_count": last_timestamp,
-                "sha256": "a" * 64,
+                "sha256": source_data_snapshot_id,
             },
             "strategy": {
                 "decision_timing": "bar-close; effective no earlier than next event",
-                "family_id": "lookback-momentum-long-flat",
-                "family_version": "lookback-momentum-long-flat-v1",
+                "family_id": candidate_family_id,
+                "family_version": candidate_family_version,
                 "kernel_hash": KERNEL_HASH,
                 "kernel_version": KERNEL_VERSION,
-                "parameters": {"entry_threshold": 0.0, "lookback_bars": 2},
+                "parameters": parameters,
             },
             "truth_status": "provisional",
         }
@@ -259,6 +266,235 @@ def _backtest_for_request(request: object) -> CandidateBacktestResult:
         verdict=verdict,
         canonical_bytes=verdict_bytes,
         verdict_id=sha256(verdict_bytes).hexdigest(),
+    )
+
+
+def _persisted_terminal_fixture(
+    root: Path,
+    ledger: strategy_lab.StrategyLedger,
+    *,
+    family_id: str = "lookback-momentum-long-flat",
+    family_version: str = "lookback-momentum-long-flat-v1",
+    search_space: dict[str, tuple[campaign.JsonValue, ...]] | None = None,
+    survived: bool = False,
+    experiment_data_source_id: str = "a" * 64,
+    experiment_policy_id: str | None = None,
+    experiment_base_engine_id: str = "engine-v2",
+    experiment_runtime_id: str = "d" * 64,
+    campaign_data_source_id: str = "a" * 64,
+    campaign_data_as_of_ns: int = 1,
+) -> tuple[
+    campaign.CampaignAttempt,
+    campaign.TrialEvidence,
+    strategy_lab.VerdictRecord | None,
+    str,
+]:
+    policy_document = {
+        "max_provisional_drawdown": 0.5,
+        "max_turnover": 10.0,
+        "minimum_signal_count": 1,
+        "minimum_trade_count": 1,
+        "policy_version": "test-screen-v1",
+        "reject_no_signal": True,
+        "schema_version": "strategy-research-policy-v1",
+    }
+    policy = campaign.ScreenPolicy(
+        sha256(_canonical(policy_document)).hexdigest(),
+        "test-screen-v1",
+        1,
+        1,
+        0.5,
+        10.0,
+        True,
+    )
+    spec = campaign.CampaignSpec(
+        family_id=family_id,
+        family_version=family_version,
+        search_space=search_space
+        or {"entry_threshold": (0.0,), "lookback_bars": (2,)},
+        approved_instruments=("BTCUSDT-PERP.BINANCE",),
+        approved_bar_types=("BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",),
+        parameter_search_policy_id="f" * 64,
+        seed=42,
+        data_as_of_ns=campaign_data_as_of_ns,
+        generation_budget=1,
+        maximum_candidates=1,
+        screen_policy_id=policy.policy_id,
+    )
+    attempt = campaign.expand_campaign(spec)[0]
+    hypothesis_path = root / "hypothesis.json"
+    hypothesis_path.write_bytes(
+        _canonical(strategy_lab._campaign_hypothesis_document(spec, attempt)),
+    )
+    hypothesis = strategy_lab.load_strategy_hypothesis(hypothesis_path)
+    ledger.record_hypothesis(hypothesis)
+
+    correct_policy_id = sha256(
+        _canonical(
+            {
+                "accounting_policy_id": "b" * 64,
+                "screen_policy_id": policy.policy_id,
+            },
+        ),
+    ).hexdigest()
+    code_commit = "e" * 40
+    candidate_context = strategy_lab._evaluation_context_id(
+        hypothesis,
+        data_source_id="a" * 64,
+        policy_id=correct_policy_id,
+        engine_id="engine-v2",
+        runtime_id="d" * 64,
+        code_commit=code_commit,
+        screen_policy_id=policy.policy_id,
+    )
+    identity = strategy_lab.ExperimentIdentity(
+        hypothesis.strategy_id,
+        experiment_data_source_id,
+        experiment_policy_id or correct_policy_id,
+        f"{experiment_base_engine_id}-evaluation-{candidate_context}",
+        experiment_runtime_id,
+    )
+    experiment_id = ledger.record_experiment(hypothesis.hypothesis_id, identity)
+
+    metrics: dict[str, float | int] = (
+        {
+            "trade_count": 1,
+            "signal_count": 1,
+            "total_return": 0.1,
+            "max_drawdown": 0.1,
+            "turnover": 1.0,
+        }
+        if survived
+        else {
+            "trade_count": 0,
+            "signal_count": 0,
+            "total_return": 0.0,
+            "max_drawdown": 0.0,
+            "turnover": 0.0,
+        }
+    )
+    candidate_path = root / "candidate.json"
+    completed = _candidate_process(metrics, source_last_timestamp=1)(
+        [
+            "python",
+            "research.py",
+            "--evaluation-context-id",
+            candidate_context,
+            "--environment-id",
+            "d" * 64,
+            "--output",
+            str(candidate_path),
+        ],
+    )
+    raw_path = root / "research-result-v2-raw.json"
+    raw_path.write_bytes(completed.stdout)
+    ledger.record_stage(
+        strategy_lab.StageRecord(
+            experiment_id,
+            "PyBroker completed",
+            "PASSED",
+            "PYBROKER_COMPLETED",
+            str(raw_path),
+            sha256(raw_path.read_bytes()).hexdigest(),
+        ),
+    )
+    result = campaign.load_research_result_v2(completed.stdout)
+    decision = campaign.screen_research_result(result, policy)
+    screen_path = root / "research-screen-result-v1.json"
+    screen_path.write_bytes(
+        _canonical(campaign.screened_result_document(result, decision, policy)),
+    )
+    ledger.record_stage(
+        strategy_lab.StageRecord(
+            experiment_id,
+            "Research screened",
+            "PASSED" if survived else "REJECTED",
+            "SCREEN_PASSED" if survived else decision.reason_codes[0],
+            str(screen_path),
+            sha256(screen_path.read_bytes()).hexdigest(),
+        ),
+    )
+    ledger.record_campaign(
+        spec,
+        campaign.CampaignPreflight(
+            policy.policy_id,
+            campaign_data_as_of_ns,
+            campaign_data_source_id,
+        ),
+    )
+
+    if not survived:
+        return (
+            attempt,
+            campaign.TrialEvidence(
+                campaign.TerminalStatus.SCREEN_REJECTED,
+                True,
+                decision.reason_codes,
+                experiment_id,
+                result.candidate_id,
+            ),
+            None,
+            code_commit,
+        )
+
+    parity = _parity_for_candidate(candidate_path, root / "catalog")
+    parity_path = root / "signal-parity-result.json"
+    parity_path.write_bytes(parity.canonical_bytes)
+    ledger.record_signal_parity(
+        strategy_lab.SignalParityRecord(
+            experiment_id,
+            parity.candidate_id,
+            candidate_context,
+            "a" * 64,
+            "PASS",
+            "SIGNAL_PARITY_MATCH",
+            None,
+            str(parity_path),
+            parity.artifact_sha256,
+            parity.decisions,
+        ),
+    )
+    backtest = _backtest_for_request(
+        SimpleNamespace(
+            candidate_path=candidate_path,
+            code_commit=code_commit,
+            experiment_id=experiment_id,
+            hypothesis_id=hypothesis.hypothesis_id,
+            signal_parity=parity,
+            strategy_id=hypothesis.strategy_id,
+        ),
+    )
+    verdict_path = root / "nautilus-verdict.json"
+    verdict_path.write_bytes(backtest.canonical_bytes)
+    ledger.record_stage(
+        strategy_lab.StageRecord(
+            experiment_id,
+            "Nautilus replayed",
+            "PASSED",
+            "NAUTILUS_REPLAY_COMPLETED",
+            str(verdict_path),
+            backtest.verdict_id,
+        ),
+    )
+    reason_codes = backtest.verdict["reason_codes"]
+    assert isinstance(reason_codes, list) and isinstance(reason_codes[0], str)
+    return (
+        attempt,
+        campaign.TrialEvidence(
+            campaign.TerminalStatus.SURVIVED,
+            True,
+            ("SCREEN_PASSED",),
+            experiment_id,
+            result.candidate_id,
+        ),
+        strategy_lab.VerdictRecord(
+            experiment_id,
+            "REJECTION",
+            reason_codes[0],
+            str(verdict_path),
+            backtest.verdict_id,
+        ),
+        code_commit,
     )
 
 
@@ -534,6 +770,103 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                         candidate_id,
                     ),
                 )
+
+    def test_record_verdict_rejects_candidate_from_another_persisted_hypothesis(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+            ledger.initialize()
+            _attempt, _evidence, record, _code_commit = _persisted_terminal_fixture(
+                root,
+                ledger,
+                family_id="close-vs-sma-mean-reversion-long-flat",
+                family_version="close-vs-sma-mean-reversion-long-flat-v1",
+                search_space={"discount_threshold": (0.0,), "window_bars": (2,)},
+                survived=True,
+            )
+            assert record is not None
+
+            with self.assertRaisesRegex(ValueError, "immutable identity"):
+                ledger.record_verdict(record)
+
+    def test_campaign_trial_rejects_cross_family_terminal_candidate(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+            ledger.initialize()
+            attempt, evidence, _record, code_commit = _persisted_terminal_fixture(
+                root,
+                ledger,
+                family_id="close-vs-sma-mean-reversion-long-flat",
+                family_version="close-vs-sma-mean-reversion-long-flat-v1",
+                search_space={"discount_threshold": (0.0,), "window_bars": (2,)},
+            )
+
+            with (
+                patch.object(strategy_lab, "_code_commit", return_value=code_commit),
+                self.assertRaisesRegex(ValueError, "immutable identity"),
+            ):
+                ledger.record_campaign_trial(attempt, evidence)
+
+    def test_campaign_trial_rejects_cross_data_or_as_of_terminal_candidate(self) -> None:
+        def assert_rejected(
+            *,
+            experiment_data_source_id: str = "a" * 64,
+            campaign_data_as_of_ns: int = 1,
+        ) -> None:
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+                ledger.initialize()
+                attempt, evidence, _record, code_commit = _persisted_terminal_fixture(
+                    root,
+                    ledger,
+                    experiment_data_source_id=experiment_data_source_id,
+                    campaign_data_as_of_ns=campaign_data_as_of_ns,
+                )
+
+                with (
+                    patch.object(strategy_lab, "_code_commit", return_value=code_commit),
+                    self.assertRaisesRegex(ValueError, "immutable identity"),
+                ):
+                    ledger.record_campaign_trial(attempt, evidence)
+
+        with self.subTest(identity="data_source"):
+            assert_rejected(experiment_data_source_id="2" * 64)
+        with self.subTest(identity="data_as_of"):
+            assert_rejected(campaign_data_as_of_ns=2)
+
+    def test_campaign_trial_rejects_cross_policy_engine_or_runtime_terminal_candidate(self) -> None:
+        def assert_rejected(
+            *,
+            experiment_policy_id: str | None = None,
+            experiment_base_engine_id: str = "engine-v2",
+            experiment_runtime_id: str = "d" * 64,
+        ) -> None:
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+                ledger.initialize()
+                attempt, evidence, _record, code_commit = _persisted_terminal_fixture(
+                    root,
+                    ledger,
+                    experiment_policy_id=experiment_policy_id,
+                    experiment_base_engine_id=experiment_base_engine_id,
+                    experiment_runtime_id=experiment_runtime_id,
+                )
+
+                with (
+                    patch.object(strategy_lab, "_code_commit", return_value=code_commit),
+                    self.assertRaisesRegex(ValueError, "immutable identity"),
+                ):
+                    ledger.record_campaign_trial(attempt, evidence)
+
+        with self.subTest(identity="policy"):
+            assert_rejected(experiment_policy_id="3" * 64)
+        with self.subTest(identity="engine"):
+            assert_rejected(experiment_base_engine_id="other-engine")
+        with self.subTest(identity="runtime"):
+            assert_rejected(experiment_runtime_id="4" * 64)
 
     def _cached_screen_fixture(
         self,

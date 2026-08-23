@@ -1057,6 +1057,7 @@ class StrategyLedger:
         evidence: TrialEvidence,
         *,
         allow_foreign_key_rejection: bool = False,
+        validate_current_context: bool = False,
     ) -> None:
         """Require a complete V2 terminal chain at the immutable trial boundary."""
         experiment_id = evidence.experiment_id
@@ -1064,10 +1065,21 @@ class StrategyLedger:
             raise StrategyLabError("campaign trial lacks a terminal chain")
         with closing(sqlite3.connect(self.path)) as connection:
             experiment = connection.execute(
-                """SELECT hypothesis_id, strategy_id FROM experiments
-                WHERE experiment_id = ?""",
+                """SELECT hypothesis_id, strategy_id, data_source_id, policy_id,
+                engine_id, runtime_id FROM experiments WHERE experiment_id = ?""",
                 (experiment_id,),
             ).fetchone()
+            hypothesis_row = (
+                connection.execute(
+                    """SELECT hypotheses.artifact_path, hypotheses.artifact_sha256,
+                    strategies.identity_schema FROM hypotheses
+                    JOIN strategies USING (strategy_id)
+                    WHERE hypothesis_id = ? AND strategy_id = ?""",
+                    (experiment[0], experiment[1]),
+                ).fetchone()
+                if experiment is not None
+                else None
+            )
             verdict_rows = connection.execute(
                 """SELECT verdict_id, outcome, reason_code, artifact_path, artifact_sha256
                 FROM verdicts WHERE experiment_id = ?""",
@@ -1103,25 +1115,16 @@ class StrategyLedger:
                 (experiment_id,),
             ).fetchone()[0]
             campaign = connection.execute(
-                "SELECT document_json, screen_policy_id FROM campaigns WHERE campaign_id = ?",
+                """SELECT document_json, screen_policy_id, data_as_of_ns, data_source_id
+                FROM campaigns WHERE campaign_id = ?""",
                 (campaign_id,),
             ).fetchone()
-        if (
-            experiment is None
-            or experiment[1] != strategy_id
-        ):
+        if experiment is None or experiment[1] != strategy_id:
             # Let SQLite's campaign FK reject nonexistent or cross-strategy links.
             if allow_foreign_key_rejection:
                 return
             raise StrategyLabError("campaign trial has an invalid terminal chain")
-        try:
-            campaign_document = json.loads(str(campaign[0])) if campaign is not None else None
-        except json.JSONDecodeError as error:
-            raise StrategyLabError("campaign trial has an invalid terminal chain") from error
-        if (
-            not isinstance(campaign_document, dict)
-            or campaign_document.get("screen_policy_id") != campaign[1]
-        ):
+        if hypothesis_row is None or hypothesis_row[2] != "strategy-id-v2":
             raise StrategyLabError("campaign trial has an invalid terminal chain")
         if evidence.terminal_status is TerminalStatus.SCREEN_REJECTED:
             if (
@@ -1136,17 +1139,105 @@ class StrategyLedger:
                 or screen[0] != "REJECTED"
             ):
                 raise StrategyLabError("campaign trial has an invalid terminal chain")
-            try:
-                raw_path = Path(str(pybroker[2]))
-                raw_payload = _verified_artifact(raw_path, str(pybroker[3]))
-                result = load_research_result_v2(raw_payload)
-                candidate_path = raw_path.with_name("candidate.json")
-                _verified_artifact(candidate_path, result.candidate_id)
-                candidate, candidate_id = load_pybroker_candidate(candidate_path)
-                screen_payload = _verified_artifact(Path(str(screen[2])), str(screen[3]))
-                document = load_screen_result_v1(screen_payload)
-            except (OSError, CandidateBacktestError, StrategyCampaignError, TypeError, ValueError) as error:
-                raise StrategyLabError("campaign trial has an invalid terminal chain") from error
+        elif (
+            len(verdict_rows) != 1
+            or error_count != 0
+            or nautilus_count != 1
+            or parity_count != 1
+            or pybroker is None
+            or screen is None
+        ):
+            raise StrategyLabError("campaign trial has an invalid terminal chain")
+        try:
+            campaign_document = (
+                json.loads(
+                    str(campaign[0]),
+                    object_pairs_hook=_unique_object,
+                    parse_constant=_reject_constant,
+                )
+                if campaign is not None
+                else None
+            )
+            if (
+                not isinstance(campaign_document, dict)
+                or _canonical_json(campaign_document).decode() != campaign[0]
+            ):
+                raise StrategyLabError("campaign document is not canonical")
+            _verified_artifact(Path(str(hypothesis_row[0])), str(hypothesis_row[1]))
+            stored_hypothesis = load_strategy_hypothesis(Path(str(hypothesis_row[0])))
+            raw_path = Path(str(pybroker[2]))
+            raw_payload = _verified_artifact(raw_path, str(pybroker[3]))
+            result = load_research_result_v2(raw_payload)
+            candidate_path = raw_path.with_name("candidate.json")
+            _verified_artifact(candidate_path, result.candidate_id)
+            candidate, candidate_id = load_pybroker_candidate(candidate_path)
+            screen_payload = _verified_artifact(Path(str(screen[2])), str(screen[3]))
+            screen_document = load_screen_result_v1(screen_payload)
+        except StrategyLabError:
+            raise
+        except (
+            IndexError,
+            OSError,
+            CandidateBacktestError,
+            StrategyCampaignError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise StrategyLabError("campaign trial has an invalid terminal chain") from error
+        identity = ExperimentIdentity(
+            str(experiment[1]),
+            str(experiment[2]),
+            str(experiment[3]),
+            str(experiment[4]),
+            str(experiment[5]),
+        )
+        candidate_source = candidate.get("source")
+        evaluation_context_id = candidate.get("evaluation_context_id")
+        screen_policy_id = screen_document.get("screen_policy_id")
+        if (
+            stored_hypothesis.hypothesis_id != experiment[0]
+            or stored_hypothesis.strategy_id != experiment[1]
+            or not isinstance(candidate_source, dict)
+            or not isinstance(evaluation_context_id, str)
+            or not isinstance(screen_policy_id, str)
+            or campaign_document.get("family_id") != stored_hypothesis.family_id
+            or campaign_document.get("family_version") != stored_hypothesis.family_version
+            or campaign_document.get("approved_instruments") != [_INSTRUMENT_ID]
+            or campaign_document.get("approved_bar_types") != [_BAR_TYPE]
+            or campaign_document.get("screen_policy_id") != campaign[1]
+            or campaign_document.get("data_as_of_ns") != campaign[2]
+            or campaign[3] != identity.data_source_id
+            or candidate_source.get("data_as_of_ns") != campaign[2]
+            or screen_document.get("candidate_id") != candidate_id
+            or screen_policy_id != campaign[1]
+            or candidate_id != result.candidate_id
+            or candidate_id != evidence.candidate_id
+        ):
+            raise StrategyLabError("campaign terminal candidate immutable identity mismatch")
+        _candidate_matches_persisted_identity(
+            candidate,
+            stored_hypothesis,
+            identity,
+            experiment_id=experiment_id,
+            evaluation_context_id=evaluation_context_id,
+            data_as_of_ns=int(campaign[2]),
+            screen_policy_id=screen_policy_id,
+            code_commit=_code_commit() if validate_current_context else None,
+        )
+        if evidence.terminal_status is TerminalStatus.SCREEN_REJECTED:
+            if (
+                verdict_rows
+                or error_count != 0
+                or nautilus_count != 0
+                or parity_count != 0
+                or stage_count != 2
+                or pybroker is None
+                or pybroker[0:2] != ("PASSED", "PYBROKER_COMPLETED")
+                or screen is None
+                or screen[0] != "REJECTED"
+                or screen_document.get("screen_outcome") != "SCREEN_REJECTED"
+            ):
+                raise StrategyLabError("campaign trial has an invalid terminal chain")
             reasons = tuple(reason for reason in evidence.reason_codes if reason != "REUSED_EXECUTION")
             expected_metrics = {
                 "max_drawdown": result.metrics.max_drawdown,
@@ -1157,14 +1248,10 @@ class StrategyLedger:
             }
             candidate_signals = candidate.get("signals")
             if (
-                candidate_id != result.candidate_id
-                or candidate_id != evidence.candidate_id
-                or not isinstance(candidate_signals, list)
+                not isinstance(candidate_signals, list)
                 or len(candidate_signals) != result.metrics.signal_count
-                or document.get("candidate_id") != candidate_id
-                or document.get("provisional_metrics") != expected_metrics
-                or document.get("screen_policy_id") != campaign[1]
-                or document.get("screen_reason_codes") != list(reasons)
+                or screen_document.get("provisional_metrics") != expected_metrics
+                or screen_document.get("screen_reason_codes") != list(reasons)
                 or screen[1] != reasons[0]
             ):
                 raise StrategyLabError("campaign trial has an invalid terminal chain")
@@ -1214,6 +1301,7 @@ class StrategyLedger:
                     attempt.strategy_id,
                     evidence,
                     allow_foreign_key_rejection=True,
+                    validate_current_context=True,
                 )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
@@ -1714,6 +1802,12 @@ class StrategyLedger:
         parity = parity_rows[0]
         if parity[3:6] != ("PASS", "SIGNAL_PARITY_MATCH", None):
             raise StrategyLabError("Nautilus verdict has no PASS parity evidence")
+        try:
+            document = load_candidate_backtest_verdict(artifact_path.read_bytes())
+            screen_payload = _verified_artifact(Path(str(screen[2])), str(screen[3]))
+            screen_document = load_screen_result_v1(screen_payload)
+        except (OSError, CandidateBacktestError, StrategyCampaignError) as error:
+            raise StrategyLabError("Nautilus verdict terminal artifact is invalid") from error
 
         _verified_artifact(Path(str(experiment[6])), str(experiment[7]))
         stored_hypothesis = load_strategy_hypothesis(Path(str(experiment[6])))
@@ -1756,16 +1850,32 @@ class StrategyLedger:
         if (
             candidate.get("evaluation_context_id") != parity[1]
             or candidate_source.get("data_snapshot_id") != parity[2]
+            or screen_document.get("candidate_id") != candidate_id
+            or screen_document.get("screen_outcome") != "PASSED"
         ):
             raise StrategyLabError("Nautilus verdict candidate context is inconsistent")
-        if prepared is not None:
-            _candidate_matches_hypothesis(
-                candidate,
-                stored_hypothesis,
-                prepared.evaluation_context_id,
-                prepared.data_as_of_ns,
-                prepared.runtime_id,
-            )
+        evaluation_context_id = candidate.get("evaluation_context_id")
+        data_as_of_ns = candidate_source.get("data_as_of_ns")
+        screen_policy_id = screen_document.get("screen_policy_id")
+        code_commit = document.get("code_commit")
+        if (
+            not isinstance(evaluation_context_id, str)
+            or isinstance(data_as_of_ns, bool)
+            or not isinstance(data_as_of_ns, int)
+            or not isinstance(screen_policy_id, str)
+            or not isinstance(code_commit, str)
+        ):
+            raise StrategyLabError("Nautilus verdict candidate identity is incomplete")
+        _candidate_matches_persisted_identity(
+            candidate,
+            stored_hypothesis,
+            identity,
+            experiment_id=record.experiment_id,
+            evaluation_context_id=evaluation_context_id,
+            data_as_of_ns=data_as_of_ns,
+            screen_policy_id=screen_policy_id,
+            code_commit=code_commit,
+        )
         try:
             candidate_signals = candidate.get("signals")
             if not isinstance(candidate_signals, list):
@@ -1787,10 +1897,6 @@ class StrategyLedger:
         ):
             raise StrategyLabError("Nautilus verdict signal parity evidence is inconsistent")
 
-        try:
-            document = load_candidate_backtest_verdict(artifact_path.read_bytes())
-        except (OSError, CandidateBacktestError) as error:
-            raise StrategyLabError("Nautilus verdict artifact is invalid") from error
         reason_codes = document["reason_codes"]
         source = document["source"]
         versions = document["runtime_versions"]
@@ -2133,6 +2239,7 @@ def _evaluation_context_id(
                 "family_version": hypothesis.family_version,
                 "kernel_hash": KERNEL_HASH,
                 "kernel_version": KERNEL_VERSION,
+                "policy_id": _content_id(policy_id, "policy_id"),
                 "runtime_id": _content_id(runtime_id, "runtime_id"),
                 "schema_version": "evaluation-context-v1",
                 "screen_policy_id": _content_id(
@@ -2637,6 +2744,55 @@ def _candidate_matches_hypothesis(
         )
     if mismatch:
         raise StrategyLabError("candidate does not match immutable hypothesis")
+
+
+def _candidate_matches_persisted_identity(
+    candidate: dict[str, JsonValue],
+    hypothesis: StrategyHypothesis,
+    identity: ExperimentIdentity,
+    *,
+    experiment_id: str,
+    evaluation_context_id: str,
+    data_as_of_ns: int,
+    screen_policy_id: str,
+    code_commit: str | None,
+) -> None:
+    """Bind one provisional candidate to persisted execution identity."""
+    source = candidate.get("source")
+    runtime = candidate.get("runtime")
+    base_engine_id, separator, embedded_context_id = identity.engine_id.rpartition(
+        "-evaluation-",
+    )
+    try:
+        _candidate_matches_hypothesis(
+            candidate,
+            hypothesis,
+            evaluation_context_id,
+            data_as_of_ns,
+            identity.runtime_id,
+        )
+        if (
+            _experiment_id(identity) != experiment_id
+            or not isinstance(source, dict)
+            or not isinstance(runtime, dict)
+            or runtime.get("environment_id") != identity.runtime_id
+            or separator != "-evaluation-"
+            or not base_engine_id
+            or embedded_context_id != evaluation_context_id
+        ):
+            raise StrategyLabError("persisted execution identity mismatch")
+        if code_commit is not None and evaluation_context_id != _evaluation_context_id(
+            hypothesis,
+            data_source_id=identity.data_source_id,
+            policy_id=identity.policy_id,
+            engine_id=base_engine_id,
+            runtime_id=identity.runtime_id,
+            code_commit=code_commit,
+            screen_policy_id=screen_policy_id,
+        ):
+            raise StrategyLabError("persisted evaluation context mismatch")
+    except StrategyLabError as error:
+        raise StrategyLabError("terminal candidate immutable identity mismatch") from error
 
 
 def _catalog_last_timestamp(catalog_path: Path, bar_type: str) -> int:
