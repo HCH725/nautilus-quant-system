@@ -269,6 +269,27 @@ def _backtest_for_request(request: object) -> CandidateBacktestResult:
     )
 
 
+def _test_screen_policy() -> campaign.ScreenPolicy:
+    document = {
+        "max_provisional_drawdown": 0.5,
+        "max_turnover": 10.0,
+        "minimum_signal_count": 1,
+        "minimum_trade_count": 1,
+        "policy_version": "test-screen-v1",
+        "reject_no_signal": True,
+        "schema_version": "strategy-research-policy-v1",
+    }
+    return campaign.ScreenPolicy(
+        sha256(_canonical(document)).hexdigest(),
+        "test-screen-v1",
+        1,
+        1,
+        0.5,
+        10.0,
+        True,
+    )
+
+
 def _persisted_terminal_fixture(
     root: Path,
     ledger: strategy_lab.StrategyLedger,
@@ -281,6 +302,9 @@ def _persisted_terminal_fixture(
     experiment_policy_id: str | None = None,
     experiment_base_engine_id: str = "engine-v2",
     experiment_runtime_id: str = "d" * 64,
+    experiment_data_as_of_ns: int = 1,
+    candidate_data_snapshot_id: str = "a" * 64,
+    candidate_data_as_of_ns: int = 1,
     campaign_data_source_id: str = "a" * 64,
     campaign_data_as_of_ns: int = 1,
 ) -> tuple[
@@ -289,24 +313,7 @@ def _persisted_terminal_fixture(
     strategy_lab.VerdictRecord | None,
     str,
 ]:
-    policy_document = {
-        "max_provisional_drawdown": 0.5,
-        "max_turnover": 10.0,
-        "minimum_signal_count": 1,
-        "minimum_trade_count": 1,
-        "policy_version": "test-screen-v1",
-        "reject_no_signal": True,
-        "schema_version": "strategy-research-policy-v1",
-    }
-    policy = campaign.ScreenPolicy(
-        sha256(_canonical(policy_document)).hexdigest(),
-        "test-screen-v1",
-        1,
-        1,
-        0.5,
-        10.0,
-        True,
-    )
+    policy = _test_screen_policy()
     spec = campaign.CampaignSpec(
         family_id=family_id,
         family_version=family_version,
@@ -341,6 +348,8 @@ def _persisted_terminal_fixture(
     candidate_context = strategy_lab._evaluation_context_id(
         hypothesis,
         data_source_id="a" * 64,
+        data_snapshot_id="a" * 64,
+        data_as_of_ns=experiment_data_as_of_ns,
         policy_id=correct_policy_id,
         engine_id="engine-v2",
         runtime_id="d" * 64,
@@ -353,6 +362,8 @@ def _persisted_terminal_fixture(
         experiment_policy_id or correct_policy_id,
         f"{experiment_base_engine_id}-evaluation-{candidate_context}",
         experiment_runtime_id,
+        experiment_data_as_of_ns,
+        "a" * 64,
     )
     experiment_id = ledger.record_experiment(hypothesis.hypothesis_id, identity)
 
@@ -374,7 +385,11 @@ def _persisted_terminal_fixture(
         }
     )
     candidate_path = root / "candidate.json"
-    completed = _candidate_process(metrics, source_last_timestamp=1)(
+    completed = _candidate_process(
+        metrics,
+        source_data_snapshot_id=candidate_data_snapshot_id,
+        source_last_timestamp=candidate_data_as_of_ns,
+    )(
         [
             "python",
             "research.py",
@@ -445,7 +460,7 @@ def _persisted_terminal_fixture(
             experiment_id,
             parity.candidate_id,
             candidate_context,
-            "a" * 64,
+            candidate_data_snapshot_id,
             "PASS",
             "SIGNAL_PARITY_MATCH",
             None,
@@ -607,6 +622,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             with (
                 patch.object(strategy_lab, "DEFAULT_LOOP_PATHS", paths),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -788,6 +804,87 @@ class StrategyCampaignScreenTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "immutable identity"):
                 ledger.record_verdict(record)
+
+    def test_record_verdict_rejects_candidate_from_another_source_snapshot_and_as_of(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+            ledger.initialize()
+            _attempt, _evidence, record, _code_commit = _persisted_terminal_fixture(
+                root,
+                ledger,
+                survived=True,
+                candidate_data_snapshot_id="2" * 64,
+                candidate_data_as_of_ns=2,
+            )
+            assert record is not None
+            with closing(sqlite3.connect(ledger.path)) as connection:
+                persisted_source = connection.execute(
+                    """SELECT data_snapshot_id, data_as_of_ns
+                    FROM experiment_sources WHERE experiment_id = ?""",
+                    (record.experiment_id,),
+                ).fetchone()
+            self.assertEqual(persisted_source, ("a" * 64, 1))
+
+            with self.assertRaisesRegex(ValueError, "immutable identity"):
+                ledger.record_verdict(record)
+            with closing(sqlite3.connect(ledger.path)) as connection:
+                verdict_count = connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0]
+            self.assertEqual(verdict_count, 0)
+
+    def test_existing_execution_rejects_screened_candidate_from_another_snapshot(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+            ledger.initialize()
+            _attempt, _evidence, _record, code_commit = _persisted_terminal_fixture(
+                root,
+                ledger,
+                candidate_data_snapshot_id="2" * 64,
+            )
+            hypothesis = strategy_lab.load_strategy_hypothesis(root / "hypothesis.json")
+            candidate, _candidate_id = strategy_lab.load_pybroker_candidate(
+                root / "candidate.json",
+            )
+            evaluation_context_id = candidate["evaluation_context_id"]
+            assert isinstance(evaluation_context_id, str)
+            screen_policy = _test_screen_policy()
+            policy_id = sha256(
+                _canonical(
+                    {
+                        "accounting_policy_id": "b" * 64,
+                        "screen_policy_id": screen_policy.policy_id,
+                    },
+                ),
+            ).hexdigest()
+            identity = strategy_lab.ExperimentIdentity(
+                hypothesis.strategy_id,
+                "a" * 64,
+                policy_id,
+                f"engine-v2-evaluation-{evaluation_context_id}",
+                "d" * 64,
+                1,
+                "a" * 64,
+            )
+            prepared = strategy_lab._PreparedExecution(
+                identity,
+                evaluation_context_id,
+                screen_policy,
+                1,
+                "d" * 64,
+                code_commit,
+                "engine-v2",
+            )
+
+            with self.assertRaisesRegex(ValueError, "immutable hypothesis"):
+                ledger.existing_execution(
+                    identity,
+                    screen_policy,
+                    hypothesis=hypothesis,
+                    prepared=prepared,
+                )
 
     def test_campaign_trial_rejects_cross_family_terminal_candidate(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1159,6 +1256,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 "b" * 64,
                 "engine-v2",
                 "d" * 64,
+                1,
+                "a" * 64,
             )
             experiment_id = ledger.record_experiment(hypothesis.hypothesis_id, identity)
             candidate_path = root / "candidate.json"
@@ -1373,6 +1472,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -1435,6 +1535,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -1471,6 +1572,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -1503,6 +1605,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             candidate_path.unlink()
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -1522,6 +1625,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 connection.execute("DELETE FROM signal_parity_results")
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -1831,6 +1935,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=999),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(
                     strategy_lab,
                     "_run_bounded_process",
@@ -1992,6 +2097,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_hash_tree", return_value="a" * 64),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -2033,6 +2139,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
 
             with (
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_hash_tree", return_value="a" * 64),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -2099,6 +2206,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_hash_tree", side_effect=("a" * 64, "b" * 64)),
                 patch.object(strategy_lab, "_runtime_identity", return_value="c" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -2144,6 +2252,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(
                     strategy_lab,
                     "_hash_tree",
@@ -2268,6 +2377,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -2379,6 +2489,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             with (
                 patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -2427,6 +2538,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                     "_hash_tree",
                     side_effect=("a" * 64,) * 4 + ("b" * 64,) * 8,
                 ),
+                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
                 patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
                 patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
@@ -2456,6 +2568,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             "b" * 64,
             "engine-v2",
             "c" * 64,
+            123,
+            "a" * 64,
         )
         prepared = strategy_lab._PreparedExecution(
             identity,
@@ -2507,6 +2621,14 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                         identity.runtime_id,
                     ),
                 )
+                connection.execute(
+                    "INSERT INTO experiment_sources VALUES (?, ?, ?)",
+                    (
+                        strategy_lab._experiment_id(identity),
+                        identity.data_snapshot_id,
+                        identity.data_as_of_ns,
+                    ),
+                )
             reason_code = None
             poisoned_experiment_id = None
             with (
@@ -2545,6 +2667,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 "b" * 64,
                 "engine-v2",
                 "c" * 64,
+                123,
+                "a" * 64,
             )
             prepared = strategy_lab._PreparedExecution(
                 identity,

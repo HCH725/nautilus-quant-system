@@ -25,6 +25,7 @@ import nautilus_trader
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from .candidate_backtest import (
+    _catalog_digest,
     CandidateBacktestError,
     CandidateBacktestRequest,
     SignalParityResult,
@@ -172,6 +173,12 @@ CREATE TABLE IF NOT EXISTS experiments (
     FOREIGN KEY (hypothesis_id, strategy_id)
         REFERENCES hypotheses(hypothesis_id, strategy_id)
 );
+CREATE TABLE IF NOT EXISTS experiment_sources (
+    experiment_id TEXT PRIMARY KEY,
+    data_snapshot_id TEXT NOT NULL,
+    data_as_of_ns INTEGER NOT NULL CHECK (data_as_of_ns >= 0),
+    FOREIGN KEY (experiment_id) REFERENCES experiments(experiment_id)
+);
 CREATE TABLE IF NOT EXISTS verdicts (
     verdict_id TEXT PRIMARY KEY,
     experiment_id TEXT NOT NULL UNIQUE,
@@ -274,6 +281,7 @@ _IMMUTABLE_TABLES: Final = (
     "strategies",
     "hypotheses",
     "experiments",
+    "experiment_sources",
     "verdicts",
     "errors",
     "stage_results",
@@ -332,6 +340,8 @@ class ExperimentIdentity:
     policy_id: str
     engine_id: str
     runtime_id: str
+    data_as_of_ns: int | None = None
+    data_snapshot_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,6 +700,21 @@ def _experiment_id(identity: ExperimentIdentity) -> str:
         "runtime_id": _identifier(identity.runtime_id, "runtime_id"),
         "strategy_id": _content_id(identity.strategy_id, "strategy_id"),
     }
+    if identity.data_as_of_ns is not None:
+        if (
+            isinstance(identity.data_as_of_ns, bool)
+            or not isinstance(identity.data_as_of_ns, int)
+            or not 0 <= identity.data_as_of_ns <= _SQLITE_INTEGER_MAX
+        ):
+            raise StrategyLabError(
+                "experiment data_as_of_ns must be a non-negative signed 64-bit integer",
+            )
+        values["data_as_of_ns"] = identity.data_as_of_ns
+    if identity.data_snapshot_id is not None:
+        values["data_snapshot_id"] = _content_id(
+            identity.data_snapshot_id,
+            "data_snapshot_id",
+        )
     return sha256(_canonical_json(values)).hexdigest()
 
 
@@ -1066,7 +1091,10 @@ class StrategyLedger:
         with closing(sqlite3.connect(self.path)) as connection:
             experiment = connection.execute(
                 """SELECT hypothesis_id, strategy_id, data_source_id, policy_id,
-                engine_id, runtime_id FROM experiments WHERE experiment_id = ?""",
+                engine_id, runtime_id, experiment_sources.data_snapshot_id,
+                experiment_sources.data_as_of_ns FROM experiments
+                LEFT JOIN experiment_sources USING (experiment_id)
+                WHERE experiment_id = ?""",
                 (experiment_id,),
             ).fetchone()
             hypothesis_row = (
@@ -1190,6 +1218,8 @@ class StrategyLedger:
             str(experiment[3]),
             str(experiment[4]),
             str(experiment[5]),
+            int(experiment[7]) if experiment[7] is not None else None,
+            str(experiment[6]) if experiment[6] is not None else None,
         )
         candidate_source = candidate.get("source")
         evaluation_context_id = candidate.get("evaluation_context_id")
@@ -1200,6 +1230,8 @@ class StrategyLedger:
             or not isinstance(candidate_source, dict)
             or not isinstance(evaluation_context_id, str)
             or not isinstance(screen_policy_id, str)
+            or experiment[6] is None
+            or experiment[7] is None
             or campaign_document.get("family_id") != stored_hypothesis.family_id
             or campaign_document.get("family_version") != stored_hypothesis.family_version
             or campaign_document.get("approved_instruments") != [_INSTRUMENT_ID]
@@ -1207,6 +1239,7 @@ class StrategyLedger:
             or campaign_document.get("screen_policy_id") != campaign[1]
             or campaign_document.get("data_as_of_ns") != campaign[2]
             or campaign[3] != identity.data_source_id
+            or experiment[7] != campaign[2]
             or candidate_source.get("data_as_of_ns") != campaign[2]
             or screen_document.get("candidate_id") != candidate_id
             or screen_policy_id != campaign[1]
@@ -1220,7 +1253,8 @@ class StrategyLedger:
             identity,
             experiment_id=experiment_id,
             evaluation_context_id=evaluation_context_id,
-            data_as_of_ns=int(campaign[2]),
+            data_snapshot_id=str(experiment[6]),
+            data_as_of_ns=int(experiment[7]),
             screen_policy_id=screen_policy_id,
             code_commit=_code_commit() if validate_current_context else None,
         )
@@ -1386,11 +1420,19 @@ class StrategyLedger:
             return
         with closing(sqlite3.connect(self.path)) as connection:
             row = connection.execute(
-                """SELECT strategy_id, data_source_id, policy_id, engine_id, runtime_id
-                FROM experiments WHERE experiment_id = ?""",
+                """SELECT strategy_id, data_source_id, policy_id, engine_id, runtime_id,
+                experiment_sources.data_snapshot_id, experiment_sources.data_as_of_ns
+                FROM experiments LEFT JOIN experiment_sources USING (experiment_id)
+                WHERE experiment_id = ?""",
                 (experiment_id,),
             ).fetchone()
-        if row is None or trial.strategy_id != str(row[0]):
+        requires_source = trial.evidence.terminal_status in {
+            TerminalStatus.SCREEN_REJECTED,
+            TerminalStatus.SURVIVED,
+        }
+        if row is None or trial.strategy_id != str(row[0]) or (
+            requires_source and (row[5] is None or row[6] is None)
+        ):
             raise StrategyLabError("campaign trial experiment identity mismatch")
         identity = ExperimentIdentity(
             strategy_id=str(row[0]),
@@ -1398,6 +1440,8 @@ class StrategyLedger:
             policy_id=str(row[2]),
             engine_id=str(row[3]),
             runtime_id=str(row[4]),
+            data_as_of_ns=int(row[6]) if row[6] is not None else None,
+            data_snapshot_id=str(row[5]) if row[5] is not None else None,
         )
         actual = self.existing_execution(identity, screen_policy)
         if actual is None:
@@ -1455,8 +1499,24 @@ class StrategyLedger:
                     identity.runtime_id,
                 ),
             ).fetchone()
+            source = (
+                connection.execute(
+                    """SELECT data_snapshot_id, data_as_of_ns FROM experiment_sources
+                    WHERE experiment_id = ?""",
+                    (row[0],),
+                ).fetchone()
+                if row is not None
+                else None
+            )
         if row is None:
             return None
+        expected_source = (
+            (identity.data_snapshot_id, identity.data_as_of_ns)
+            if identity.data_snapshot_id is not None and identity.data_as_of_ns is not None
+            else None
+        )
+        if source != expected_source:
+            raise StrategyLabError("stored experiment source identity is inconsistent")
         experiment_id = str(row[0])
         if experiment_id != _experiment_id(identity):
             raise StrategyLabError("stored experiment identity is inconsistent")
@@ -1473,7 +1533,9 @@ class StrategyLedger:
         """Return terminal evidence for the exact existing execution identity."""
         with closing(sqlite3.connect(self.path)) as connection:
             experiment = connection.execute(
-                """SELECT experiment_id FROM experiments
+                """SELECT experiments.experiment_id,
+                experiment_sources.data_snapshot_id, experiment_sources.data_as_of_ns
+                FROM experiments LEFT JOIN experiment_sources USING (experiment_id)
                 WHERE strategy_id = ? AND data_source_id = ? AND policy_id = ?
                   AND engine_id = ? AND runtime_id = ?""",
                 (
@@ -1486,6 +1548,13 @@ class StrategyLedger:
             ).fetchone()
             if experiment is None:
                 return None
+            expected_source = (
+                (identity.data_snapshot_id, identity.data_as_of_ns)
+                if identity.data_snapshot_id is not None and identity.data_as_of_ns is not None
+                else (None, None)
+            )
+            if experiment[1:] != expected_source:
+                raise StrategyLabError("stored experiment source identity is inconsistent")
             experiment_id = str(experiment[0])
             verdict = connection.execute(
                 """SELECT verdict_id, outcome, reason_code, artifact_path, artifact_sha256
@@ -1544,6 +1613,7 @@ class StrategyLedger:
                     candidate_document,
                     hypothesis,
                     prepared.evaluation_context_id,
+                    prepared.identity.data_snapshot_id,
                     prepared.data_as_of_ns,
                     prepared.runtime_id,
                 )
@@ -1687,21 +1757,63 @@ class StrategyLedger:
         self, hypothesis_id: str, identity: ExperimentIdentity
     ) -> str:
         experiment_id = _experiment_id(identity)
+        expected_identity = (
+            identity.strategy_id,
+            identity.data_source_id,
+            identity.policy_id,
+            identity.engine_id,
+            identity.runtime_id,
+        )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
+            hypothesis = connection.execute(
+                """SELECT hypotheses.strategy_id, strategies.identity_schema
+                FROM hypotheses JOIN strategies USING (strategy_id)
+                WHERE hypothesis_id = ?""",
+                (hypothesis_id,),
+            ).fetchone()
+            if hypothesis is None or hypothesis[0] != identity.strategy_id:
+                raise StrategyLabError("experiment hypothesis identity mismatch")
+            source: tuple[str, str, int] | None = None
+            if hypothesis[1] == "strategy-id-v2":
+                if identity.data_as_of_ns is None or identity.data_snapshot_id is None:
+                    raise StrategyLabError("V2 experiment source identity is incomplete")
+                source = (
+                    experiment_id,
+                    _content_id(identity.data_snapshot_id, "data_snapshot_id"),
+                    identity.data_as_of_ns,
+                )
+            elif identity.data_as_of_ns is not None or identity.data_snapshot_id is not None:
+                raise StrategyLabError("legacy experiment cannot add V2 source identity")
             connection.execute(
                 """INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(experiment_id) DO NOTHING""",
                 (
                     experiment_id,
                     _content_id(hypothesis_id, "hypothesis_id"),
-                    identity.strategy_id,
-                    identity.data_source_id,
-                    identity.policy_id,
-                    identity.engine_id,
-                    identity.runtime_id,
+                    *expected_identity,
                 ),
             )
+            stored = connection.execute(
+                """SELECT strategy_id, data_source_id, policy_id,
+                engine_id, runtime_id FROM experiments WHERE experiment_id = ?""",
+                (experiment_id,),
+            ).fetchone()
+            if stored != expected_identity:
+                raise StrategyLabError("experiment record conflict")
+            if source is not None:
+                connection.execute(
+                    """INSERT INTO experiment_sources VALUES (?, ?, ?)
+                    ON CONFLICT(experiment_id) DO NOTHING""",
+                    source,
+                )
+                stored_source = connection.execute(
+                    """SELECT experiment_id, data_snapshot_id, data_as_of_ns
+                    FROM experiment_sources WHERE experiment_id = ?""",
+                    (experiment_id,),
+                ).fetchone()
+                if stored_source != source:
+                    raise StrategyLabError("experiment source record conflict")
         return experiment_id
 
     def record_verdict(self, record: VerdictRecord) -> str:
@@ -1749,10 +1861,12 @@ class StrategyLedger:
                 """SELECT experiments.hypothesis_id, experiments.strategy_id,
                 experiments.data_source_id, experiments.policy_id, experiments.engine_id,
                 experiments.runtime_id, hypotheses.artifact_path, hypotheses.artifact_sha256,
-                strategies.identity_schema
+                strategies.identity_schema, experiment_sources.data_snapshot_id,
+                experiment_sources.data_as_of_ns
                 FROM experiments
                 JOIN hypotheses USING (hypothesis_id, strategy_id)
                 JOIN strategies USING (strategy_id)
+                LEFT JOIN experiment_sources USING (experiment_id)
                 WHERE experiments.experiment_id = ?""",
                 (_content_id(record.experiment_id, "experiment_id"),),
             ).fetchone()
@@ -1828,6 +1942,8 @@ class StrategyLedger:
             str(experiment[3]),
             str(experiment[4]),
             str(experiment[5]),
+            int(experiment[10]) if experiment[10] is not None else None,
+            str(experiment[9]) if experiment[9] is not None else None,
         )
         if prepared is not None and prepared.identity != identity:
             raise StrategyLabError("Nautilus verdict prepared identity mismatch")
@@ -1855,13 +1971,12 @@ class StrategyLedger:
         ):
             raise StrategyLabError("Nautilus verdict candidate context is inconsistent")
         evaluation_context_id = candidate.get("evaluation_context_id")
-        data_as_of_ns = candidate_source.get("data_as_of_ns")
         screen_policy_id = screen_document.get("screen_policy_id")
         code_commit = document.get("code_commit")
         if (
             not isinstance(evaluation_context_id, str)
-            or isinstance(data_as_of_ns, bool)
-            or not isinstance(data_as_of_ns, int)
+            or experiment[9] is None
+            or experiment[10] is None
             or not isinstance(screen_policy_id, str)
             or not isinstance(code_commit, str)
         ):
@@ -1872,7 +1987,8 @@ class StrategyLedger:
             identity,
             experiment_id=record.experiment_id,
             evaluation_context_id=evaluation_context_id,
-            data_as_of_ns=data_as_of_ns,
+            data_snapshot_id=str(experiment[9]),
+            data_as_of_ns=int(experiment[10]),
             screen_policy_id=screen_policy_id,
             code_commit=code_commit,
         )
@@ -2223,6 +2339,8 @@ def _evaluation_context_id(
     hypothesis: StrategyHypothesis,
     *,
     data_source_id: str,
+    data_snapshot_id: str,
+    data_as_of_ns: int,
     policy_id: str,
     engine_id: str,
     runtime_id: str,
@@ -2233,6 +2351,8 @@ def _evaluation_context_id(
         _canonical_json(
             {
                 "code_commit": _identifier(code_commit, "code_commit"),
+                "data_as_of_ns": data_as_of_ns,
+                "data_snapshot_id": _content_id(data_snapshot_id, "data_snapshot_id"),
                 "data_source_id": _content_id(data_source_id, "data_source_id"),
                 "engine_id": _identifier(engine_id, "engine_id"),
                 "family_id": hypothesis.family_id,
@@ -2258,8 +2378,12 @@ def _prepare_execution(
 ) -> _PreparedExecution:
     """Derive the exact execution identity shared by run and campaign reuse."""
     data_as_of_ns: int | None = None
+    data_snapshot_id: str | None = None
     if hypothesis.identity_schema == "strategy-id-v2":
-        data_source_id, data_as_of_ns = _stable_data_snapshot(paths, _BAR_TYPE)
+        data_source_id, data_snapshot_id, data_as_of_ns = _stable_data_snapshot(
+            paths,
+            _BAR_TYPE,
+        )
     else:
         data_source_id = _hash_tree(paths)
     accounting_policy_id, _policy_version = _policy_identity(paths.policy_path)
@@ -2287,6 +2411,8 @@ def _prepare_execution(
         evaluation_context_id = _evaluation_context_id(
             hypothesis,
             data_source_id=data_source_id,
+            data_snapshot_id=data_snapshot_id,
+            data_as_of_ns=data_as_of_ns,
             policy_id=policy_id,
             engine_id=base_engine_id,
             runtime_id=runtime_id,
@@ -2301,6 +2427,8 @@ def _prepare_execution(
             policy_id=policy_id,
             engine_id=engine_id,
             runtime_id=runtime_id,
+            data_as_of_ns=data_as_of_ns,
+            data_snapshot_id=data_snapshot_id,
         ),
         evaluation_context_id=evaluation_context_id,
         screen_policy=screen_policy,
@@ -2706,6 +2834,7 @@ def _candidate_matches_hypothesis(
     candidate: dict[str, JsonValue],
     hypothesis: StrategyHypothesis,
     evaluation_context_id: str | None,
+    data_snapshot_id: str | None,
     data_as_of_ns: int | None,
     runtime_id: str,
 ) -> None:
@@ -2733,6 +2862,7 @@ def _candidate_matches_hypothesis(
             candidate.get("schema_version") != "pybroker-candidate-v2"
             or candidate.get("evaluation_context_id") != evaluation_context_id
             or not isinstance(source, dict)
+            or source.get("data_snapshot_id") != data_snapshot_id
             or source.get("data_as_of_ns") != data_as_of_ns
             or not isinstance(runtime, dict)
             or runtime.get("environment_id") != runtime_id
@@ -2753,6 +2883,7 @@ def _candidate_matches_persisted_identity(
     *,
     experiment_id: str,
     evaluation_context_id: str,
+    data_snapshot_id: str,
     data_as_of_ns: int,
     screen_policy_id: str,
     code_commit: str | None,
@@ -2768,6 +2899,7 @@ def _candidate_matches_persisted_identity(
             candidate,
             hypothesis,
             evaluation_context_id,
+            data_snapshot_id,
             data_as_of_ns,
             identity.runtime_id,
         )
@@ -2775,6 +2907,8 @@ def _candidate_matches_persisted_identity(
             _experiment_id(identity) != experiment_id
             or not isinstance(source, dict)
             or not isinstance(runtime, dict)
+            or identity.data_snapshot_id != data_snapshot_id
+            or source.get("data_snapshot_id") != data_snapshot_id
             or runtime.get("environment_id") != identity.runtime_id
             or separator != "-evaluation-"
             or not base_engine_id
@@ -2784,6 +2918,8 @@ def _candidate_matches_persisted_identity(
         if code_commit is not None and evaluation_context_id != _evaluation_context_id(
             hypothesis,
             data_source_id=identity.data_source_id,
+            data_snapshot_id=data_snapshot_id,
+            data_as_of_ns=data_as_of_ns,
             policy_id=identity.policy_id,
             engine_id=base_engine_id,
             runtime_id=identity.runtime_id,
@@ -2805,14 +2941,15 @@ def _catalog_last_timestamp(catalog_path: Path, bar_type: str) -> int:
     return int(timestamps[-1])
 
 
-def _stable_data_snapshot(paths: StrategyLoopPaths, bar_type: str) -> tuple[str, int]:
-    """Bind cohort hash and tail to one stable read window."""
+def _stable_data_snapshot(paths: StrategyLoopPaths, bar_type: str) -> tuple[str, str, int]:
+    """Bind execution source, candidate snapshot, and tail to one stable read window."""
     before = _hash_tree(paths)
+    data_snapshot_id = _catalog_digest(paths.catalog_path, bar_type)
     data_as_of_ns = _catalog_last_timestamp(paths.catalog_path, bar_type)
     after = _hash_tree(paths)
     if before != after:
         raise StrategyLabError("campaign data snapshot changed during preflight")
-    return before, data_as_of_ns
+    return before, data_snapshot_id, data_as_of_ns
 
 
 def _campaign_hypothesis_document(
@@ -2875,6 +3012,7 @@ def _campaign_reference_execution(
 def _campaign_execution_signature(prepared: _PreparedExecution) -> tuple[object, ...]:
     return (
         prepared.identity.data_source_id,
+        prepared.identity.data_snapshot_id,
         prepared.identity.policy_id,
         prepared.identity.runtime_id,
         prepared.data_as_of_ns,
@@ -2916,7 +3054,10 @@ def _reconcile_campaign_preflight(
         if reference_hypothesis is not None and reference_prepared is not None:
             _require_execution_snapshot(reference_hypothesis, paths, reference_prepared)
         policy = load_screen_policy(research_policy_path)
-        data_source_id, data_as_of_ns = _stable_data_snapshot(paths, _BAR_TYPE)
+        data_source_id, _data_snapshot_id, data_as_of_ns = _stable_data_snapshot(
+            paths,
+            _BAR_TYPE,
+        )
     except (OSError, RuntimeError, StrategyCampaignError, StrategyLabError, ValueError) as error:
         raise CampaignTechnicalError("CAMPAIGN_PREFLIGHT_DRIFT", False) from error
     if (
@@ -3399,6 +3540,7 @@ def _run_strategy_loop_locked(
             candidate_document,
             hypothesis,
             evaluation_context_id,
+            prepared.identity.data_snapshot_id,
             prepared.data_as_of_ns,
             runtime_id,
         )

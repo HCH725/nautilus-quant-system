@@ -463,7 +463,15 @@ class StrategyLedgerTests(unittest.TestCase):
                 )
             }
         self.assertTrue(
-            {"strategies", "hypotheses", "experiments", "verdicts", "errors"} <= tables
+            {
+                "strategies",
+                "hypotheses",
+                "experiments",
+                "experiment_sources",
+                "verdicts",
+                "errors",
+            }
+            <= tables
         )
 
     def test_initialize_migrates_copied_v1_ledger_without_reidentifying_or_losing_rows(self):
@@ -490,6 +498,8 @@ class StrategyLedgerTests(unittest.TestCase):
             migrated_stage_sql = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'"
             ).fetchone()[0]
+            source_rows = connection.execute("SELECT * FROM experiment_sources").fetchall()
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
             foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
             triggers = {
                 row[0]
@@ -519,8 +529,15 @@ class StrategyLedgerTests(unittest.TestCase):
         self.assertEqual(migrated[-1], "strategy-id-v1")
         self.assertEqual(after, before)
         self.assertEqual(migrated_stage_sql, stage_sql)
+        self.assertEqual(source_rows, [])
+        self.assertEqual(quick_check, "ok")
         self.assertEqual(foreign_key_errors, [])
-        for table in (*preserved_tables, "strategies", "signal_parity_results"):
+        for table in (
+            *preserved_tables,
+            "strategies",
+            "experiment_sources",
+            "signal_parity_results",
+        ):
             self.assertIn(f"{table}_immutable_update", triggers)
             self.assertIn(f"{table}_immutable_delete", triggers)
 
@@ -533,8 +550,14 @@ class StrategyLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger.path)) as connection:
             columns = [row[1] for row in connection.execute("PRAGMA table_info(strategies)")]
             row = connection.execute("SELECT family FROM strategies").fetchone()
+            source_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'experiment_sources'"
+            ).fetchone()
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
         self.assertIn("lookback_bars", columns)
         self.assertEqual(row, ("unknown-family",))
+        self.assertIsNone(source_table)
+        self.assertEqual(quick_check, "ok")
 
     def test_initialize_migrates_legacy_stage_outcomes_without_losing_rows(self):
         self.ledger.path.parent.mkdir(parents=True, exist_ok=True)
