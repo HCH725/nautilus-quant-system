@@ -215,6 +215,48 @@ class CliTests(unittest.TestCase):
             self.assertEqual(report["status"], "FAIL")
             self.assertEqual(report["error_type"], "JSONDecodeError")
 
+    def test_status_ignores_cli_pre_config_failure_report(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = write_valid_config(project)
+            valid_config = config.read_text(encoding="utf-8")
+            report = {
+                "status": "PASS",
+                "catalog_path": str((project / "data/catalog").resolve()),
+                "funding_path": str((project / "data/funding").resolve()),
+            }
+
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                patch("nautilus_quant.cli.run_sync", return_value=report),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(main(["sync", "--config", str(config)]), 0)
+
+            config.write_text("{not-json", encoding="utf-8")
+            with (
+                patch("nautilus_quant.cli.PROJECT_ROOT", project),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                self.assertEqual(main(["sync", "--config", str(config)]), 1)
+            config.write_text(valid_config, encoding="utf-8")
+
+            reports = sorted((project / "var/runs").glob("sync-*.json"))
+            pre_config_failure = json.loads(reports[-1].read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(pre_config_failure),
+                {"status", "failed_at", "error_type", "error"},
+            )
+
+            output = StringIO()
+            with patch("nautilus_quant.cli.PROJECT_ROOT", project), redirect_stdout(output):
+                result = main(["status", "--config", str(config)])
+
+            self.assertEqual(result, 0)
+            event = json.loads(output.getvalue())
+            self.assertEqual(event["status"], "PASS")
+
     def test_sync_rejects_config_outside_project_and_reports_inside_project(self):
         with TemporaryDirectory() as project_tmp, TemporaryDirectory() as external_tmp:
             project = Path(project_tmp)

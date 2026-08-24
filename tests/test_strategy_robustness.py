@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import hashlib
 import sqlite3
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, cast
 import unittest
 
 import nautilus_quant.strategy_lab as strategy_lab
@@ -70,6 +70,64 @@ def _trial_context(
         "terminal_census_complete": True,
         "trial_census_id": "d" * 64,
     }
+
+
+def _complete_robustness_verdict() -> dict[str, object]:
+    policy = replace(
+        load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+        expanding_minimum_train_bars=3,
+        rolling_train_bars=4,
+        test_bars=2,
+        step_bars=2,
+    )
+    windows = generate_robustness_windows(
+        tuple(range(1, 14)),
+        policy,
+        evaluation_start_ns=1,
+        evaluation_end_ns=13,
+        data_as_of_ns=13,
+        evaluation_context_id="f" * 64,
+    )
+    cells = generate_robustness_matrix(
+        {"lookback_bars": 10, "entry_threshold": 0.02},
+        windows,
+        policy,
+    )
+    results = tuple(
+        RobustnessCellResult(
+            cell.cell_id,
+            cell.evaluation_context_id,
+            "PASS",
+            "PASS",
+            "a" * 64,
+            Decimal("1"),
+            Decimal("0"),
+            "official",
+            ("CELL_ECONOMIC_PASS",),
+            "a" * 64,
+        )
+        for cell in cells
+    )
+    return build_robustness_verdict_v2(
+        {
+            "candidate_id": "1" * 64,
+            "code_commit": "c" * 40,
+            "data_as_of_ns": 13,
+            "data_snapshot_id": "2" * 64,
+            "data_source_id": "3" * 64,
+            "engine_id": "4" * 64,
+            "evaluation_context_id": robustness_evaluation_context_id(policy, cells),
+            "experiment_id": "6" * 64,
+            "hypothesis_id": "7" * 64,
+            "policy_id": policy.policy_id,
+            "runtime_id": "9" * 64,
+            "strategy_id": "a" * 64,
+        },
+        policy,
+        cells,
+        results,
+        trial_context=_trial_context(),
+    )
 
 
 def _seed_persisted_mutation_source(
@@ -290,6 +348,13 @@ def _run_persisted_mutation(
 
 
 class StrategyRobustnessPolicyTests(unittest.TestCase):
+    def test_loaded_policy_preserves_canonical_config_identity(self) -> None:
+        path = ROOT / "config/strategy_robustness_policy.json"
+        policy = load_robustness_policy(path)
+
+        self.assertEqual(canonical_json(policy.document()), path.read_bytes())
+        self.assertEqual(policy.policy_id, hashlib.sha256(path.read_bytes()).hexdigest())
+
     def test_persisted_run_derives_experiment_and_publishes_complete_chain(self) -> None:
         frozen = load_robustness_policy(ROOT / "config/strategy_robustness_policy.json")
         policy = replace(
@@ -336,10 +401,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         }
         ledger.robustness_survivor_context.return_value = survivor
         ledger.existing_robustness.return_value = None
-        ledger.record_experiment.side_effect = (
-            lambda _hypothesis_id, identity: strategy_lab.experiment_id(identity)
-        )
-        ledger.publish_robustness.side_effect = lambda _directory, verdict, feedback, action: SimpleNamespace(
+        ledger.publish_robustness.side_effect = lambda _directory, verdict, feedback, action, **_kwargs: SimpleNamespace(
             action_path="action.json",
             action_sha256=hashlib.sha256(canonical_json(action)).hexdigest(),
             economic_status=verdict["economic_status"],
@@ -416,8 +478,13 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                 evaluator=evaluate,
             )
 
-        recorded_identity = ledger.record_experiment.call_args.args[1]
+        recorded_identity = ledger.publish_robustness.call_args.kwargs["experiment_identity"]
         self.assertEqual(summary["experiment_id"], strategy_lab.experiment_id(recorded_identity))
+        self.assertEqual(
+            ledger.publish_robustness.call_args.kwargs["experiment_hypothesis_id"],
+            survivor.hypothesis_id,
+        )
+        ledger.record_experiment.assert_not_called()
         self.assertEqual(summary["campaign_id"], campaign_id)
         self.assertEqual(summary["candidate_id"], candidate_id)
         self.assertEqual(summary["action"], "ADVANCE")
@@ -532,6 +599,191 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             self.assertEqual(first["robustness_verdict_id"], second["robustness_verdict_id"])
             self.assertEqual(first["funnel"], second["funnel"])
 
+    def test_window_distinct_mutations_persist_distinct_lineage_to_same_child(self) -> None:
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _seed_persisted_mutation_source(root)
+
+            first = _run_persisted_mutation(root, fixture, policy)
+            with closing(sqlite3.connect(fixture["ledger"].path)) as connection, connection:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("DROP TRIGGER robustness_lineage_immutable_update")
+                connection.execute("DROP TRIGGER robustness_lineage_immutable_delete")
+                connection.execute("ALTER TABLE robustness_lineage RENAME TO legacy_robustness_lineage")
+                connection.execute(
+                    """CREATE TABLE robustness_lineage (
+                        lineage_id TEXT PRIMARY KEY,
+                        robustness_id TEXT NOT NULL UNIQUE,
+                        robustness_verdict_id TEXT NOT NULL UNIQUE,
+                        action_id TEXT NOT NULL UNIQUE,
+                        parent_strategy_id TEXT NOT NULL,
+                        child_strategy_id TEXT NOT NULL,
+                        child_hypothesis_id TEXT NOT NULL UNIQUE,
+                        FOREIGN KEY (robustness_id) REFERENCES robustness_results(robustness_id),
+                        FOREIGN KEY (parent_strategy_id) REFERENCES strategies(strategy_id),
+                        FOREIGN KEY (child_strategy_id) REFERENCES strategies(strategy_id),
+                        FOREIGN KEY (child_hypothesis_id, child_strategy_id)
+                            REFERENCES hypotheses(hypothesis_id, strategy_id)
+                    )""",
+                )
+                connection.execute(
+                    "INSERT INTO robustness_lineage SELECT * FROM legacy_robustness_lineage",
+                )
+                connection.execute("DROP TABLE legacy_robustness_lineage")
+            fixture["ledger"].initialize()
+            second = _run_persisted_mutation(root, fixture, replace(policy, test_bars=3))
+
+            first_action = load_action_v1(Path(first["action_path"]).read_bytes())
+            second_action = load_action_v1(Path(second["action_path"]).read_bytes())
+            self.assertNotEqual(first["experiment_id"], second["experiment_id"])
+            self.assertNotEqual(first["robustness_verdict_id"], second["robustness_verdict_id"])
+            self.assertEqual(first_action["child_hypothesis_id"], second_action["child_hypothesis_id"])
+            with closing(sqlite3.connect(fixture["ledger"].path)) as connection:
+                lineages = connection.execute(
+                    """SELECT robustness_verdict_id, action_id, child_hypothesis_id
+                    FROM robustness_lineage ORDER BY robustness_verdict_id""",
+                ).fetchall()
+            self.assertEqual(
+                set(lineages),
+                {
+                    (
+                        first["robustness_verdict_id"],
+                        first_action["action_id"],
+                        first_action["child_hypothesis_id"],
+                    ),
+                    (
+                        second["robustness_verdict_id"],
+                        second_action["action_id"],
+                        second_action["child_hypothesis_id"],
+                    ),
+                },
+            )
+
+    def test_reuse_requires_every_referenced_formal_cell_artifact(self) -> None:
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _seed_persisted_mutation_source(root)
+            first = _run_persisted_mutation(root, fixture, policy)
+            verdict = strategy_robustness.load_robustness_verdict_v2(
+                Path(first["verdict_path"]).read_bytes(),
+            )
+            cell = cast(list[dict[str, object]], verdict["cells"])[0]
+            cell_path = (
+                root
+                / "robustness"
+                / str(first["experiment_id"])
+                / "cells"
+                / str(cell["cell_id"])
+                / "nautilus-verdict-v1.json"
+            )
+            cell_payload = cell_path.read_bytes()
+            cell_path.unlink()
+
+            with self.assertRaisesRegex(ValueError, "formal cell artifact"):
+                _run_persisted_mutation(root, fixture, policy)
+            cell_path.write_bytes(cell_payload + b" ")
+            with self.assertRaisesRegex(ValueError, "formal cell artifact"):
+                _run_persisted_mutation(root, fixture, policy)
+
+    def test_persistence_rejects_source_detached_from_survivor(self) -> None:
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _seed_persisted_mutation_source(root)
+            captured: dict[str, object] = {}
+
+            def capture_publish(
+                _directory: Path,
+                verdict: dict[str, object],
+                feedback: dict[str, object],
+                action: dict[str, object],
+                **kwargs: object,
+            ) -> None:
+                captured.update(
+                    verdict=verdict,
+                    feedback=feedback,
+                    action=action,
+                    **kwargs,
+                )
+                raise RuntimeError("captured before persistence")
+
+            with patch.object(strategy_lab.StrategyLedger, "publish_robustness", side_effect=capture_publish):
+                with self.assertRaisesRegex(RuntimeError, "captured before persistence"):
+                    _run_persisted_mutation(root, fixture, policy)
+            verdict = cast(dict[str, object], captured["verdict"])
+            source_action = cast(dict[str, object], captured["action"])
+            forged_identity = strategy_lab.robustness_experiment_identity(
+                replace(fixture["base_identity"], data_snapshot_id="f" * 64),
+                policy.policy_id,
+                cast(str, verdict["evaluation_context_id"]),
+            )
+            forged_verdict = {
+                **verdict,
+                "data_snapshot_id": "f" * 64,
+                "experiment_id": strategy_lab.experiment_id(forged_identity),
+            }
+            del forged_verdict["robustness_verdict_id"]
+            forged_verdict["robustness_verdict_id"] = hashlib.sha256(
+                canonical_json(forged_verdict),
+            ).hexdigest()
+            forged_feedback = build_feedback_v2(forged_verdict)
+            forged_action = build_action_v1(
+                forged_verdict,
+                campaign_id=fixture["campaign_id"],
+                changed_dimension=cast(str, source_action["changed_dimension"]),
+                child_hypothesis_id=cast(str, source_action["child_hypothesis_id"]),
+                child_strategy_id=cast(str, source_action["child_strategy_id"]),
+                generation=cast(int, source_action["generation"]),
+            )
+            tables = ("experiments", "experiment_sources", "robustness_results", "robustness_lineage")
+            with closing(sqlite3.connect(fixture["ledger"].path)) as connection:
+                before = tuple(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in tables
+                )
+
+            with self.assertRaisesRegex(ValueError, "survivor source identity"):
+                fixture["ledger"].publish_robustness(
+                    root / "forged-source",
+                    forged_verdict,
+                    forged_feedback,
+                    forged_action,
+                    child_hypothesis_payload=cast(bytes, captured["child_hypothesis_payload"]),
+                    experiment_hypothesis_id=fixture["source"].hypothesis_id,
+                    experiment_identity=forged_identity,
+                )
+
+            with closing(sqlite3.connect(fixture["ledger"].path)) as connection:
+                after = tuple(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in tables
+                )
+            self.assertEqual(after, before)
+            self.assertFalse((root / "forged-source" / forged_verdict["robustness_verdict_id"]).exists())
+
     def test_persisted_mutation_rolls_back_child_and_new_artifacts_on_lineage_error(self) -> None:
         policy = replace(
             load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
@@ -545,7 +797,14 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             root = Path(temporary)
             fixture = _seed_persisted_mutation_source(root)
             ledger = fixture["ledger"]
-            tables = ("strategies", "hypotheses", "robustness_results", "robustness_lineage")
+            tables = (
+                "strategies",
+                "hypotheses",
+                "experiments",
+                "experiment_sources",
+                "robustness_results",
+                "robustness_lineage",
+            )
             with closing(sqlite3.connect(ledger.path)) as connection, connection:
                 before = tuple(
                     connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -574,6 +833,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             self.assertEqual(quick_check, "ok")
             self.assertEqual(foreign_key_errors, [])
             self.assertEqual(list((root / "robustness").rglob("strategy-action-v1.json")), [])
+            self.assertEqual(list((root / "robustness").rglob("nautilus-verdict-v1.json")), [])
 
             repaired = _run_persisted_mutation(root, fixture, policy)
             self.assertTrue(Path(repaired["action_path"]).is_file())
@@ -582,7 +842,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                     connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                     for table in tables
                 )
-            self.assertEqual(repaired_counts, (2, 2, 1, 1))
+            self.assertEqual(repaired_counts, (2, 2, 2, 2, 1, 1))
 
     def test_mutation_publish_removes_new_partial_artifacts_on_immutable_conflict(self) -> None:
         policy = replace(
@@ -653,6 +913,47 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
 
             self.assertNotEqual(first["child_strategy_id"], second["child_strategy_id"])
             self.assertNotEqual(first["child_hypothesis_id"], second["child_hypothesis_id"])
+
+    def test_zero_threshold_mutation_changes_a_real_dimension_and_child_identity(self) -> None:
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _seed_persisted_mutation_source(
+                root,
+                parameters={"entry_threshold": 0.0, "lookback_bars": 10},
+            )
+
+            result = _run_persisted_mutation(root, fixture, policy)
+
+            self.assertNotEqual(result["child_strategy_id"], fixture["source"].strategy_id)
+            action = load_action_v1(Path(result["action_path"]).read_bytes())
+            self.assertEqual(action["changed_dimension"], "lookback_bars")
+
+    def test_mutation_without_an_effective_parameter_change_fails_closed(self) -> None:
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _seed_persisted_mutation_source(
+                root,
+                parameters={"entry_threshold": 0.0, "lookback_bars": 1},
+            )
+
+            with self.assertRaisesRegex(ValueError, "no effective parameter change"):
+                _run_persisted_mutation(root, fixture, policy)
 
     def test_formal_cli_uses_persisted_campaign_and_writable_ledger(self) -> None:
         ledger = Mock()
@@ -790,6 +1091,68 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         self.assertTrue(all(window.test_end_ns <= 13 for window in windows))
         self.assertTrue(all(window.train_end_ns < window.test_start_ns for window in windows))
         self.assertEqual(len({window.evaluation_context_id for window in windows}), 4)
+
+    def test_partial_frozen_matrix_cannot_advance(self) -> None:
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=2,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        windows = generate_robustness_windows(
+            tuple(range(1, 7)),
+            policy,
+            evaluation_start_ns=1,
+            evaluation_end_ns=6,
+            data_as_of_ns=6,
+            evaluation_context_id="f" * 64,
+        )
+        cells = generate_robustness_matrix(
+            {"lookback_bars": 10, "entry_threshold": 0.02},
+            windows,
+            policy,
+        )
+        results = tuple(
+            RobustnessCellResult(
+                cell.cell_id,
+                cell.evaluation_context_id,
+                "PASS",
+                "PASS",
+                "a" * 64,
+                Decimal("1"),
+                Decimal("0"),
+                "official",
+                ("CELL_ECONOMIC_PASS",),
+            )
+            for cell in cells
+        )
+        verdict = build_robustness_verdict_v2(
+            {
+                "candidate_id": "1" * 64,
+                "code_commit": "c" * 40,
+                "data_as_of_ns": 6,
+                "data_snapshot_id": "2" * 64,
+                "data_source_id": "3" * 64,
+                "engine_id": "4" * 64,
+                "evaluation_context_id": robustness_evaluation_context_id(policy, cells),
+                "experiment_id": "6" * 64,
+                "hypothesis_id": "7" * 64,
+                "policy_id": policy.policy_id,
+                "runtime_id": "9" * 64,
+                "strategy_id": "a" * 64,
+            },
+            policy,
+            cells,
+            results,
+            trial_context={**_trial_context(), "data_as_of_ns": 6},
+        )
+
+        self.assertEqual(len(windows), 2)
+        self.assertFalse(verdict["complete_matrix"])
+        self.assertEqual(verdict["technical_status"], "ERROR")
+        self.assertEqual(verdict["action"], "FIX_TECHNICAL")
 
     def test_window_change_produces_a_distinct_robustness_experiment(self) -> None:
         policy = replace(
@@ -1026,6 +1389,66 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         self.assertEqual(first_cell["cost_policy_id"], cells[0].cost_policy.cost_policy_id)
         self.assertEqual(first_cell["parameters"], cells[0].parameters)
         self.assertEqual(first_cell["window"]["scheme"], cells[0].window.scheme)
+
+    def test_loader_rejects_rehashed_advance_with_error_cell(self) -> None:
+        forged = _complete_robustness_verdict()
+        cells = cast(list[dict[str, object]], forged["cells"])
+        cells[0]["technical_status"] = "ERROR"
+        cells[0]["economic_status"] = "NOT_MODELED"
+        cells[0]["reason_codes"] = ["NAUTILUS_EVALUATION_ERROR"]
+        del forged["robustness_verdict_id"]
+        forged["robustness_verdict_id"] = hashlib.sha256(canonical_json(forged)).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+            strategy_robustness.load_robustness_verdict_v2(canonical_json(forged))
+
+    def test_loader_rejects_rehashed_advance_with_unclaimable_funding(self) -> None:
+        forged = _complete_robustness_verdict()
+        cells = cast(list[dict[str, object]], forged["cells"])
+        cells[0]["funding_truth_status"] = "modeled_funding"
+        forged["funding_truth_counts"] = {
+            "missing": 0,
+            "mixed": 0,
+            "modeled_funding": 1,
+            "official": len(cells) - 1,
+        }
+        forged["performance_claimable"] = False
+        del forged["robustness_verdict_id"]
+        forged["robustness_verdict_id"] = hashlib.sha256(canonical_json(forged)).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+            strategy_robustness.load_robustness_verdict_v2(canonical_json(forged))
+
+    def test_loader_rejects_rehashed_downsized_frozen_matrix(self) -> None:
+        forged = _complete_robustness_verdict()
+        forged["cells"] = [
+            cell
+            for cell in cast(list[dict[str, object]], forged["cells"])
+            if cast(dict[str, object], cell["window"])["ordinal"] == 0
+        ]
+        cast(dict[str, object], forged["matrix_shape"])["maximum_windows_per_scheme"] = 1
+        forged["cell_count"] = len(cast(list[object], forged["cells"]))
+        forged["funding_truth_counts"] = {
+            "missing": 0,
+            "mixed": 0,
+            "modeled_funding": 0,
+            "official": forged["cell_count"],
+        }
+        del forged["robustness_verdict_id"]
+        forged["robustness_verdict_id"] = hashlib.sha256(canonical_json(forged)).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "policy-bound matrix"):
+            strategy_robustness.load_robustness_verdict_v2(canonical_json(forged))
+
+    def test_loader_rejects_rehashed_duplicate_cell_identity(self) -> None:
+        forged = _complete_robustness_verdict()
+        cells = cast(list[dict[str, Any]], forged["cells"])
+        cells[1]["cell_id"] = cells[0]["cell_id"]
+        del forged["robustness_verdict_id"]
+        forged["robustness_verdict_id"] = hashlib.sha256(canonical_json(forged)).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+            strategy_robustness.load_robustness_verdict_v2(canonical_json(forged))
 
     def test_formal_evaluator_binds_cell_context_and_parameter_override(self) -> None:
         policy = replace(
@@ -1524,6 +1947,10 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                      identity["data_source_id"], identity["policy_id"], identity["engine_id"], identity["runtime_id"]),
                 )
                 connection.execute(
+                    "INSERT INTO experiment_sources VALUES (?, ?, ?)",
+                    (identity["experiment_id"], identity["data_snapshot_id"], identity["data_as_of_ns"]),
+                )
+                connection.execute(
                     "INSERT INTO campaigns VALUES (?, ?, ?, ?, ?)",
                     (campaign_id, campaign_payload.decode(), "f" * 64, 13, identity["data_source_id"]),
                 )
@@ -1575,6 +2002,42 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             )
             feedback = build_feedback_v2(verdict)
             action = build_action_v1(verdict, campaign_id=campaign_id)
+            forged_feedback = {**feedback, "candidate_id": "f" * 64}
+            del forged_feedback["feedback_id"]
+            forged_feedback["feedback_id"] = hashlib.sha256(
+                canonical_json(forged_feedback),
+            ).hexdigest()
+            with self.assertRaisesRegex(ValueError, "artifact identity"):
+                ledger.publish_robustness(
+                    root / "foreign-feedback",
+                    verdict,
+                    forged_feedback,
+                    action,
+                )
+            forged_feedback_outcome = {**feedback, "action": "HOLD"}
+            del forged_feedback_outcome["feedback_id"]
+            forged_feedback_outcome["feedback_id"] = hashlib.sha256(
+                canonical_json(forged_feedback_outcome),
+            ).hexdigest()
+            with self.assertRaisesRegex(ValueError, "artifact outcome"):
+                ledger.publish_robustness(
+                    root / "foreign-feedback-outcome",
+                    verdict,
+                    forged_feedback_outcome,
+                    action,
+                )
+            forged_action = {**action, "data_snapshot_id": "f" * 64}
+            del forged_action["action_id"]
+            forged_action["action_id"] = hashlib.sha256(
+                canonical_json(forged_action),
+            ).hexdigest()
+            with self.assertRaisesRegex(ValueError, "artifact identity"):
+                ledger.publish_robustness(
+                    root / "foreign-action",
+                    verdict,
+                    feedback,
+                    forged_action,
+                )
             relative_artifacts = Path(os.path.relpath(root / "robustness", Path.cwd()))
             record = ledger.publish_robustness(relative_artifacts, verdict, feedback, action)
             self.assertTrue(Path(record.verdict_path).is_absolute())

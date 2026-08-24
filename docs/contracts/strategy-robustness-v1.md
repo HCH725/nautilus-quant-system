@@ -17,5 +17,19 @@ Nautilus evaluation. Fees remain Nautilus instrument metadata; Funding remains
 the canonical FundingObservation generation. Parameter neighborhoods are
 copies from the shared family kernel and never mutate the candidate.
 
+The append-only persistence boundary records the experiment, aggregate,
+feedback, action, optional child hypothesis, and current-verdict lineage in one
+SQLite transaction. Distinct robustness verdicts may reference the same
+deterministic child hypothesis. A failed aggregate/lineage write rolls back the
+experiment and removes only newly created aggregate and cell artifacts.
+Before insertion, the robustness experiment's complete identity and source row
+must match the verdict, and its snapshot/data-as-of must also match the unique
+persisted campaign survivor's historical `experiment_sources` row. Agreement
+among newly supplied verdict/feedback/action bytes is not sufficient.
+
+Reuse requires canonical hash/readback of the aggregate verdict, feedback,
+action, optional child hypothesis, and every formal Nautilus cell artifact
+referenced by the aggregate.
+
 DSR and PBO are explicitly `NOT_MODELED`. Missing cells, technical failures,
 unclear Funding truth, or an unmodeled cost cannot pass robustness.

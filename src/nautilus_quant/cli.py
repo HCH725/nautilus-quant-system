@@ -116,6 +116,12 @@ def _latest_report(
         report = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(report, dict):
             raise ValueError("run report must be a JSON object")
+        if (
+            set(report) == {"status", "failed_at", "error_type", "error"}
+            and report["status"] == "FAIL"
+            and all(isinstance(report[field], str) for field in ("failed_at", "error_type", "error"))
+        ):
+            continue
         for field in ("catalog_path", "funding_path"):
             if not isinstance(report.get(field), str) or not report[field]:
                 raise ValueError(f"invalid run report field: {field}")

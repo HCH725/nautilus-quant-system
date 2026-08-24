@@ -20,7 +20,7 @@ import signal
 import sqlite3
 import subprocess
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import Final, IO, Literal, assert_never
+from typing import Final, IO, Literal, assert_never, cast
 
 import nautilus_trader
 from nautilus_trader.persistence import ParquetDataCatalog
@@ -311,7 +311,7 @@ CREATE TABLE IF NOT EXISTS robustness_lineage (
     action_id TEXT NOT NULL UNIQUE,
     parent_strategy_id TEXT NOT NULL,
     child_strategy_id TEXT NOT NULL,
-    child_hypothesis_id TEXT NOT NULL UNIQUE,
+    child_hypothesis_id TEXT NOT NULL,
     FOREIGN KEY (robustness_id) REFERENCES robustness_results(robustness_id),
     FOREIGN KEY (parent_strategy_id) REFERENCES strategies(strategy_id),
     FOREIGN KEY (child_strategy_id) REFERENCES strategies(strategy_id),
@@ -858,6 +858,70 @@ def experiment_id(identity: ExperimentIdentity) -> str:
     return _experiment_id(identity)
 
 
+def _record_experiment_row(
+    connection: sqlite3.Connection,
+    hypothesis_id: str,
+    identity: ExperimentIdentity,
+) -> str:
+    derived_experiment_id = _experiment_id(identity)
+    expected_identity = (
+        identity.strategy_id,
+        identity.data_source_id,
+        identity.policy_id,
+        identity.engine_id,
+        identity.runtime_id,
+    )
+    hypothesis = connection.execute(
+        """SELECT hypotheses.strategy_id, strategies.identity_schema
+        FROM hypotheses JOIN strategies USING (strategy_id)
+        WHERE hypothesis_id = ?""",
+        (hypothesis_id,),
+    ).fetchone()
+    if hypothesis is None or hypothesis[0] != identity.strategy_id:
+        raise StrategyLabError("experiment hypothesis identity mismatch")
+    source: tuple[str, str, int] | None = None
+    if hypothesis[1] == "strategy-id-v2":
+        if identity.data_as_of_ns is None or identity.data_snapshot_id is None:
+            raise StrategyLabError("V2 experiment source identity is incomplete")
+        source = (
+            derived_experiment_id,
+            _content_id(identity.data_snapshot_id, "data_snapshot_id"),
+            identity.data_as_of_ns,
+        )
+    elif identity.data_as_of_ns is not None or identity.data_snapshot_id is not None:
+        raise StrategyLabError("legacy experiment cannot add V2 source identity")
+    connection.execute(
+        """INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(experiment_id) DO NOTHING""",
+        (
+            derived_experiment_id,
+            _content_id(hypothesis_id, "hypothesis_id"),
+            *expected_identity,
+        ),
+    )
+    stored = connection.execute(
+        """SELECT strategy_id, data_source_id, policy_id,
+        engine_id, runtime_id FROM experiments WHERE experiment_id = ?""",
+        (derived_experiment_id,),
+    ).fetchone()
+    if stored != expected_identity:
+        raise StrategyLabError("experiment record conflict")
+    if source is not None:
+        connection.execute(
+            """INSERT INTO experiment_sources VALUES (?, ?, ?)
+            ON CONFLICT(experiment_id) DO NOTHING""",
+            source,
+        )
+        stored_source = connection.execute(
+            """SELECT experiment_id, data_snapshot_id, data_as_of_ns
+            FROM experiment_sources WHERE experiment_id = ?""",
+            (derived_experiment_id,),
+        ).fetchone()
+        if stored_source != source:
+            raise StrategyLabError("experiment source record conflict")
+    return derived_experiment_id
+
+
 def robustness_experiment_identity(
     base: ExperimentIdentity,
     policy_id: str,
@@ -1095,6 +1159,41 @@ def _migrate_legacy_strategies(connection: sqlite3.Connection) -> bool:
     return True
 
 
+def _migrate_legacy_robustness_lineage(connection: sqlite3.Connection) -> bool:
+    schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'robustness_lineage'",
+    ).fetchone()
+    if schema is None or "child_hypothesis_id TEXT NOT NULL UNIQUE" not in schema[0]:
+        return False
+    row_count = connection.execute("SELECT COUNT(*) FROM robustness_lineage").fetchone()[0]
+    connection.execute("DROP TRIGGER IF EXISTS robustness_lineage_immutable_update")
+    connection.execute("DROP TRIGGER IF EXISTS robustness_lineage_immutable_delete")
+    connection.execute("ALTER TABLE robustness_lineage RENAME TO legacy_robustness_lineage")
+    connection.execute(
+        """CREATE TABLE robustness_lineage (
+            lineage_id TEXT PRIMARY KEY,
+            robustness_id TEXT NOT NULL UNIQUE,
+            robustness_verdict_id TEXT NOT NULL UNIQUE,
+            action_id TEXT NOT NULL UNIQUE,
+            parent_strategy_id TEXT NOT NULL,
+            child_strategy_id TEXT NOT NULL,
+            child_hypothesis_id TEXT NOT NULL,
+            FOREIGN KEY (robustness_id) REFERENCES robustness_results(robustness_id),
+            FOREIGN KEY (parent_strategy_id) REFERENCES strategies(strategy_id),
+            FOREIGN KEY (child_strategy_id) REFERENCES strategies(strategy_id),
+            FOREIGN KEY (child_hypothesis_id, child_strategy_id)
+                REFERENCES hypotheses(hypothesis_id, strategy_id)
+        )""",
+    )
+    connection.execute(
+        "INSERT INTO robustness_lineage SELECT * FROM legacy_robustness_lineage",
+    )
+    connection.execute("DROP TABLE legacy_robustness_lineage")
+    if connection.execute("SELECT COUNT(*) FROM robustness_lineage").fetchone()[0] != row_count:
+        raise StrategyLabError("legacy robustness lineage migration row count mismatch")
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyLedger:
     """Append-only SQLite persistence for strategy-loop identities and outcomes."""
@@ -1121,6 +1220,7 @@ class StrategyLedger:
                             "legacy ledger has duplicate terminal errors for one experiment",
                         )
                 _execute_schema(connection)
+                migrated_robustness_lineage = _migrate_legacy_robustness_lineage(connection)
                 stage_schema = connection.execute(
                     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'",
                 ).fetchone()
@@ -1155,13 +1255,13 @@ class StrategyLedger:
                             BEFORE {action} ON {table}
                             BEGIN SELECT RAISE(ABORT, '{table} records are immutable'); END""",
                         )
-                if migrated_strategies:
+                if migrated_strategies or migrated_robustness_lineage:
                     foreign_key_errors = connection.execute(
                         "PRAGMA foreign_key_check",
                     ).fetchall()
                     if foreign_key_errors:
                         raise StrategyLabError(
-                            f"legacy strategy migration broke foreign keys: {foreign_key_errors!r}",
+                            f"legacy ledger migration broke foreign keys: {foreign_key_errors!r}",
                         )
                 connection.commit()
             except Exception:
@@ -1930,65 +2030,9 @@ class StrategyLedger:
     def record_experiment(
         self, hypothesis_id: str, identity: ExperimentIdentity
     ) -> str:
-        experiment_id = _experiment_id(identity)
-        expected_identity = (
-            identity.strategy_id,
-            identity.data_source_id,
-            identity.policy_id,
-            identity.engine_id,
-            identity.runtime_id,
-        )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
-            hypothesis = connection.execute(
-                """SELECT hypotheses.strategy_id, strategies.identity_schema
-                FROM hypotheses JOIN strategies USING (strategy_id)
-                WHERE hypothesis_id = ?""",
-                (hypothesis_id,),
-            ).fetchone()
-            if hypothesis is None or hypothesis[0] != identity.strategy_id:
-                raise StrategyLabError("experiment hypothesis identity mismatch")
-            source: tuple[str, str, int] | None = None
-            if hypothesis[1] == "strategy-id-v2":
-                if identity.data_as_of_ns is None or identity.data_snapshot_id is None:
-                    raise StrategyLabError("V2 experiment source identity is incomplete")
-                source = (
-                    experiment_id,
-                    _content_id(identity.data_snapshot_id, "data_snapshot_id"),
-                    identity.data_as_of_ns,
-                )
-            elif identity.data_as_of_ns is not None or identity.data_snapshot_id is not None:
-                raise StrategyLabError("legacy experiment cannot add V2 source identity")
-            connection.execute(
-                """INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(experiment_id) DO NOTHING""",
-                (
-                    experiment_id,
-                    _content_id(hypothesis_id, "hypothesis_id"),
-                    *expected_identity,
-                ),
-            )
-            stored = connection.execute(
-                """SELECT strategy_id, data_source_id, policy_id,
-                engine_id, runtime_id FROM experiments WHERE experiment_id = ?""",
-                (experiment_id,),
-            ).fetchone()
-            if stored != expected_identity:
-                raise StrategyLabError("experiment record conflict")
-            if source is not None:
-                connection.execute(
-                    """INSERT INTO experiment_sources VALUES (?, ?, ?)
-                    ON CONFLICT(experiment_id) DO NOTHING""",
-                    source,
-                )
-                stored_source = connection.execute(
-                    """SELECT experiment_id, data_snapshot_id, data_as_of_ns
-                    FROM experiment_sources WHERE experiment_id = ?""",
-                    (experiment_id,),
-                ).fetchone()
-                if stored_source != source:
-                    raise StrategyLabError("experiment source record conflict")
-        return experiment_id
+            return _record_experiment_row(connection, hypothesis_id, identity)
 
     def record_verdict(self, record: VerdictRecord) -> str:
         _verified_artifact(
@@ -2558,6 +2602,8 @@ class StrategyLedger:
         action: dict[str, object],
         *,
         child_hypothesis_payload: bytes | None = None,
+        experiment_hypothesis_id: str | None = None,
+        experiment_identity: ExperimentIdentity | None = None,
     ) -> RobustnessRecord:
         """Publish and read back one immutable robustness evidence chain."""
         loaded_verdict = load_robustness_verdict_v2(_robustness_json(verdict))
@@ -2644,7 +2690,12 @@ class StrategyLedger:
             action_sha256=published["action"][1],
         )
         try:
-            self.record_robustness(record, child_hypothesis=child_hypothesis)
+            self.record_robustness(
+                record,
+                child_hypothesis=child_hypothesis,
+                experiment_hypothesis_id=experiment_hypothesis_id,
+                experiment_identity=experiment_identity,
+            )
         except Exception:
             robustness_id = _robustness_record_id(record)
             with closing(sqlite3.connect(self.path)) as connection:
@@ -2669,8 +2720,12 @@ class StrategyLedger:
         record: RobustnessRecord,
         *,
         child_hypothesis: StrategyHypothesis | None = None,
+        experiment_hypothesis_id: str | None = None,
+        experiment_identity: ExperimentIdentity | None = None,
     ) -> str:
         """Persist a complete robustness/verdict/feedback/action evidence chain."""
+        if (experiment_hypothesis_id is None) != (experiment_identity is None):
+            raise StrategyLabError("robustness experiment identity is incomplete")
         if not record.reason_codes or not all(record.reason_codes):
             raise StrategyLabError("robustness record requires reason codes")
         verdict_payload = _verified_artifact(
@@ -2691,7 +2746,7 @@ class StrategyLedger:
             action = load_action_v1(action_payload)
         except ValueError as error:
             raise StrategyLabError("robustness artifact chain is invalid") from error
-        identity_fields = (
+        record_identity_fields = (
             "experiment_id",
             "strategy_id",
             "evaluation_context_id",
@@ -2699,11 +2754,40 @@ class StrategyLedger:
         )
         if any(
             verdict.get(field) != getattr(record, field)
-            or feedback.get(field) != getattr(record, field)
-            or action.get(field) != getattr(record, field)
-            for field in identity_fields
+            for field in record_identity_fields
+        ) or any(
+            feedback.get(field) != verdict.get(field)
+            or action.get(field) != verdict.get(field)
+            for field in (
+                "candidate_id",
+                "code_commit",
+                "data_as_of_ns",
+                "data_snapshot_id",
+                "data_source_id",
+                "engine_id",
+                "evaluation_context_id",
+                "experiment_id",
+                "hypothesis_id",
+                "policy_id",
+                "runtime_id",
+                "strategy_id",
+            )
         ):
             raise StrategyLabError("robustness artifact identity mismatch")
+        if experiment_identity is not None and (
+            experiment_hypothesis_id != verdict.get("hypothesis_id")
+            or experiment_identity
+            != ExperimentIdentity(
+                str(verdict["strategy_id"]),
+                str(verdict["data_source_id"]),
+                str(verdict["policy_id"]),
+                str(verdict["engine_id"]),
+                str(verdict["runtime_id"]),
+                cast(int, verdict["data_as_of_ns"]),
+                str(verdict["data_snapshot_id"]),
+            )
+        ):
+            raise StrategyLabError("robustness experiment source identity mismatch")
         trial_context = verdict.get("trial_context")
         if not isinstance(trial_context, dict):
             raise StrategyLabError("robustness campaign trial census is missing")
@@ -2734,7 +2818,10 @@ class StrategyLedger:
             or verdict.get("reason_codes") != list(record.reason_codes)
             or feedback.get("reason_codes") != list(record.reason_codes)
             or action.get("reason_codes") != list(record.reason_codes)
+            or feedback.get("action") != verdict.get("action")
+            or feedback.get("status") != verdict.get("status")
             or action.get("action") != verdict.get("action")
+            or action.get("status") != verdict.get("status")
         ):
             raise StrategyLabError("robustness artifact outcome mismatch")
         action_value = action.get("action")
@@ -2782,9 +2869,22 @@ class StrategyLedger:
         )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
+            if experiment_hypothesis_id is not None and experiment_identity is not None:
+                if (
+                    _record_experiment_row(
+                        connection,
+                        experiment_hypothesis_id,
+                        experiment_identity,
+                    )
+                    != record.experiment_id
+                ):
+                    raise StrategyLabError("robustness experiment identity mismatch")
             experiment = connection.execute(
-                """SELECT strategy_id, data_source_id, policy_id, engine_id, runtime_id
-                FROM experiments WHERE experiment_id = ?""",
+                """SELECT experiments.strategy_id, experiments.data_source_id,
+                    experiments.policy_id, experiments.engine_id, experiments.runtime_id,
+                    experiment_sources.data_snapshot_id, experiment_sources.data_as_of_ns
+                FROM experiments JOIN experiment_sources USING (experiment_id)
+                WHERE experiment_id = ?""",
                 (record.experiment_id,),
             ).fetchone()
             if experiment is None or experiment != (
@@ -2793,22 +2893,35 @@ class StrategyLedger:
                 record.policy_id,
                 verdict.get("engine_id"),
                 verdict.get("runtime_id"),
+                verdict.get("data_snapshot_id"),
+                verdict.get("data_as_of_ns"),
             ):
                 raise StrategyLabError("robustness experiment identity does not exist")
             campaign_source = connection.execute(
-                "SELECT data_source_id FROM campaigns WHERE campaign_id = ?",
+                "SELECT data_source_id, data_as_of_ns FROM campaigns WHERE campaign_id = ?",
                 (campaign_id,),
             ).fetchone()
-            if campaign_source is None or campaign_source[0] != verdict.get("data_source_id"):
+            if campaign_source != (
+                verdict.get("data_source_id"),
+                verdict.get("data_as_of_ns"),
+            ):
                 raise StrategyLabError("robustness campaign data source mismatch")
-            survivor = connection.execute(
-                """SELECT COUNT(*) FROM campaign_trials
+            survivor_sources = connection.execute(
+                """SELECT experiment_sources.data_snapshot_id,
+                    experiment_sources.data_as_of_ns
+                FROM campaign_trials
+                JOIN experiment_sources USING (experiment_id)
                 WHERE campaign_id = ? AND strategy_id = ? AND candidate_id = ?
                     AND terminal_status = 'SURVIVED'""",
                 (campaign_id, record.strategy_id, verdict.get("candidate_id")),
-            ).fetchone()
-            if survivor is None or survivor[0] != 1:
+            ).fetchall()
+            if len(survivor_sources) != 1:
                 raise StrategyLabError("robustness survivor candidate identity mismatch")
+            if survivor_sources[0] != (
+                verdict.get("data_snapshot_id"),
+                verdict.get("data_as_of_ns"),
+            ):
+                raise StrategyLabError("robustness survivor source identity mismatch")
             if child_hypothesis is not None:
                 _record_hypothesis_row(connection, child_hypothesis)
             connection.execute(
