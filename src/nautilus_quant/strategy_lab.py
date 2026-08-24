@@ -7,6 +7,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
 from hashlib import sha256
 import json
@@ -63,6 +64,12 @@ from .strategy_families import (
     KERNEL_HASH,
     KERNEL_VERSION,
     FamilyKernelError,
+)
+from .strategy_robustness import (
+    canonical_json as _robustness_json,
+    load_action_v1,
+    load_feedback_v2,
+    load_robustness_verdict_v2,
 )
 
 
@@ -276,6 +283,41 @@ CREATE TABLE IF NOT EXISTS campaign_trials (
     FOREIGN KEY (experiment_id, strategy_id)
         REFERENCES experiments(experiment_id, strategy_id)
 );
+CREATE TABLE IF NOT EXISTS robustness_results (
+    robustness_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    evaluation_context_id TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('PASS', 'FAIL', 'TECHNICAL_INVALID')),
+    technical_status TEXT NOT NULL CHECK (technical_status IN ('PASS', 'ERROR')),
+    economic_status TEXT NOT NULL CHECK (economic_status IN ('PASS', 'FAIL', 'NOT_MODELED')),
+    action TEXT NOT NULL CHECK (action IN ('ADVANCE', 'HOLD', 'MUTATE', 'NEW_FAMILY', 'KILL', 'FIX_TECHNICAL')),
+    reason_codes_json TEXT NOT NULL,
+    verdict_path TEXT NOT NULL,
+    verdict_sha256 TEXT NOT NULL,
+    feedback_path TEXT NOT NULL,
+    feedback_sha256 TEXT NOT NULL,
+    action_path TEXT NOT NULL,
+    action_sha256 TEXT NOT NULL,
+    UNIQUE (experiment_id, evaluation_context_id, policy_id),
+    FOREIGN KEY (experiment_id, strategy_id)
+        REFERENCES experiments(experiment_id, strategy_id)
+);
+CREATE TABLE IF NOT EXISTS robustness_lineage (
+    lineage_id TEXT PRIMARY KEY,
+    robustness_id TEXT NOT NULL UNIQUE,
+    robustness_verdict_id TEXT NOT NULL UNIQUE,
+    action_id TEXT NOT NULL UNIQUE,
+    parent_strategy_id TEXT NOT NULL,
+    child_strategy_id TEXT NOT NULL,
+    child_hypothesis_id TEXT NOT NULL UNIQUE,
+    FOREIGN KEY (robustness_id) REFERENCES robustness_results(robustness_id),
+    FOREIGN KEY (parent_strategy_id) REFERENCES strategies(strategy_id),
+    FOREIGN KEY (child_strategy_id) REFERENCES strategies(strategy_id),
+    FOREIGN KEY (child_hypothesis_id, child_strategy_id)
+        REFERENCES hypotheses(hypothesis_id, strategy_id)
+);
 """
 _IMMUTABLE_TABLES: Final = (
     "strategies",
@@ -288,6 +330,8 @@ _IMMUTABLE_TABLES: Final = (
     "signal_parity_results",
     "campaigns",
     "campaign_trials",
+    "robustness_results",
+    "robustness_lineage",
 )
 
 
@@ -351,6 +395,42 @@ class VerdictRecord:
     reason_code: str
     artifact_path: str
     artifact_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RobustnessRecord:
+    """Immutable ledger projection for one identity-bound robustness verdict."""
+
+    experiment_id: str
+    strategy_id: str
+    evaluation_context_id: str
+    policy_id: str
+    outcome: Literal["PASS", "FAIL", "TECHNICAL_INVALID"]
+    technical_status: Literal["PASS", "ERROR"]
+    economic_status: Literal["PASS", "FAIL", "NOT_MODELED"]
+    reason_codes: tuple[str, ...]
+    verdict_path: str
+    verdict_sha256: str
+    feedback_path: str
+    feedback_sha256: str
+    action_path: str
+    action_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RobustnessSurvivorContext:
+    """Verified persisted Card 2 survivor inputs for one Card 3 experiment."""
+
+    base_identity: ExperimentIdentity
+    historical_experiment_id: str
+    historical_verdict_id: str
+    hypothesis_id: str
+    hypothesis_path: Path
+    strategy_id: str
+    candidate_id: str
+    candidate_path: Path
+    candidate_evaluation_context_id: str
+    code_commit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,6 +760,61 @@ def load_strategy_hypothesis(path: Path) -> StrategyHypothesis:
     return hypothesis
 
 
+def _record_hypothesis_row(
+    connection: sqlite3.Connection,
+    hypothesis: StrategyHypothesis,
+) -> tuple[object, ...]:
+    parameters_json = _canonical_json(hypothesis.parameters.values).decode()
+    expected_strategy = (
+        hypothesis.family_id,
+        hypothesis.family_version,
+        parameters_json,
+        _INSTRUMENT_ID,
+        _BAR_TYPE,
+        hypothesis.identity_schema,
+    )
+    connection.execute(
+        """INSERT INTO strategies (
+            strategy_id, family, family_version, parameters_json,
+            instrument_id, bar_type, identity_schema
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(strategy_id) DO NOTHING""",
+        (hypothesis.strategy_id, *expected_strategy),
+    )
+    stored_strategy = connection.execute(
+        """SELECT family, family_version, parameters_json,
+        instrument_id, bar_type, identity_schema
+        FROM strategies WHERE strategy_id = ?""",
+        (hypothesis.strategy_id,),
+    ).fetchone()
+    if stored_strategy != expected_strategy:
+        raise StrategyLabError("strategy record conflict")
+    connection.execute(
+        """INSERT INTO hypotheses VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(hypothesis_id) DO NOTHING""",
+        (
+            hypothesis.hypothesis_id,
+            hypothesis.strategy_id,
+            hypothesis.parent_strategy_id,
+            hypothesis.based_on_verdict_id,
+            str(hypothesis.source_path),
+            hypothesis.hypothesis_id,
+        ),
+    )
+    stored = connection.execute(
+        """SELECT strategy_id, parent_strategy_id, based_on_verdict_id,
+        artifact_path, artifact_sha256 FROM hypotheses WHERE hypothesis_id = ?""",
+        (hypothesis.hypothesis_id,),
+    ).fetchone()
+    if stored is None or stored[:3] != (
+        hypothesis.strategy_id,
+        hypothesis.parent_strategy_id,
+        hypothesis.based_on_verdict_id,
+    ):
+        raise StrategyLabError("hypothesis record conflict")
+    return stored
+
+
 def _content_id(value: str, field: str) -> str:
     if _SHA256.fullmatch(value) is None:
         raise StrategyLabError(f"{field} must be lowercase SHA-256")
@@ -718,6 +853,43 @@ def _experiment_id(identity: ExperimentIdentity) -> str:
     return sha256(_canonical_json(values)).hexdigest()
 
 
+def experiment_id(identity: ExperimentIdentity) -> str:
+    """Return the public deterministic experiment identity."""
+    return _experiment_id(identity)
+
+
+def robustness_experiment_identity(
+    base: ExperimentIdentity,
+    policy_id: str,
+    evaluation_context_id: str,
+) -> ExperimentIdentity:
+    """Derive a non-reusable experiment whenever policy or matrix context changes."""
+    policy_id = _content_id(policy_id, "policy_id")
+    evaluation_context_id = _content_id(
+        evaluation_context_id,
+        "evaluation_context_id",
+    )
+    engine_id = sha256(
+        _canonical_json(
+            {
+                "base_engine_id": _identifier(base.engine_id, "engine_id"),
+                "evaluation_context_id": evaluation_context_id,
+                "policy_id": policy_id,
+                "schema_version": "robustness-experiment-engine-v1",
+            },
+        ),
+    ).hexdigest()
+    return ExperimentIdentity(
+        base.strategy_id,
+        base.data_source_id,
+        policy_id,
+        engine_id,
+        base.runtime_id,
+        base.data_as_of_ns,
+        base.data_snapshot_id,
+    )
+
+
 def _verdict_record_id(record: VerdictRecord) -> str:
     return sha256(
         _canonical_json(
@@ -730,6 +902,58 @@ def _verdict_record_id(record: VerdictRecord) -> str:
                 "experiment_id": _content_id(record.experiment_id, "experiment_id"),
                 "outcome": record.outcome,
                 "reason_code": _identifier(record.reason_code, "reason_code"),
+            },
+        ),
+    ).hexdigest()
+
+
+def _robustness_record_id(record: RobustnessRecord) -> str:
+    return sha256(
+        _canonical_json(
+            {
+                "action_sha256": _content_id(record.action_sha256, "action_sha256"),
+                "action_path": _identifier(record.action_path, "action_path"),
+                "economic_status": record.economic_status,
+                "evaluation_context_id": _content_id(
+                    record.evaluation_context_id,
+                    "evaluation_context_id",
+                ),
+                "experiment_id": _content_id(record.experiment_id, "experiment_id"),
+                "feedback_sha256": _content_id(record.feedback_sha256, "feedback_sha256"),
+                "feedback_path": _identifier(record.feedback_path, "feedback_path"),
+                "outcome": record.outcome,
+                "policy_id": _content_id(record.policy_id, "policy_id"),
+                "reason_codes": list(record.reason_codes),
+                "schema_version": "strategy-robustness-ledger-record-v1",
+                "strategy_id": _content_id(record.strategy_id, "strategy_id"),
+                "technical_status": record.technical_status,
+                "verdict_sha256": _content_id(record.verdict_sha256, "verdict_sha256"),
+                "verdict_path": _identifier(record.verdict_path, "verdict_path"),
+            },
+        ),
+    ).hexdigest()
+
+
+def _robustness_lineage_id(
+    robustness_verdict_id: str,
+    action_id: str,
+    child_hypothesis: StrategyHypothesis,
+) -> str:
+    return sha256(
+        _canonical_json(
+            {
+                "action_id": _content_id(action_id, "action_id"),
+                "child_hypothesis_id": child_hypothesis.hypothesis_id,
+                "child_strategy_id": child_hypothesis.strategy_id,
+                "parent_strategy_id": _content_id(
+                    child_hypothesis.parent_strategy_id or "",
+                    "parent_strategy_id",
+                ),
+                "robustness_verdict_id": _content_id(
+                    robustness_verdict_id,
+                    "robustness_verdict_id",
+                ),
+                "schema_version": "robustness-lineage-v1",
             },
         ),
     ).hexdigest()
@@ -947,59 +1171,9 @@ class StrategyLedger:
 
     def record_hypothesis(self, hypothesis: StrategyHypothesis) -> None:
         _verified_artifact(hypothesis.source_path, hypothesis.hypothesis_id)
-        parameters_json = _canonical_json(hypothesis.parameters.values).decode()
-        expected_strategy = (
-            hypothesis.family_id,
-            hypothesis.family_version,
-            parameters_json,
-            _INSTRUMENT_ID,
-            _BAR_TYPE,
-            hypothesis.identity_schema,
-        )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(
-                """INSERT INTO strategies (
-                    strategy_id, family, family_version, parameters_json,
-                    instrument_id, bar_type, identity_schema
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(strategy_id) DO NOTHING""",
-                (
-                    hypothesis.strategy_id,
-                    *expected_strategy,
-                ),
-            )
-            stored_strategy = connection.execute(
-                """SELECT family, family_version, parameters_json,
-                instrument_id, bar_type, identity_schema
-                FROM strategies WHERE strategy_id = ?""",
-                (hypothesis.strategy_id,),
-            ).fetchone()
-            if stored_strategy != expected_strategy:
-                raise StrategyLabError("strategy record conflict")
-            connection.execute(
-                """INSERT INTO hypotheses VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(hypothesis_id) DO NOTHING""",
-                (
-                    hypothesis.hypothesis_id,
-                    hypothesis.strategy_id,
-                    hypothesis.parent_strategy_id,
-                    hypothesis.based_on_verdict_id,
-                    str(hypothesis.source_path),
-                    hypothesis.hypothesis_id,
-                ),
-            )
-            stored = connection.execute(
-                """SELECT strategy_id, parent_strategy_id, based_on_verdict_id,
-                artifact_path, artifact_sha256 FROM hypotheses WHERE hypothesis_id = ?""",
-                (hypothesis.hypothesis_id,),
-            ).fetchone()
-        if stored is None or stored[:3] != (
-            hypothesis.strategy_id,
-            hypothesis.parent_strategy_id,
-            hypothesis.based_on_verdict_id,
-        ):
-            raise StrategyLabError("hypothesis record conflict")
+            stored = _record_hypothesis_row(connection, hypothesis)
         _verified_artifact(Path(stored[3]), stored[4])
 
     def record_campaign(self, spec: CampaignSpec, preflight: CampaignPreflight) -> None:
@@ -2052,6 +2226,713 @@ class StrategyLedger:
             raise StrategyLabError("Nautilus verdict code commit is inconsistent")
         return document
 
+    def robustness_trial_context(self, campaign_id: str) -> dict[str, object]:
+        """Derive the exact terminal Card 2 census from immutable ledger rows."""
+        campaign_id = _content_id(campaign_id, "campaign_id")
+        with closing(sqlite3.connect(self.path)) as connection:
+            campaign = connection.execute(
+                """SELECT document_json, screen_policy_id, data_as_of_ns, data_source_id
+                FROM campaigns WHERE campaign_id = ?""",
+                (campaign_id,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT ordinal, strategy_id, candidate_id, terminal_status,
+                execution_started, experiment_id, reason_codes_json
+                FROM campaign_trials WHERE campaign_id = ? ORDER BY ordinal""",
+                (campaign_id,),
+            ).fetchall()
+        if campaign is None:
+            raise StrategyLabError("robustness campaign does not exist")
+        try:
+            document = json.loads(
+                str(campaign[0]),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except (json.JSONDecodeError, StrategyLabError) as error:
+            raise StrategyLabError("robustness campaign document is invalid") from error
+        required = {
+            "approved_bar_types",
+            "approved_instruments",
+            "data_as_of_ns",
+            "family_id",
+            "family_version",
+            "generation_budget",
+            "maximum_candidates",
+            "parameter_search_policy_id",
+            "schema_version",
+            "screen_policy_id",
+            "search_space",
+            "seed",
+        }
+        if (
+            not isinstance(document, dict)
+            or set(document) != required
+            or document.get("schema_version") != "strategy-campaign-v1"
+            or _canonical_json(document).decode() != campaign[0]
+            or sha256(_canonical_json(document)).hexdigest() != campaign_id
+            or document.get("screen_policy_id") != campaign[1]
+            or document.get("data_as_of_ns") != campaign[2]
+        ):
+            raise StrategyLabError("robustness campaign identity is invalid")
+        _content_id(str(campaign[1]), "screen_policy_id")
+        _content_id(str(campaign[3]), "data_source_id")
+        parameter_policy_id = _content_id(
+            str(document["parameter_search_policy_id"]),
+            "parameter_search_policy_id",
+        )
+        search_space = document["search_space"]
+        if (
+            not isinstance(search_space, dict)
+            or not search_space
+            or any(
+                not isinstance(name, str)
+                or not name
+                or not isinstance(values, list)
+                or not values
+                for name, values in search_space.items()
+            )
+        ):
+            raise StrategyLabError("robustness campaign search space is invalid")
+        generation_budget = document["generation_budget"]
+        maximum_candidates = document["maximum_candidates"]
+        data_as_of_ns = document["data_as_of_ns"]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (generation_budget, maximum_candidates, data_as_of_ns)
+        ):
+            raise StrategyLabError("robustness campaign bounds are invalid")
+        generated_count = math.prod(len(values) for values in search_space.values())
+        if generated_count > min(generation_budget, maximum_candidates):
+            raise StrategyLabError("robustness campaign exceeds its generation budget")
+        if len(rows) != generated_count or [row[0] for row in rows] != list(range(generated_count)):
+            raise StrategyLabError("robustness campaign trial census is incomplete")
+        statuses = {status.value: 0 for status in TerminalStatus}
+        trial_documents: list[dict[str, object]] = []
+        executed_count = 0
+        strategy_ids: set[str] = set()
+        for row in rows:
+            try:
+                status = TerminalStatus(str(row[3]))
+                reasons = json.loads(str(row[6]), object_pairs_hook=_unique_object)
+            except (ValueError, json.JSONDecodeError, StrategyLabError) as error:
+                raise StrategyLabError("robustness campaign trial census is invalid") from error
+            if (
+                not isinstance(reasons, list)
+                or not reasons
+                or not all(isinstance(reason, str) and reason for reason in reasons)
+                or _canonical_json(reasons).decode() != row[6]
+                or row[4] not in (0, 1)
+            ):
+                raise StrategyLabError("robustness campaign trial census is invalid")
+            for value, field in (
+                (row[1], "strategy_id"),
+                (row[2], "candidate_id"),
+                (row[5], "experiment_id"),
+            ):
+                if value is not None:
+                    _content_id(str(value), field)
+            if row[4] and row[5] is None:
+                raise StrategyLabError("robustness campaign trial census is invalid")
+            if status in {TerminalStatus.SCREEN_REJECTED, TerminalStatus.SURVIVED} and (
+                row[1] is None or row[2] is None or row[5] is None or not row[4]
+            ):
+                raise StrategyLabError("robustness campaign trial census is invalid")
+            statuses[status.value] += 1
+            executed_count += int(row[4])
+            if row[1] is not None:
+                strategy_ids.add(str(row[1]))
+            trial_documents.append(
+                {
+                    "candidate_id": row[2],
+                    "execution_started": bool(row[4]),
+                    "experiment_id": row[5],
+                    "ordinal": row[0],
+                    "reason_codes": reasons,
+                    "strategy_id": row[1],
+                    "terminal_status": status.value,
+                },
+            )
+        cohort_id = sha256(
+            _canonical_json(
+                {
+                    "campaign_id": campaign_id,
+                    "data_as_of_ns": data_as_of_ns,
+                    "data_source_id": str(campaign[3]),
+                    "schema_version": "strategy-cohort-identity-v1",
+                    "screen_policy_id": str(campaign[1]),
+                },
+            ),
+        ).hexdigest()
+        trial_census_id = sha256(
+            _canonical_json(
+                {
+                    "campaign_id": campaign_id,
+                    "schema_version": "strategy-trial-census-v1",
+                    "trials": trial_documents,
+                },
+            ),
+        ).hexdigest()
+        return {
+            "campaign_id": campaign_id,
+            "candidate_count": len(strategy_ids),
+            "cohort_id": cohort_id,
+            "data_as_of_ns": data_as_of_ns,
+            "deduped_count": statuses[TerminalStatus.DUPLICATE_SUPPRESSED.value],
+            "executed_count": executed_count,
+            "family_count": 1,
+            "family_id": document["family_id"],
+            "family_version": document["family_version"],
+            "generated_count": generated_count,
+            "generation_budget": min(generation_budget, maximum_candidates),
+            "maximum_candidates": maximum_candidates,
+            "parameter_search_policy_id": parameter_policy_id,
+            "rejected_count": statuses[TerminalStatus.SCREEN_REJECTED.value],
+            "search_space": search_space,
+            "surviving_count": statuses[TerminalStatus.SURVIVED.value],
+            "technical_invalid_count": statuses[TerminalStatus.TECHNICAL_INVALID.value],
+            "terminal_census_complete": True,
+            "trial_census_id": trial_census_id,
+        }
+
+    def robustness_survivor_context(
+        self,
+        campaign_id: str,
+        candidate_id: str | None = None,
+    ) -> RobustnessSurvivorContext:
+        """Resolve one immutable, source-bound Card 2 survivor for Card 3."""
+        campaign_id = _content_id(campaign_id, "campaign_id")
+        self.robustness_trial_context(campaign_id)
+        if candidate_id is not None:
+            candidate_id = _content_id(candidate_id, "candidate_id")
+        parameters: tuple[str, ...] = (campaign_id,)
+        candidate_predicate = ""
+        if candidate_id is not None:
+            candidate_predicate = " AND campaign_trials.candidate_id = ?"
+            parameters += (candidate_id,)
+        with closing(sqlite3.connect(self.path)) as connection:
+            rows = connection.execute(
+                """SELECT campaign_trials.strategy_id, campaign_trials.candidate_id,
+                campaign_trials.experiment_id, experiments.hypothesis_id,
+                experiments.data_source_id, experiments.policy_id,
+                experiments.engine_id, experiments.runtime_id,
+                experiment_sources.data_snapshot_id, experiment_sources.data_as_of_ns,
+                pybroker.artifact_path, parity.evaluation_context_id,
+                parity.data_snapshot_id, parity.outcome, parity.required_action,
+                verdicts.verdict_id, verdicts.outcome, verdicts.reason_code, verdicts.artifact_path,
+                verdicts.artifact_sha256, hypotheses.artifact_path,
+                hypotheses.artifact_sha256, campaigns.data_source_id,
+                campaigns.data_as_of_ns
+                FROM campaign_trials
+                JOIN campaigns USING (campaign_id)
+                JOIN experiments USING (experiment_id, strategy_id)
+                JOIN experiment_sources USING (experiment_id)
+                JOIN hypotheses USING (hypothesis_id, strategy_id)
+                JOIN stage_results AS pybroker ON
+                    pybroker.experiment_id = experiments.experiment_id
+                    AND pybroker.stage = 'PyBroker completed'
+                    AND pybroker.outcome = 'PASSED'
+                JOIN signal_parity_results AS parity ON
+                    parity.experiment_id = experiments.experiment_id
+                    AND parity.candidate_id = campaign_trials.candidate_id
+                JOIN verdicts ON verdicts.experiment_id = experiments.experiment_id
+                    AND verdicts.strategy_id = experiments.strategy_id
+                WHERE campaign_trials.campaign_id = ?
+                    AND campaign_trials.terminal_status = 'SURVIVED'"""
+                + candidate_predicate
+                + " ORDER BY campaign_trials.ordinal",
+                parameters,
+            ).fetchall()
+        if not rows:
+            raise StrategyLabError("robustness campaign has no matching persisted survivor")
+        if len(rows) != 1:
+            raise StrategyLabError("robustness campaign survivor is ambiguous; select candidate_id")
+        row = rows[0]
+        (
+            strategy_id,
+            stored_candidate_id,
+            historical_experiment_id,
+            hypothesis_id,
+            data_source_id,
+            historical_policy_id,
+            historical_engine_id,
+            runtime_id,
+            data_snapshot_id,
+            data_as_of_ns,
+            pybroker_path,
+            evaluation_context_id,
+            parity_snapshot_id,
+            parity_outcome,
+            parity_action,
+            historical_verdict_id,
+            historical_outcome,
+            historical_reason,
+            historical_path,
+            historical_sha256,
+            hypothesis_path,
+            hypothesis_sha256,
+            campaign_source_id,
+            campaign_as_of_ns,
+        ) = row
+        for value, field in (
+            (strategy_id, "strategy_id"),
+            (stored_candidate_id, "candidate_id"),
+            (historical_experiment_id, "experiment_id"),
+            (historical_verdict_id, "verdict_id"),
+            (hypothesis_id, "hypothesis_id"),
+            (data_source_id, "data_source_id"),
+            (historical_policy_id, "policy_id"),
+            (runtime_id, "runtime_id"),
+            (data_snapshot_id, "data_snapshot_id"),
+            (evaluation_context_id, "evaluation_context_id"),
+        ):
+            _content_id(str(value), field)
+        if (
+            parity_snapshot_id != data_snapshot_id
+            or parity_outcome != "PASS"
+            or parity_action is not None
+            or historical_outcome != "SUCCESS"
+            or campaign_source_id != data_source_id
+            or campaign_as_of_ns != data_as_of_ns
+        ):
+            raise StrategyLabError("persisted robustness survivor chain is incomplete")
+        candidate_path = Path(str(pybroker_path)).with_name("candidate.json")
+        _verified_artifact(Path(str(hypothesis_path)), str(hypothesis_sha256))
+        _verified_artifact(candidate_path, str(stored_candidate_id))
+        try:
+            candidate, loaded_candidate_id = load_pybroker_candidate(candidate_path)
+            historical_document = load_candidate_backtest_verdict(
+                _verified_artifact(Path(str(historical_path)), str(historical_sha256)),
+            )
+        except (CandidateBacktestError, OSError, TypeError, ValueError) as error:
+            raise StrategyLabError("persisted robustness survivor artifact is invalid") from error
+        source = candidate.get("source")
+        historical_source = historical_document.get("source")
+        code_commit = historical_document.get("code_commit")
+        if (
+            loaded_candidate_id != stored_candidate_id
+            or candidate.get("evaluation_context_id") != evaluation_context_id
+            or not isinstance(source, dict)
+            or source.get("data_snapshot_id") != data_snapshot_id
+            or source.get("data_as_of_ns") != data_as_of_ns
+            or historical_document.get("candidate_id") != stored_candidate_id
+            or historical_document.get("experiment_id") != historical_experiment_id
+            or historical_document.get("hypothesis_id") != hypothesis_id
+            or historical_document.get("strategy_id") != strategy_id
+            or historical_reason not in historical_document.get("reason_codes", [historical_reason])
+            or not isinstance(historical_source, dict)
+            or historical_source.get("sha256") != data_snapshot_id
+            or not isinstance(code_commit, str)
+            or not code_commit
+        ):
+            raise StrategyLabError("persisted robustness survivor identity is inconsistent")
+        base_identity = ExperimentIdentity(
+            str(strategy_id),
+            str(data_source_id),
+            str(historical_policy_id),
+            str(historical_engine_id),
+            str(runtime_id),
+            int(data_as_of_ns),
+            str(data_snapshot_id),
+        )
+        if _experiment_id(base_identity) != historical_experiment_id:
+            raise StrategyLabError("persisted robustness survivor experiment identity is inconsistent")
+        return RobustnessSurvivorContext(
+            base_identity=base_identity,
+            historical_experiment_id=str(historical_experiment_id),
+            historical_verdict_id=str(historical_verdict_id),
+            hypothesis_id=str(hypothesis_id),
+            hypothesis_path=Path(str(hypothesis_path)),
+            strategy_id=str(strategy_id),
+            candidate_id=str(stored_candidate_id),
+            candidate_path=candidate_path,
+            candidate_evaluation_context_id=str(evaluation_context_id),
+            code_commit=code_commit,
+        )
+
+    def publish_robustness(
+        self,
+        directory: Path,
+        verdict: dict[str, object],
+        feedback: dict[str, object],
+        action: dict[str, object],
+        *,
+        child_hypothesis_payload: bytes | None = None,
+    ) -> RobustnessRecord:
+        """Publish and read back one immutable robustness evidence chain."""
+        loaded_verdict = load_robustness_verdict_v2(_robustness_json(verdict))
+        loaded_feedback = load_feedback_v2(_robustness_json(feedback))
+        loaded_action = load_action_v1(_robustness_json(action))
+        verdict_id = str(loaded_verdict["robustness_verdict_id"])
+        if (
+            loaded_feedback.get("robustness_verdict_id") != verdict_id
+            or loaded_action.get("robustness_verdict_id") != verdict_id
+        ):
+            raise StrategyLabError("robustness artifact lineage mismatch")
+        mutation = loaded_action.get("action") in {"MUTATE", "NEW_FAMILY"}
+        if mutation and child_hypothesis_payload is None:
+            raise StrategyLabError("mutation child hypothesis artifact is missing")
+        if not mutation and child_hypothesis_payload is not None:
+            raise StrategyLabError("non-mutation robustness cannot publish a child hypothesis")
+        artifact_directory = Path(directory).resolve() / verdict_id
+        created_paths: list[Path] = []
+
+        def publish(path: Path, payload: bytes) -> str:
+            existed = path.exists()
+            try:
+                return _atomic_publish(path, payload)
+            finally:
+                if not existed and path.exists():
+                    created_paths.append(path)
+
+        def cleanup_created() -> None:
+            for path in reversed(created_paths):
+                path.unlink(missing_ok=True)
+            try:
+                artifact_directory.rmdir()
+            except OSError:
+                pass
+
+        child_hypothesis: StrategyHypothesis | None = None
+        try:
+            if child_hypothesis_payload is not None:
+                child_hypothesis_id = loaded_action.get("child_hypothesis_id")
+                if not isinstance(child_hypothesis_id, str):
+                    raise StrategyLabError("mutation child hypothesis identity is missing")
+                child_hypothesis_path = (
+                    artifact_directory / f"hypothesis-{child_hypothesis_id}.json"
+                )
+                if publish(child_hypothesis_path, child_hypothesis_payload) != child_hypothesis_id:
+                    raise StrategyLabError("mutation child hypothesis artifact hash mismatch")
+                child_hypothesis = load_strategy_hypothesis(child_hypothesis_path)
+                if child_hypothesis.hypothesis_id != child_hypothesis_id:
+                    raise StrategyLabError("mutation child hypothesis readback mismatch")
+            documents = {
+                "verdict": (loaded_verdict, artifact_directory / "nautilus-verdict-v2.json"),
+                "feedback": (loaded_feedback, artifact_directory / "strategy-feedback-v2.json"),
+                "action": (loaded_action, artifact_directory / "strategy-action-v1.json"),
+            }
+            published = {
+                name: (path, publish(path, _robustness_json(document)))
+                for name, (document, path) in documents.items()
+            }
+        except Exception:
+            cleanup_created()
+            raise
+        technical_status = str(loaded_verdict["technical_status"])
+        economic_status = str(loaded_verdict["economic_status"])
+        record = RobustnessRecord(
+            experiment_id=str(loaded_verdict["experiment_id"]),
+            strategy_id=str(loaded_verdict["strategy_id"]),
+            evaluation_context_id=str(loaded_verdict["evaluation_context_id"]),
+            policy_id=str(loaded_verdict["policy_id"]),
+            outcome=(
+                "TECHNICAL_INVALID"
+                if technical_status == "ERROR"
+                else "FAIL"
+                if economic_status == "FAIL"
+                else "PASS"
+            ),
+            technical_status=technical_status,
+            economic_status=economic_status,
+            reason_codes=tuple(str(reason) for reason in loaded_verdict["reason_codes"]),
+            verdict_path=str(published["verdict"][0]),
+            verdict_sha256=published["verdict"][1],
+            feedback_path=str(published["feedback"][0]),
+            feedback_sha256=published["feedback"][1],
+            action_path=str(published["action"][0]),
+            action_sha256=published["action"][1],
+        )
+        try:
+            self.record_robustness(record, child_hypothesis=child_hypothesis)
+        except Exception:
+            robustness_id = _robustness_record_id(record)
+            with closing(sqlite3.connect(self.path)) as connection:
+                committed = connection.execute(
+                    "SELECT 1 FROM robustness_results WHERE robustness_id = ?",
+                    (robustness_id,),
+                ).fetchone()
+            if committed is None:
+                cleanup_created()
+            raise
+        stored = self.existing_robustness(
+            record.experiment_id,
+            record.evaluation_context_id,
+            record.policy_id,
+        )
+        if stored != record:
+            raise StrategyLabError("robustness publish readback mismatch")
+        return record
+
+    def record_robustness(
+        self,
+        record: RobustnessRecord,
+        *,
+        child_hypothesis: StrategyHypothesis | None = None,
+    ) -> str:
+        """Persist a complete robustness/verdict/feedback/action evidence chain."""
+        if not record.reason_codes or not all(record.reason_codes):
+            raise StrategyLabError("robustness record requires reason codes")
+        verdict_payload = _verified_artifact(
+            Path(_identifier(record.verdict_path, "verdict_path")),
+            _content_id(record.verdict_sha256, "verdict_sha256"),
+        )
+        feedback_payload = _verified_artifact(
+            Path(_identifier(record.feedback_path, "feedback_path")),
+            _content_id(record.feedback_sha256, "feedback_sha256"),
+        )
+        action_payload = _verified_artifact(
+            Path(_identifier(record.action_path, "action_path")),
+            _content_id(record.action_sha256, "action_sha256"),
+        )
+        try:
+            verdict = load_robustness_verdict_v2(verdict_payload)
+            feedback = load_feedback_v2(feedback_payload)
+            action = load_action_v1(action_payload)
+        except ValueError as error:
+            raise StrategyLabError("robustness artifact chain is invalid") from error
+        identity_fields = (
+            "experiment_id",
+            "strategy_id",
+            "evaluation_context_id",
+            "policy_id",
+        )
+        if any(
+            verdict.get(field) != getattr(record, field)
+            or feedback.get(field) != getattr(record, field)
+            or action.get(field) != getattr(record, field)
+            for field in identity_fields
+        ):
+            raise StrategyLabError("robustness artifact identity mismatch")
+        trial_context = verdict.get("trial_context")
+        if not isinstance(trial_context, dict):
+            raise StrategyLabError("robustness campaign trial census is missing")
+        campaign_id = trial_context.get("campaign_id")
+        if not isinstance(campaign_id, str):
+            raise StrategyLabError("robustness campaign trial census is missing")
+        if trial_context != self.robustness_trial_context(campaign_id):
+            raise StrategyLabError("robustness campaign trial census mismatch")
+        verdict_id = verdict.get("robustness_verdict_id")
+        if (
+            feedback.get("robustness_verdict_id") != verdict_id
+            or action.get("robustness_verdict_id") != verdict_id
+            or action.get("source_verdict_id") != verdict_id
+            or action.get("campaign_id") != campaign_id
+        ):
+            raise StrategyLabError("robustness artifact lineage mismatch")
+        expected_outcome = (
+            "TECHNICAL_INVALID"
+            if record.technical_status == "ERROR"
+            else "FAIL"
+            if record.economic_status == "FAIL"
+            else "PASS"
+        )
+        if (
+            record.outcome != expected_outcome
+            or verdict.get("technical_status") != record.technical_status
+            or verdict.get("economic_status") != record.economic_status
+            or verdict.get("reason_codes") != list(record.reason_codes)
+            or feedback.get("reason_codes") != list(record.reason_codes)
+            or action.get("reason_codes") != list(record.reason_codes)
+            or action.get("action") != verdict.get("action")
+        ):
+            raise StrategyLabError("robustness artifact outcome mismatch")
+        action_value = action.get("action")
+        if action_value not in {"ADVANCE", "HOLD", "MUTATE", "NEW_FAMILY", "KILL", "FIX_TECHNICAL"}:
+            raise StrategyLabError("robustness action is invalid")
+        mutation = action_value in {"MUTATE", "NEW_FAMILY"}
+        if mutation:
+            if child_hypothesis is None:
+                raise StrategyLabError("mutation child hypothesis is missing")
+            _verified_artifact(
+                child_hypothesis.source_path,
+                child_hypothesis.hypothesis_id,
+            )
+            if (
+                action.get("child_hypothesis_id") != child_hypothesis.hypothesis_id
+                or action.get("child_strategy_id") != child_hypothesis.strategy_id
+                or child_hypothesis.parent_strategy_id != record.strategy_id
+                or child_hypothesis.based_on_verdict_id is None
+            ):
+                raise StrategyLabError("mutation child hypothesis lineage mismatch")
+        elif child_hypothesis is not None:
+            raise StrategyLabError("non-mutation robustness cannot record a child hypothesis")
+        robustness_id = _robustness_record_id(record)
+        lineage_id = (
+            _robustness_lineage_id(str(verdict_id), str(action["action_id"]), child_hypothesis)
+            if child_hypothesis is not None
+            else None
+        )
+        expected = (
+            record.experiment_id,
+            record.strategy_id,
+            record.evaluation_context_id,
+            record.policy_id,
+            record.outcome,
+            record.technical_status,
+            record.economic_status,
+            action_value,
+            _canonical_json(list(record.reason_codes)).decode(),
+            record.verdict_path,
+            record.verdict_sha256,
+            record.feedback_path,
+            record.feedback_sha256,
+            record.action_path,
+            record.action_sha256,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            experiment = connection.execute(
+                """SELECT strategy_id, data_source_id, policy_id, engine_id, runtime_id
+                FROM experiments WHERE experiment_id = ?""",
+                (record.experiment_id,),
+            ).fetchone()
+            if experiment is None or experiment != (
+                record.strategy_id,
+                verdict.get("data_source_id"),
+                record.policy_id,
+                verdict.get("engine_id"),
+                verdict.get("runtime_id"),
+            ):
+                raise StrategyLabError("robustness experiment identity does not exist")
+            campaign_source = connection.execute(
+                "SELECT data_source_id FROM campaigns WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+            if campaign_source is None or campaign_source[0] != verdict.get("data_source_id"):
+                raise StrategyLabError("robustness campaign data source mismatch")
+            survivor = connection.execute(
+                """SELECT COUNT(*) FROM campaign_trials
+                WHERE campaign_id = ? AND strategy_id = ? AND candidate_id = ?
+                    AND terminal_status = 'SURVIVED'""",
+                (campaign_id, record.strategy_id, verdict.get("candidate_id")),
+            ).fetchone()
+            if survivor is None or survivor[0] != 1:
+                raise StrategyLabError("robustness survivor candidate identity mismatch")
+            if child_hypothesis is not None:
+                _record_hypothesis_row(connection, child_hypothesis)
+            connection.execute(
+                """INSERT INTO robustness_results VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ) ON CONFLICT(robustness_id) DO NOTHING""",
+                (
+                    robustness_id,
+                    record.experiment_id,
+                    record.strategy_id,
+                    record.evaluation_context_id,
+                    record.policy_id,
+                    record.outcome,
+                    record.technical_status,
+                    record.economic_status,
+                    action_value,
+                    _canonical_json(list(record.reason_codes)).decode(),
+                    record.verdict_path,
+                    record.verdict_sha256,
+                    record.feedback_path,
+                    record.feedback_sha256,
+                    record.action_path,
+                    record.action_sha256,
+                ),
+            )
+            stored = connection.execute(
+                """SELECT experiment_id, strategy_id, evaluation_context_id,
+                policy_id, outcome, technical_status, economic_status, action,
+                reason_codes_json, verdict_path, verdict_sha256, feedback_path,
+                feedback_sha256, action_path, action_sha256
+                FROM robustness_results WHERE robustness_id = ?""",
+                (robustness_id,),
+            ).fetchone()
+            if stored != expected:
+                raise StrategyLabError("robustness record conflict")
+            if child_hypothesis is not None and lineage_id is not None:
+                lineage = (
+                    robustness_id,
+                    str(verdict_id),
+                    str(action["action_id"]),
+                    record.strategy_id,
+                    child_hypothesis.strategy_id,
+                    child_hypothesis.hypothesis_id,
+                )
+                connection.execute(
+                    """INSERT INTO robustness_lineage VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(lineage_id) DO NOTHING""",
+                    (lineage_id, *lineage),
+                )
+                stored_lineage = connection.execute(
+                    """SELECT robustness_id, robustness_verdict_id, action_id,
+                    parent_strategy_id, child_strategy_id, child_hypothesis_id
+                    FROM robustness_lineage WHERE lineage_id = ?""",
+                    (lineage_id,),
+                ).fetchone()
+                if stored_lineage != lineage:
+                    raise StrategyLabError("robustness lineage record conflict")
+        if child_hypothesis is not None:
+            _verified_artifact(
+                child_hypothesis.source_path,
+                child_hypothesis.hypothesis_id,
+            )
+        return robustness_id
+
+    def existing_robustness(
+        self,
+        experiment_id: str,
+        evaluation_context_id: str,
+        policy_id: str,
+    ) -> RobustnessRecord | None:
+        """Read back one robustness result only after its full artifact chain verifies."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute(
+                """SELECT experiment_id, strategy_id, evaluation_context_id,
+                policy_id, outcome, technical_status, economic_status, action,
+                reason_codes_json, verdict_path, verdict_sha256, feedback_path,
+                feedback_sha256, action_path, action_sha256
+                FROM robustness_results
+                WHERE experiment_id = ? AND evaluation_context_id = ? AND policy_id = ?""",
+                (experiment_id, evaluation_context_id, policy_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            reasons = json.loads(row[8])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StrategyLabError("stored robustness reasons are invalid") from error
+        if not isinstance(reasons, list) or not all(isinstance(reason, str) and reason for reason in reasons):
+            raise StrategyLabError("stored robustness reasons are invalid")
+        record = RobustnessRecord(
+            experiment_id=str(row[0]),
+            strategy_id=str(row[1]),
+            evaluation_context_id=str(row[2]),
+            policy_id=str(row[3]),
+            outcome=row[4],
+            technical_status=row[5],
+            economic_status=row[6],
+            reason_codes=tuple(reasons),
+            verdict_path=str(row[9]),
+            verdict_sha256=str(row[10]),
+            feedback_path=str(row[11]),
+            feedback_sha256=str(row[12]),
+            action_path=str(row[13]),
+            action_sha256=str(row[14]),
+        )
+        child_hypothesis: StrategyHypothesis | None = None
+        if row[7] in {"MUTATE", "NEW_FAMILY"}:
+            robustness_id = _robustness_record_id(record)
+            with closing(sqlite3.connect(self.path)) as connection:
+                lineage = connection.execute(
+                    """SELECT hypotheses.artifact_path
+                    FROM robustness_lineage
+                    JOIN hypotheses ON
+                        hypotheses.hypothesis_id = robustness_lineage.child_hypothesis_id
+                        AND hypotheses.strategy_id = robustness_lineage.child_strategy_id
+                    WHERE robustness_lineage.robustness_id = ?""",
+                    (robustness_id,),
+                ).fetchone()
+            if lineage is None:
+                raise StrategyLabError("stored mutation robustness lineage is incomplete")
+            child_hypothesis = load_strategy_hypothesis(Path(str(lineage[0])))
+        self.record_robustness(record, child_hypothesis=child_hypothesis)
+        return record
+
     def record_error(self, record: ErrorRecord) -> str:
         _verified_artifact(
             Path(_identifier(record.artifact_path, "artifact_path")),
@@ -2215,11 +3096,54 @@ class StrategyLedger:
                 WHERE experiment_id = ?
                 UNION ALL
                 SELECT artifact_path, artifact_sha256 FROM errors
+                WHERE experiment_id = ?
+                UNION ALL
+                SELECT verdict_path, verdict_sha256 FROM robustness_results
+                WHERE experiment_id = ?
+                UNION ALL
+                SELECT feedback_path, feedback_sha256 FROM robustness_results
+                WHERE experiment_id = ?
+                UNION ALL
+                SELECT action_path, action_sha256 FROM robustness_results
                 WHERE experiment_id = ?""",
-                (experiment_id, experiment_id, experiment_id, experiment_id),
+                (
+                    experiment_id,
+                    experiment_id,
+                    experiment_id,
+                    experiment_id,
+                    experiment_id,
+                    experiment_id,
+                    experiment_id,
+                ),
             ).fetchall()
         for artifact_path, artifact_hash in rows:
             _verified_artifact(Path(artifact_path), artifact_hash)
+
+    def robustness_funnel(self) -> dict[str, int]:
+        """Return robustness funnel counts derived solely from immutable ledger rows."""
+        self.require_terminal_consistency()
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute(
+                """SELECT
+                COUNT(DISTINCT strategy_id),
+                COUNT(DISTINCT CASE WHEN technical_status = 'PASS' THEN strategy_id END),
+                COUNT(DISTINCT CASE WHEN economic_status = 'PASS' THEN strategy_id END),
+                COUNT(DISTINCT CASE WHEN action = 'ADVANCE'
+                    THEN strategy_id END),
+                COUNT(DISTINCT CASE WHEN outcome = 'FAIL' THEN strategy_id END),
+                COUNT(DISTINCT CASE WHEN outcome = 'TECHNICAL_INVALID' THEN strategy_id END)
+                FROM robustness_results""",
+            ).fetchone()
+        if row is None:
+            raise StrategyLabError("robustness funnel query returned no row")
+        return {
+            "robustness_evaluated": int(row[0]),
+            "technical_valid": int(row[1]),
+            "economic_passed": int(row[2]),
+            "robustness_passed": int(row[3]),
+            "economic_failed": int(row[4]),
+            "technical_invalid": int(row[5]),
+        }
 
     def funnel_counts(self) -> FunnelCounts:
         self.require_terminal_consistency()
@@ -2327,6 +3251,7 @@ def _engine_identity() -> str:
         _REPO_ROOT / "src/nautilus_quant/runtime_attestation.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_campaign.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_families.py",
+        _REPO_ROOT / "src/nautilus_quant/strategy_robustness.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_lab.py",
     ):
         digest.update(path.relative_to(_REPO_ROOT).as_posix().encode())
@@ -2346,30 +3271,42 @@ def _evaluation_context_id(
     runtime_id: str,
     code_commit: str,
     screen_policy_id: str | None = None,
+    robustness_policy_id: str | None = None,
+    cost_policy_id: str | None = None,
 ) -> str:
-    return sha256(
-        _canonical_json(
-            {
-                "code_commit": _identifier(code_commit, "code_commit"),
-                "data_as_of_ns": data_as_of_ns,
-                "data_snapshot_id": _content_id(data_snapshot_id, "data_snapshot_id"),
-                "data_source_id": _content_id(data_source_id, "data_source_id"),
-                "engine_id": _identifier(engine_id, "engine_id"),
-                "family_id": hypothesis.family_id,
-                "family_version": hypothesis.family_version,
-                "kernel_hash": KERNEL_HASH,
-                "kernel_version": KERNEL_VERSION,
-                "policy_id": _content_id(policy_id, "policy_id"),
-                "runtime_id": _content_id(runtime_id, "runtime_id"),
-                "schema_version": "evaluation-context-v1",
-                "screen_policy_id": _content_id(
-                    screen_policy_id or policy_id,
-                    "screen_policy_id",
-                ),
-                "strategy_id": hypothesis.strategy_id,
-            },
+    preimage: dict[str, JsonValue] = {
+        "code_commit": _identifier(code_commit, "code_commit"),
+        "data_as_of_ns": data_as_of_ns,
+        "data_snapshot_id": _content_id(data_snapshot_id, "data_snapshot_id"),
+        "data_source_id": _content_id(data_source_id, "data_source_id"),
+        "engine_id": _identifier(engine_id, "engine_id"),
+        "family_id": hypothesis.family_id,
+        "family_version": hypothesis.family_version,
+        "kernel_hash": KERNEL_HASH,
+        "kernel_version": KERNEL_VERSION,
+        "policy_id": _content_id(policy_id, "policy_id"),
+        "runtime_id": _content_id(runtime_id, "runtime_id"),
+        "schema_version": "evaluation-context-v1",
+        "screen_policy_id": _content_id(
+            screen_policy_id or policy_id,
+            "screen_policy_id",
         ),
-    ).hexdigest()
+        "strategy_id": hypothesis.strategy_id,
+    }
+    if robustness_policy_id is not None:
+        preimage["robustness_policy_id"] = _content_id(
+            robustness_policy_id,
+            "robustness_policy_id",
+        )
+    if cost_policy_id is not None:
+        preimage["cost_policy_id"] = _content_id(cost_policy_id, "cost_policy_id")
+    return sha256(_canonical_json(preimage)).hexdigest()
+
+
+def _utc_z_from_ns(timestamp_ns: int) -> str:
+    seconds, remainder = divmod(timestamp_ns, 1_000_000_000)
+    base = datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return base[:-1] + f".{remainder:09d}Z" if remainder else base
 
 
 def _prepare_execution(
@@ -2449,17 +3386,19 @@ def _require_execution_snapshot(
 
 
 def _code_commit() -> str:
-    head = (_REPO_ROOT / ".git/HEAD").read_text().strip()
-    if not head.startswith("ref: "):
-        return head
-    reference = _REPO_ROOT / ".git" / head.removeprefix("ref: ")
-    if reference.is_file():
-        return reference.read_text().strip()
-    for line in (_REPO_ROOT / ".git/packed-refs").read_text().splitlines():
-        commit, separator, name = line.partition(" ")
-        if separator and name == head.removeprefix("ref: "):
-            return commit
-    raise StrategyLabError("git HEAD reference cannot be resolved")
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "rev-parse", "--verify", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise StrategyLabError("git HEAD reference cannot be resolved") from error
+    if len(commit) not in {40, 64} or any(character not in "0123456789abcdef" for character in commit):
+        raise StrategyLabError("git HEAD reference cannot be resolved")
+    return commit
 
 
 def _load_canonical_json(path: Path) -> JsonValue:
@@ -3707,6 +4646,31 @@ def _run_strategy_loop_locked(
         )
 
     try:
+        request_bounds: dict[str, object] = {}
+        if prepared.evaluation_context_id is not None and prepared.data_as_of_ns is not None:
+            try:
+                policy_document = json.loads(paths.policy_path.read_bytes())
+                historical_start = policy_document["historical_start"]
+            except (OSError, KeyError, TypeError, ValueError) as error:
+                raise StrategyLabError("strategy loop policy lacks a UTC historical_start") from error
+            try:
+                historical_start_ns = int(
+                    datetime.fromisoformat(historical_start.replace("Z", "+00:00")).timestamp()
+                    * 1_000_000_000,
+                )
+            except (TypeError, ValueError) as error:
+                raise StrategyLabError("strategy loop policy historical_start is invalid") from error
+            request_start_ns = (
+                historical_start_ns
+                if historical_start_ns < prepared.data_as_of_ns
+                else prepared.data_as_of_ns - 1
+            )
+            request_bounds = {
+                "evaluation_start_utc": _utc_z_from_ns(request_start_ns),
+                "evaluation_end_utc": _utc_z_from_ns(prepared.data_as_of_ns),
+                "data_as_of_ns": prepared.data_as_of_ns,
+                "evaluation_context_id": prepared.evaluation_context_id,
+            }
         result = run_candidate_backtest(
             CandidateBacktestRequest(
                 candidate_path=candidate_path,
@@ -3717,6 +4681,7 @@ def _run_strategy_loop_locked(
                 strategy_id=hypothesis.strategy_id,
                 experiment_id=experiment_id,
                 code_commit=code_commit,
+                **request_bounds,
                 signal_parity=signal_parity,
             ),
         )
@@ -3918,6 +4883,13 @@ def write_funnel_reports(
             label: _stage_projection(connection, label, data_source_id, policy_ids)
             for label in _STAGE_LABELS[2:5]
         }
+        robustness_rows = connection.execute(
+            """SELECT robustness_results.strategy_id, robustness_results.action,
+            robustness_results.outcome, robustness_results.reason_codes_json
+            FROM robustness_results JOIN experiments USING (experiment_id, strategy_id)
+            WHERE experiments.data_source_id = ?""",
+            (data_source_id,),
+        ).fetchall()
         reason_rows = connection.execute(
             """SELECT errors.reason_code, experiments.strategy_id
             FROM errors JOIN experiments USING (experiment_id)
@@ -3941,7 +4913,11 @@ def write_funnel_reports(
         operational["PyBroker completed"],
         operational["Research screened"],
         operational["Nautilus replayed"],
-        (0, 0, 0),
+        (
+            len({str(row[0]) for row in robustness_rows}),
+            len({str(row[0]) for row in robustness_rows if row[1] == "ADVANCE"}),
+            len({str(row[0]) for row in robustness_rows if row[1] != "ADVANCE"}),
+        ),
         (0, 0, 0),
     ]
     stages: list[JsonValue] = []
@@ -3965,6 +4941,17 @@ def write_funnel_reports(
     reason_strategies: dict[str, set[str]] = {}
     for reason_code, strategy_id in reason_rows:
         reason_strategies.setdefault(str(reason_code), set()).add(str(strategy_id))
+    for strategy_id, _action, _outcome, reason_codes_json in robustness_rows:
+        try:
+            robustness_reasons = json.loads(str(reason_codes_json))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StrategyLabError("robustness reason codes are invalid") from error
+        if not isinstance(robustness_reasons, list) or not all(
+            isinstance(reason, str) and reason for reason in robustness_reasons
+        ):
+            raise StrategyLabError("robustness reason codes are invalid")
+        for reason_code in robustness_reasons:
+            reason_strategies.setdefault(reason_code, set()).add(str(strategy_id))
     top_reason_codes: list[JsonValue] = [
         {"count": len(strategy_ids), "reason_code": reason_code}
         for reason_code, strategy_ids in sorted(

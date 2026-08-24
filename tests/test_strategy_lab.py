@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import tomllib
@@ -470,6 +471,8 @@ class StrategyLedgerTests(unittest.TestCase):
                 "experiment_sources",
                 "verdicts",
                 "errors",
+                "robustness_results",
+                "robustness_lineage",
             }
             <= tables
         )
@@ -499,6 +502,8 @@ class StrategyLedgerTests(unittest.TestCase):
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'"
             ).fetchone()[0]
             source_rows = connection.execute("SELECT * FROM experiment_sources").fetchall()
+            robustness_rows = connection.execute("SELECT * FROM robustness_results").fetchall()
+            lineage_rows = connection.execute("SELECT * FROM robustness_lineage").fetchall()
             quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
             foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
             triggers = {
@@ -530,6 +535,8 @@ class StrategyLedgerTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(migrated_stage_sql, stage_sql)
         self.assertEqual(source_rows, [])
+        self.assertEqual(robustness_rows, [])
+        self.assertEqual(lineage_rows, [])
         self.assertEqual(quick_check, "ok")
         self.assertEqual(foreign_key_errors, [])
         for table in (
@@ -537,6 +544,8 @@ class StrategyLedgerTests(unittest.TestCase):
             "strategies",
             "experiment_sources",
             "signal_parity_results",
+            "robustness_results",
+            "robustness_lineage",
         ):
             self.assertIn(f"{table}_immutable_update", triggers)
             self.assertIn(f"{table}_immutable_delete", triggers)
@@ -1727,6 +1736,46 @@ class StrategyLoopPolicyTests(unittest.TestCase):
 
 
 class StrategyLoopIdentityAndConfinementTests(unittest.TestCase):
+    def test_code_commit_resolves_a_linked_git_worktree(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            worktree = root / "worktree"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(repository)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            (repository / "tracked.txt").write_text("tracked\n")
+            subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "test"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "worktree", "add", "-b", "card/test", str(worktree)],
+                check=True,
+                capture_output=True,
+            )
+            expected = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            with patch.object(strategy_lab, "_REPO_ROOT", worktree):
+                self.assertEqual(strategy_lab._code_commit(), expected)
+
     def test_subprocess_capture_is_bounded_while_both_streams_are_drained(self):
         size = strategy_lab.PROCESS_OUTPUT_LIMIT + 10_000
 

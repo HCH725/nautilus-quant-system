@@ -537,6 +537,32 @@ class CandidateBacktestTests(unittest.TestCase):
 
         self.assertEqual(result.verdict["funding"]["events"][0]["mark_price"], "1000.00")
 
+    def test_bounded_replay_excludes_first_bar_funding_while_flat(self) -> None:
+        candidate = self._candidate_v2()
+        self._write_candidate(candidate)
+        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
+        modeled_path = self._write_funding("bounded-modeled-funding", modeled_first=True)
+
+        result = run_candidate_backtest(
+            replace(
+                self.request,
+                funding_path=modeled_path,
+                signal_parity=parity,
+                evaluation_start_utc="1970-01-01T04:00:00Z",
+                evaluation_end_utc="1970-01-01T10:00:00Z",
+                data_as_of_ns=10 * HOUR_NS,
+                evaluation_context_id="f" * 64,
+                candidate_evaluation_context_id="e" * 64,
+            ),
+        )
+
+        self.assertEqual(result.verdict["funding"]["events"], [])
+        self.assertEqual(result.verdict["funding"]["total"], "0.00000000")
+        self.assertEqual(
+            result.verdict["evaluation_windows"]["actual_first_ts_event_ns"],
+            4 * HOUR_NS,
+        )
+
     def test_v2_parity_pass_recomputes_signals_before_nautilus_accounting(self) -> None:
         candidate = self._candidate_v2()
         self._write_candidate(candidate)
@@ -729,6 +755,81 @@ class CandidateBacktestTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "quantity|timing"):
                     load_candidate_backtest_verdict(_canonical(invalid))
+
+    def test_tracked_cost_policy_is_bound_to_a_formal_replay(self) -> None:
+        request = replace(
+            self.request,
+            code_commit="a" * 40,
+            evaluation_start_utc="1970-01-01T00:00:00Z",
+            evaluation_end_utc="1970-01-01T10:00:00Z",
+            data_as_of_ns=10 * HOUR_NS,
+            evaluation_context_id="e" * 64,
+            fee_multiplier=Decimal("2"),
+            funding_multiplier=Decimal("2"),
+            delay_bars=1,
+            slippage_model="one_tick",
+            cost_policy_id="f" * 64,
+        )
+        result = run_candidate_backtest(request)
+        verdict = load_candidate_backtest_verdict(result.canonical_bytes)
+        self.assertEqual(verdict["cost_policy"], {
+            "cost_policy_id": "f" * 64,
+            "delay_bars": 1,
+            "fee_multiplier": "2",
+            "fee_source": "nautilus_instrument_metadata",
+            "funding_multiplier": "2",
+            "funding_source": "canonical_funding_observation_v1",
+            "schema_version": "nautilus-cost-policy-v1",
+            "slippage_model": "one_tick",
+        })
+
+    def test_one_tick_slippage_is_executed_by_nautilus_not_only_labeled(self) -> None:
+        base = replace(
+            self.request,
+            code_commit="a" * 40,
+            evaluation_start_utc="1970-01-01T00:00:00Z",
+            evaluation_end_utc="1970-01-01T10:00:00Z",
+            data_as_of_ns=10 * HOUR_NS,
+            evaluation_context_id="e" * 64,
+        )
+
+        unstressed = run_candidate_backtest(base).verdict
+        stressed = run_candidate_backtest(
+            replace(base, slippage_model="one_tick", cost_policy_id="f" * 64),
+        ).verdict
+
+        self.assertEqual(stressed["execution"]["slippage_status"], "modeled_one_tick")
+        self.assertLess(
+            Decimal(stressed["gross_trading_result"]),
+            Decimal(unstressed["gross_trading_result"]),
+        )
+
+    def test_one_bar_delay_moves_each_changed_signal_one_additional_bar(self) -> None:
+        result = run_candidate_backtest(
+            replace(
+                self.request,
+                code_commit="a" * 40,
+                evaluation_start_utc="1970-01-01T00:00:00Z",
+                evaluation_end_utc="1970-01-01T10:00:00Z",
+                data_as_of_ns=10 * HOUR_NS,
+                evaluation_context_id="e" * 64,
+                delay_bars=1,
+                cost_policy_id="f" * 64,
+            ),
+        )
+
+        self.assertEqual(
+            [
+                (fill["source_signal_ts_event_ns"], fill["action_ts_event_ns"])
+                for fill in result.verdict["execution"]["fills"]
+            ],
+            [
+                (1 * HOUR_NS, 3 * HOUR_NS),
+                (4 * HOUR_NS, 6 * HOUR_NS),
+                (7 * HOUR_NS, 9 * HOUR_NS),
+                (None, 10 * HOUR_NS),
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -21,8 +21,8 @@
 | `data_snapshot_id`, `data_as_of` | Candidate v2 source identity; snapshot equals source digest |
 | `code_commit` | controller evaluation-context preimage and Nautilus verdict |
 | `screen_policy_id` | canonical strategy-loop policy digest |
-| `robustness_policy_id` | `N/A` until Card 3 |
-| `cost_policy_id` | currently resolved through the canonical strategy-loop policy/evaluator identity; separately versioned stress policy begins in Card 3 |
+| `robustness_policy_id` | tracked `strategy-robustness-policy-v1` content ID |
+| `cost_policy_id` | tracked Nautilus fee/Funding/delay/one-tick cost-policy content ID |
 | `risk_policy_id` | `N/A` until the independent Risk & Execution Policy in Card 4 |
 | `evaluation_context_id` | SHA-256 over strategy, family/kernel, code, data, screen policy, engine, and runtime identities |
 | `runtime_identity`, `environment_identity` | root runtime digest and isolated PyBroker environment digest |
@@ -71,4 +71,4 @@ The V2 experiment identity then binds strategy, data source, policy, runtime, an
 
 Card 1 implements Hypothesis v2, Candidate v2, shared deterministic family kernel, evaluation context, formal Signal Parity Gate, append-only parity evidence, V1-safe strategy-ledger migration, and Nautilus consumption of recomputed signals.
 
-The following remain planned, not implemented by this contract: campaign trial census, substantive provisional screen policy, robustness/multiple-testing verdicts, independent Risk & Execution Policy, Shadow/Paper, Binance Demo/Testnet evidence, promotion projection, runtime qualification, and all real-funds Live capability.
+The following remain outside this contract: independent Risk & Execution Policy, Shadow/Paper, Binance Demo/Testnet evidence, promotion projection, runtime qualification, and all real-funds Live capability. Card 3 robustness artifacts are defined separately by the strategy robustness, verdict, feedback, and action contracts; DSR/PBO remain `NOT_MODELED` there.

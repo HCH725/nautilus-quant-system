@@ -1,13 +1,14 @@
 # noqa: E501  # noqa: SIZE_OK — Task C is explicitly scoped to one evaluator module.
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 from pathlib import Path
 import platform
+import re
 from typing import Final, Literal
 
 import nautilus_trader
@@ -15,6 +16,7 @@ from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.common import LogLevel
 from nautilus_trader.config import BacktestEngineConfig, LoggerConfig
 from nautilus_trader.core import UUID4
+from nautilus_trader.execution import OneTickSlippageFillModel
 from nautilus_trader.model import (
     AccountType,
     Bar,
@@ -109,6 +111,18 @@ _VERDICT_FIELDS: Final = frozenset(
         "strategy_id",
     },
 )
+_COST_POLICY_FIELDS: Final = frozenset(
+    {
+        "cost_policy_id",
+        "delay_bars",
+        "fee_multiplier",
+        "fee_source",
+        "funding_multiplier",
+        "funding_source",
+        "schema_version",
+        "slippage_model",
+    },
+)
 _PARITY_FIELDS: Final = frozenset(
     {
         "candidate_id",
@@ -123,6 +137,15 @@ _PARITY_FIELDS: Final = frozenset(
         "schema_version",
     },
 )
+_SHA256: Final = re.compile(r"[0-9a-f]{64}")
+
+
+def _utc_timestamp_ns(value: str) -> int:
+    raw = value[:-1]
+    whole, separator, fraction = raw.partition(".")
+    parsed = datetime.fromisoformat(whole + "+00:00")
+    nanos = int((fraction + "000000000")[:9]) if separator else 0
+    return int(parsed.timestamp()) * 1_000_000_000 + nanos
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +170,94 @@ class CandidateBacktestRequest:
     strategy_id: str
     experiment_id: str
     code_commit: str
+    evaluation_start_utc: str | None = None
+    evaluation_end_utc: str | None = None
+    data_as_of_ns: int | None = None
+    evaluation_context_id: str | None = None
+    candidate_evaluation_context_id: str | None = None
+    strategy_parameters_override: dict[str, JsonValue] | None = None
+    fee_multiplier: Decimal = Decimal("1")
+    funding_multiplier: Decimal = Decimal("1")
+    delay_bars: int = 0
+    slippage_model: Literal["none", "one_tick"] = "none"
+    cost_policy_id: str | None = None
+    robustness_cell_id: str | None = None
     signal_parity: SignalParityResult | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.candidate_evaluation_context_id is not None
+            and (
+                not isinstance(self.candidate_evaluation_context_id, str)
+                or _SHA256.fullmatch(self.candidate_evaluation_context_id) is None
+            )
+        ):
+            raise CandidateBacktestError("candidate_evaluation_context_id must be lowercase SHA-256")
+        if self.strategy_parameters_override is not None:
+            if not isinstance(self.strategy_parameters_override, dict):
+                raise CandidateBacktestError("strategy_parameters_override must be an object")
+            try:
+                _canonical(self.strategy_parameters_override)
+            except (TypeError, ValueError) as error:
+                raise CandidateBacktestError(
+                    "strategy_parameters_override must contain finite plain JSON",
+                ) from error
+        card3_values = (
+            self.evaluation_start_utc,
+            self.evaluation_end_utc,
+            self.data_as_of_ns,
+            self.evaluation_context_id,
+        )
+        if all(value is None for value in card3_values):
+            # V1 callers remain readable; formal Card 3 callers must opt in as a
+            # complete identity tuple below.
+            self._validate_cost_fields()
+            return
+        if any(value is None for value in card3_values):
+            raise CandidateBacktestError("CandidateBacktestRequest requires all four Card 3 bounds and identity fields")
+        for name, value in (
+            ("evaluation_start_utc", self.evaluation_start_utc),
+            ("evaluation_end_utc", self.evaluation_end_utc),
+        ):
+            if not isinstance(value, str) or not value.endswith("Z"):
+                raise CandidateBacktestError(f"{name} must be a UTC timestamp ending in Z")
+            try:
+                parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+            except ValueError as error:
+                raise CandidateBacktestError(f"{name} must be a valid UTC timestamp") from error
+            if parsed.tzinfo != timezone.utc:
+                raise CandidateBacktestError(f"{name} must be UTC")
+        if (
+            isinstance(self.data_as_of_ns, bool)
+            or not isinstance(self.data_as_of_ns, int)
+            or self.data_as_of_ns < 0
+        ):
+            raise CandidateBacktestError("data_as_of_ns must be a non-negative integer")
+        if (
+            not isinstance(self.evaluation_context_id, str)
+            or _SHA256.fullmatch(self.evaluation_context_id) is None
+        ):
+            raise CandidateBacktestError("evaluation_context_id must be lowercase SHA-256")
+        start = _utc_timestamp_ns(self.evaluation_start_utc)
+        end = _utc_timestamp_ns(self.evaluation_end_utc)
+        if start >= end:
+            raise CandidateBacktestError("evaluation UTC bounds must be ordered")
+        self._validate_cost_fields()
+
+    def _validate_cost_fields(self) -> None:
+        for name, value in (
+            ("fee_multiplier", self.fee_multiplier),
+            ("funding_multiplier", self.funding_multiplier),
+        ):
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise CandidateBacktestError(f"{name} must be a positive finite Decimal")
+        if isinstance(self.delay_bars, bool) or not isinstance(self.delay_bars, int) or self.delay_bars < 0:
+            raise CandidateBacktestError("delay_bars must be a non-negative integer")
+        if self.slippage_model not in {"none", "one_tick"}:
+            raise CandidateBacktestError("slippage_model must be none or one_tick")
+        for name, value in (("cost_policy_id", self.cost_policy_id), ("robustness_cell_id", self.robustness_cell_id)):
+            if value is not None and (_SHA256.fullmatch(value) is None):
+                raise CandidateBacktestError(f"{name} must be lowercase SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +306,42 @@ class _ReplayPlan:
     quantity: Quantity
     signals: list[_Signal]
     boundary_ns: int
+    delay_bars: int = 0
+
+
+def candidate_request_bounds_ns(
+    request: CandidateBacktestRequest,
+) -> tuple[int, int, int] | None:
+    """Return explicit Card 3 UTC bounds as nanoseconds, or None for V1 callers."""
+    if request.evaluation_start_utc is None:
+        return None
+    start = _utc_timestamp_ns(request.evaluation_start_utc)
+    end = _utc_timestamp_ns(request.evaluation_end_utc)
+    return (
+        start,
+        end,
+        request.data_as_of_ns,
+    )
+
+
+def _validate_candidate_request_identity(
+    request: CandidateBacktestRequest,
+    candidate: dict[str, JsonValue],
+) -> tuple[int, int, int] | None:
+    bounds = candidate_request_bounds_ns(request)
+    if bounds is None:
+        return None
+    candidate_context = candidate.get("evaluation_context_id")
+    expected_context = request.candidate_evaluation_context_id or request.evaluation_context_id
+    if candidate_context is not None and candidate_context != expected_context:
+        raise CandidateBacktestError("candidate evaluation_context_id does not match request")
+    if request.candidate_evaluation_context_id is not None and candidate_context is None:
+        raise CandidateBacktestError("candidate evaluation_context_id does not match request")
+    source = _mapping(candidate["source"], "candidate source")
+    source_last = source.get("last_ts_event_ns")
+    if not isinstance(source_last, int) or source_last > bounds[2]:
+        raise CandidateBacktestError("candidate source exceeds request data_as_of_ns")
+    return bounds
 
 
 def _canonical(value: JsonValue) -> bytes:
@@ -298,6 +444,39 @@ def candidate_signal_decisions(
             decisions.append(FamilyDecision(**row))
         except (TypeError, ValueError) as error:
             raise CandidateBacktestError("Candidate v2 decision is invalid") from error
+    return tuple(decisions)
+
+
+def _recompute_family_decisions(
+    candidate: dict[str, JsonValue],
+    source_bars: list[Bar],
+    parameters: dict[str, JsonValue],
+) -> tuple[FamilyDecision, ...]:
+    """Recompute signals from canonical closed bars without changing the candidate."""
+    strategy = _mapping(candidate["strategy"], "candidate strategy")
+    family_id = strategy.get("family_id")
+    family_version = strategy.get("family_version")
+    if not isinstance(family_id, str) or not isinstance(family_version, str):
+        raise CandidateBacktestError("validated Candidate v2 family identity is invalid")
+    evaluator = IncrementalFamilyEvaluator(
+        family_id=family_id,
+        family_version=family_version,
+        parameters=parameters,
+    )
+    decisions: list[FamilyDecision] = []
+    for bar in source_bars:
+        decision = evaluator.push(
+            ClosedBar(
+                ts_event_ns=bar.ts_event,
+                open=float(str(bar.open)),
+                high=float(str(bar.high)),
+                low=float(str(bar.low)),
+                close=float(str(bar.close)),
+                volume=float(str(bar.volume)),
+            ),
+        )
+        if decision is not None:
+            decisions.append(decision)
     return tuple(decisions)
 
 
@@ -406,6 +585,8 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
     if not isinstance(value, dict) or set(value) not in {
         _VERDICT_FIELDS,
         _VERDICT_FIELDS | {"signal_parity"},
+        _VERDICT_FIELDS | {"cost_policy"},
+        _VERDICT_FIELDS | {"signal_parity", "cost_policy"},
     }:
         raise CandidateBacktestError("invalid Nautilus verdict fields")
     try:
@@ -416,6 +597,20 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
         raise CandidateBacktestError("Nautilus verdict must use canonical JSON encoding")
 
     document = value
+    cost_policy = document.get("cost_policy")
+    if cost_policy is not None:
+        if not isinstance(cost_policy, dict) or set(cost_policy) != _COST_POLICY_FIELDS:
+            raise CandidateBacktestError("Nautilus verdict cost policy is invalid")
+        _verdict_content_id(cost_policy["cost_policy_id"], "cost_policy.cost_policy_id")
+        if cost_policy["schema_version"] != "nautilus-cost-policy-v1":
+            raise CandidateBacktestError("Nautilus verdict cost policy schema is invalid")
+        if cost_policy["fee_source"] != "nautilus_instrument_metadata" or cost_policy["funding_source"] != "canonical_funding_observation_v1":
+            raise CandidateBacktestError("Nautilus verdict cost policy source is invalid")
+        _verdict_decimal(cost_policy["fee_multiplier"], "cost_policy.fee_multiplier", positive=True)
+        _verdict_decimal(cost_policy["funding_multiplier"], "cost_policy.funding_multiplier", positive=True)
+        _verdict_integer(cost_policy["delay_bars"], "cost_policy.delay_bars")
+        if cost_policy["slippage_model"] not in {"none", "one_tick"}:
+            raise CandidateBacktestError("Nautilus verdict cost policy slippage is invalid")
     claimed_result_hash = _verdict_content_id(
         document["canonical_result_hash"],
         "canonical_result_hash",
@@ -507,8 +702,17 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
     )
     if not isinstance(execution["boundary_flattened"], bool):
         raise CandidateBacktestError("Nautilus verdict execution boundary is invalid")
-    if execution["slippage_status"] != _SLIPPAGE_STATUS:
+    slippage_status = execution["slippage_status"]
+    allowed_slippage_statuses = {_SLIPPAGE_STATUS}
+    if isinstance(cost_policy, dict) and cost_policy["slippage_model"] == "one_tick":
+        allowed_slippage_statuses.add("modeled_one_tick")
+    if slippage_status not in allowed_slippage_statuses:
         raise CandidateBacktestError("Nautilus verdict slippage policy is invalid")
+    if slippage_status == "modeled_one_tick" and (
+        not isinstance(cost_policy, dict)
+        or cost_policy["slippage_model"] != "one_tick"
+    ):
+        raise CandidateBacktestError("Nautilus verdict modeled slippage is unbound")
     fixed_quantity = _verdict_decimal(
         execution["fixed_quantity_btc"],
         "fixed_quantity_btc",
@@ -648,7 +852,11 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
         or versions["nautilus_python"] != platform.python_version()
     ):
         raise CandidateBacktestError("Nautilus verdict runtime versions are invalid")
-    if document["performance_claimable"] is not False:
+    expected_performance_claimable = (
+        funding["truth_status"] == "official"
+        and slippage_status != "unmodeled"
+    )
+    if document["performance_claimable"] is not expected_performance_claimable:
         raise CandidateBacktestError("Nautilus verdict performance claim is inconsistent")
     expected_truth_status = (
         "official"
@@ -665,8 +873,9 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
         raise CandidateBacktestError("Nautilus verdict gross, fees, and funding do not reconcile")
     expected_reason_codes = [
         "POSITIVE_NET_RESEARCH_ONLY" if net_account_delta > 0 else "NON_POSITIVE_NET_RESULT",
-        "UNMODELED_SLIPPAGE",
     ]
+    if slippage_status == "unmodeled":
+        expected_reason_codes.append("UNMODELED_SLIPPAGE")
     if funding["truth_status"] != "official":
         expected_reason_codes.append(f"FUNDING_TRUTH_{str(funding['truth_status']).upper()}")
     if document["reason_codes"] != expected_reason_codes:
@@ -867,25 +1076,7 @@ def run_signal_parity_gate(
             or not isinstance(parameters, dict)
         ):
             raise CandidateBacktestError("validated Candidate v2 strategy is invalid")
-        evaluator = IncrementalFamilyEvaluator(
-            family_id=family_id,
-            family_version=family_version,
-            parameters=parameters,
-        )
-        recomputed: list[FamilyDecision] = []
-        for bar in source_bars:
-            decision = evaluator.push(
-                ClosedBar(
-                    ts_event_ns=bar.ts_event,
-                    open=float(str(bar.open)),
-                    high=float(str(bar.high)),
-                    low=float(str(bar.low)),
-                    close=float(str(bar.close)),
-                    volume=float(str(bar.volume)),
-                )
-            )
-            if decision is not None:
-                recomputed.append(decision)
+        recomputed = _recompute_family_decisions(candidate, source_bars, parameters)
     except (ArithmeticError, FamilyKernelError, LookupError, OSError, RuntimeError, ValueError) as error:
         return _parity_result(
             candidate_id=candidate_id,
@@ -973,6 +1164,7 @@ class _CandidateReplayStrategy(Strategy):
         self.deduped_signal_count = 0
         self.boundary_flattened = False
         self.actions: dict[str, _Action] = {}
+        self._pending: list[tuple[int, _Signal]] = []
 
     def configure(self, plan: _ReplayPlan) -> None:
         self._plan = plan
@@ -1006,6 +1198,14 @@ class _CandidateReplayStrategy(Strategy):
     def on_bar(self, bar: Bar) -> None:
         if self._plan is None:
             raise CandidateBacktestError("candidate strategy is not configured")
+        due: list[_Signal] = []
+        pending: list[tuple[int, _Signal]] = []
+        for remaining, signal in self._pending:
+            if remaining == 0:
+                due.append(signal)
+            else:
+                pending.append((remaining - 1, signal))
+        self._pending = pending
         changed: _Signal | None = None
         while (
             self._cursor < len(self._plan.signals)
@@ -1020,31 +1220,45 @@ class _CandidateReplayStrategy(Strategy):
                 changed = signal
         is_long = self.portfolio.is_net_long(self._plan.instrument_id)
         if bar.ts_event == self._plan.boundary_ns:
+            self._pending.clear()
             if is_long:
                 source_ns = (
-                    changed.ts_event_ns
+                    due[-1].ts_event_ns
+                    if due and due[-1].intent == "FLAT"
+                    else changed.ts_event_ns
                     if changed is not None and changed.intent == "FLAT"
                     else None
                 )
                 self.boundary_flattened = source_ns is None
                 self._submit(_Action("FLAT", source_ns, bar.ts_event))
             return
-        if changed is None:
-            return
-        if changed.intent == "LONG" and not is_long:
-            self._submit(_Action("LONG", changed.ts_event_ns, bar.ts_event))
-        elif changed.intent == "FLAT" and is_long:
-            self._submit(_Action("FLAT", changed.ts_event_ns, bar.ts_event))
+        if changed is not None:
+            if self._plan.delay_bars > 0:
+                self._pending.append((self._plan.delay_bars - 1, changed))
+            else:
+                due.append(changed)
+        for signal in due:
+            if signal.intent == "LONG" and not is_long:
+                self._submit(_Action("LONG", signal.ts_event_ns, bar.ts_event))
+                is_long = True
+            elif signal.intent == "FLAT" and is_long:
+                self._submit(_Action("FLAT", signal.ts_event_ns, bar.ts_event))
+                is_long = False
 
 
 def _funding_data(
     observations: list[FundingObservation],
     bars: list[Bar],
     instrument_id: InstrumentId,
+    funding_multiplier: Decimal = Decimal("1"),
 ) -> tuple[list[MarkPriceUpdate | FundingRateUpdate], dict[int, tuple[FundingObservation, Price, str]]]:
     events: list[MarkPriceUpdate | FundingRateUpdate] = []
     evidence: dict[int, tuple[FundingObservation, Price, str]] = {}
     for observation in observations:
+        effective_observation = replace(
+            observation,
+            rate=observation.rate * funding_multiplier,
+        )
         if observation.mark_price is not None:
             mark_price = Price.from_str(str(observation.mark_price))
             price_source = FUNDING_PRICE_SOURCE
@@ -1074,14 +1288,14 @@ def _funding_data(
         events.append(
             FundingRateUpdate(
                 instrument_id,
-                observation.rate,
+                effective_observation.rate,
                 settlement_timestamp,
                 settlement_timestamp,
                 interval=480,
                 next_funding_ns=settlement_timestamp,
             ),
         )
-        evidence[settlement_timestamp] = (observation, mark_price, price_source)
+        evidence[settlement_timestamp] = (effective_observation, mark_price, price_source)
     return events, evidence
 
 
@@ -1130,6 +1344,7 @@ def _account_total(event) -> Decimal:
 def _historical_instrument(
     instrument: CryptoPerpetual,
     bars: list[Bar],
+    fee_multiplier: Decimal = Decimal("1"),
 ) -> CryptoPerpetual:
     increment = instrument.price_increment.as_decimal()
     prices = (
@@ -1137,33 +1352,59 @@ def _historical_instrument(
         for bar in bars
         for price in (bar.open, bar.high, bar.low, bar.close)
     )
-    if all(price % increment == 0 for price in prices):
+    if all(price % increment == 0 for price in prices) and fee_multiplier == Decimal("1"):
         return instrument
     historical_increment = Decimal(1).scaleb(-instrument.price_precision)
     # ponytail: use the stored bar precision until Catalog carries versioned tick sizes.
     definition = instrument.to_dict()
     definition["price_increment"] = str(historical_increment)
+    if fee_multiplier != Decimal("1"):
+        definition["maker_fee"] = str(instrument.maker_fee * fee_multiplier)
+        definition["taker_fee"] = str(instrument.taker_fee * fee_multiplier)
     return CryptoPerpetual.from_dict(definition)
 
 
 def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBacktestResult:
     """Evaluate one validated PyBroker candidate with the real Nautilus engine."""
     candidate, candidate_id = load_pybroker_candidate(request.candidate_path)
+    request_bounds = _validate_candidate_request_identity(request, candidate)
     policy = _load_policy(request.policy_path)
     catalog_path = Path(request.catalog_path)
     catalog = ParquetDataCatalog(str(catalog_path))
     source_bars = _source_bars(candidate, catalog, catalog_path)
+    bars = [bar for bar in source_bars if bar.ts_event >= policy.historical_start_ns]
     if candidate.get("schema_version") == "pybroker-candidate-v2":
         parity = request.signal_parity
         if parity is None:
             raise CandidateBacktestError("Candidate v2 requires a passed signal parity gate")
+        base_decisions = _verified_parity_decisions(parity, candidate_id)
+        if request.strategy_parameters_override is None:
+            replay_decisions = base_decisions
+        else:
+            replay_decisions = _recompute_family_decisions(
+                candidate,
+                source_bars,
+                request.strategy_parameters_override,
+            )
         replay_signals = [
             _Signal(item.target_intent, item.ts_event_ns)
-            for item in _verified_parity_decisions(parity, candidate_id)
+            for item in replay_decisions
         ]
     else:
+        if request.strategy_parameters_override is not None:
+            raise CandidateBacktestError(
+                "strategy_parameters_override requires Candidate v2",
+            )
         replay_signals = _signals(candidate)
-    bars = [bar for bar in source_bars if bar.ts_event >= policy.historical_start_ns]
+    if request_bounds is not None:
+        evaluation_start_ns, evaluation_end_ns, data_as_of_ns = request_bounds
+        bars = [
+            bar for bar in bars
+            if evaluation_start_ns <= bar.ts_event <= evaluation_end_ns
+            and bar.ts_event <= data_as_of_ns
+        ]
+        if not bars:
+            raise CandidateBacktestError("request UTC bounds contain no catalog bars")
     if not bars:
         raise CandidateBacktestError("catalog has no bars at or after historical_start")
     instrument_id_text = candidate["instrument_id"]
@@ -1176,7 +1417,7 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             pass
         case _:
             raise CandidateBacktestError("catalog must contain one CryptoPerpetual instrument")
-    instrument = _historical_instrument(instrument, bars)
+    instrument = _historical_instrument(instrument, bars, request.fee_multiplier)
 
     symbol = instrument_id_text.partition("-PERP.")[0]
     funding_symbols = _funding_symbols(request.funding_path)
@@ -1189,12 +1430,13 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
     evaluated_observations = [
         item
         for item in observations
-        if bars[0].ts_event <= item.funding_time_ns <= bars[-1].ts_event
+        if bars[0].ts_event < item.funding_time_ns <= bars[-1].ts_event
     ]
     funding_data, funding_evidence = _funding_data(
         evaluated_observations,
         bars,
         instrument.id,
+        request.funding_multiplier,
     )
     strategy = _CandidateReplayStrategy()
     strategy.configure(
@@ -1204,6 +1446,7 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             policy.quantity,
             replay_signals,
             bars[-1].ts_event,
+            request.delay_bars,
         ),
     )
     engine = BacktestEngine(
@@ -1213,12 +1456,18 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
         ),
     )
     try:
+        fill_model = (
+            OneTickSlippageFillModel(prob_slippage=1.0, random_seed=42)
+            if request.slippage_model == "one_tick"
+            else None
+        )
         engine.add_venue(
             venue=_VENUE,
             oms_type=OmsType.NETTING,
             account_type=AccountType.MARGIN,
             starting_balances=[Money(policy.starting_balance, _USDT)],
             base_currency=_USDT,
+            fill_model=fill_model,
         )
         engine.add_instrument(instrument)
         engine.add_strategy(strategy)
@@ -1317,10 +1566,16 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             if modeled_count and official_count
             else "missing"
         )
+        slippage_status = (
+            "modeled_one_tick"
+            if request.slippage_model == "one_tick"
+            else policy.slippage_status
+        )
         reason_codes = [
             "POSITIVE_NET_RESEARCH_ONLY" if account_delta > 0 else "NON_POSITIVE_NET_RESULT",
-            "UNMODELED_SLIPPAGE",
         ]
+        if slippage_status == "unmodeled":
+            reason_codes.append("UNMODELED_SLIPPAGE")
         if truth_status != "official":
             reason_codes.append(f"FUNDING_TRUTH_{truth_status.upper()}")
         source = _mapping(candidate["source"], "candidate source")
@@ -1348,7 +1603,7 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
                 "fixed_quantity_btc": str(policy.quantity),
                 "order_count": len(orders),
                 "signal_timing": policy.signal_timing,
-                "slippage_status": policy.slippage_status,
+                "slippage_status": slippage_status,
                 "trade_count": sum(fill["intent"] == "FLAT" for fill in fills),
             },
             "experiment_id": request.experiment_id,
@@ -1375,7 +1630,7 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             "net_account_delta": _money(account_delta),
             "open_position_count": 0,
             "performance_claimable": (
-                truth_status == "official" and policy.slippage_status != "unmodeled"
+                truth_status == "official" and slippage_status != "unmodeled"
             ),
             "policy_decision_version": policy.decision_version,
             "realized_balance_drawdown": _money(realized_drawdown),
@@ -1406,6 +1661,29 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
                 "artifact_sha256": parity.artifact_sha256,
                 "outcome": parity.outcome,
                 "reason_code": parity.reason_code,
+            }
+        if (
+            request.fee_multiplier != Decimal("1")
+            or request.funding_multiplier != Decimal("1")
+            or request.delay_bars != 0
+            or request.slippage_model != "none"
+            or request.cost_policy_id is not None
+        ):
+            cost_policy_document: dict[str, JsonValue] = {
+                "delay_bars": request.delay_bars,
+                "fee_multiplier": str(request.fee_multiplier),
+                "fee_source": "nautilus_instrument_metadata",
+                "funding_multiplier": str(request.funding_multiplier),
+                "funding_source": "canonical_funding_observation_v1",
+                "schema_version": "nautilus-cost-policy-v1",
+                "slippage_model": request.slippage_model,
+            }
+            cost_policy_id = request.cost_policy_id or sha256(
+                _canonical(cost_policy_document),
+            ).hexdigest()
+            verdict["cost_policy"] = {
+                **cost_policy_document,
+                "cost_policy_id": cost_policy_id,
             }
         verdict["canonical_result_hash"] = sha256(_canonical(verdict)).hexdigest()
         payload = _canonical(verdict)
