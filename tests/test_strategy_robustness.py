@@ -130,6 +130,12 @@ def _complete_robustness_verdict() -> dict[str, object]:
     )
 
 
+def _rehash_robustness_verdict(verdict: dict[str, object]) -> bytes:
+    verdict.pop("robustness_verdict_id", None)
+    verdict["robustness_verdict_id"] = hashlib.sha256(canonical_json(verdict)).hexdigest()
+    return canonical_json(verdict)
+
+
 def _seed_persisted_mutation_source(
     root: Path,
     *,
@@ -1125,6 +1131,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                 Decimal("0"),
                 "official",
                 ("CELL_ECONOMIC_PASS",),
+                "a" * 64,
             )
             for cell in cells
         )
@@ -1319,6 +1326,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                 Decimal("0"),
                 "official",
                 ("CELL_ECONOMIC_PASS",),
+                "a" * 64,
             )
             for cell in cells
         )
@@ -1450,6 +1458,71 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cell-derived closure"):
             strategy_robustness.load_robustness_verdict_v2(canonical_json(forged))
 
+    def test_loader_rejects_rehashed_cell_window_beyond_data_as_of(self) -> None:
+        forged = _complete_robustness_verdict()
+        cell = cast(list[dict[str, Any]], forged["cells"])[0]
+        cast(dict[str, object], cell["window"])["test_end_ns"] = cast(int, forged["data_as_of_ns"]) + 1
+
+        with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+            strategy_robustness.load_robustness_verdict_v2(
+                _rehash_robustness_verdict(forged),
+            )
+
+    def test_loader_rejects_rehashed_cell_metrics_with_forged_pass(self) -> None:
+        forged = _complete_robustness_verdict()
+        cell = cast(list[dict[str, Any]], forged["cells"])[0]
+        cell["net_account_delta"] = "-999999"
+        cell["realized_balance_drawdown"] = "999999"
+
+        with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+            strategy_robustness.load_robustness_verdict_v2(
+                _rehash_robustness_verdict(forged),
+            )
+
+    def test_loader_rejects_rehashed_advance_with_incomplete_cell_artifact_reference(self) -> None:
+        for missing in (("artifact_sha256",), ("verdict_id",), ("artifact_sha256", "verdict_id")):
+            with self.subTest(missing=missing):
+                forged = _complete_robustness_verdict()
+                cell = cast(list[dict[str, Any]], forged["cells"])[0]
+                for field in missing:
+                    cell[field] = None
+
+                with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+                    strategy_robustness.load_robustness_verdict_v2(
+                        _rehash_robustness_verdict(forged),
+                    )
+
+    def test_loader_rejects_rehashed_cell_id_detached_from_preimage(self) -> None:
+        forged = _complete_robustness_verdict()
+        cast(list[dict[str, Any]], forged["cells"])[0]["cell_id"] = "f" * 64
+
+        with self.assertRaisesRegex(ValueError, "cell-derived closure"):
+            strategy_robustness.load_robustness_verdict_v2(
+                _rehash_robustness_verdict(forged),
+            )
+
+    def test_advance_without_any_formal_cell_references_fails_every_entry_point(self) -> None:
+        forged = _complete_robustness_verdict()
+        for cell in cast(list[dict[str, Any]], forged["cells"]):
+            cell["artifact_sha256"] = None
+            cell["verdict_id"] = None
+        payload = _rehash_robustness_verdict(forged)
+
+        with TemporaryDirectory() as temporary:
+            entry_points = {
+                "loader": lambda: strategy_robustness.load_robustness_verdict_v2(payload),
+                "feedback": lambda: build_feedback_v2(forged),
+                "action": lambda: build_action_v1(forged, campaign_id="c" * 64),
+                "formal artifact verifier": lambda: strategy_robustness._verify_formal_cell_artifacts(
+                    forged,
+                    Path(temporary),
+                ),
+            }
+            for name, invoke in entry_points.items():
+                with self.subTest(entry_point=name):
+                    with self.assertRaises(ValueError):
+                        invoke()
+
     def test_formal_evaluator_binds_cell_context_and_parameter_override(self) -> None:
         policy = replace(
             load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
@@ -1531,6 +1604,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                 None if index == 0 else Decimal("0"),
                 None if index == 0 else "official",
                 ("ENGINE_FAILED",) if index == 0 else ("CELL_ECONOMIC_PASS",),
+                None if index == 0 else "a" * 64,
             )
             for index, cell in enumerate(cells)
         )
@@ -1579,6 +1653,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                 Decimal("0"), "official",
                 ("MINIMUM_NET_ACCOUNT_DELTA_NOT_MET",)
                 if index == 0 else ("CELL_ECONOMIC_PASS",),
+                "a" * 64,
             )
             for index, cell in enumerate(cells)
         )
@@ -1641,6 +1716,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             RobustnessCellResult(
                 cell.cell_id, cell.evaluation_context_id, "PASS", "PASS", "a" * 64,
                 Decimal("1"), Decimal("0"), "official", ("CELL_ECONOMIC_PASS",),
+                "a" * 64,
             )
             for cell in cells
         )
@@ -1900,7 +1976,8 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         results = tuple(
             RobustnessCellResult(
                 cell.cell_id, cell.evaluation_context_id, "PASS", "PASS", "a" * 64,
-                Decimal("1"), Decimal("0"), "official", ("DSR_PBO_NOT_MODELED",),
+                Decimal("1"), Decimal("0"), "official", ("CELL_ECONOMIC_PASS",),
+                "a" * 64,
             )
             for cell in cells
         )

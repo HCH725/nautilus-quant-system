@@ -603,9 +603,9 @@ def _string_tuple(value: object, name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def load_robustness_policy(path: Path) -> RobustnessPolicy:
+def load_robustness_policy(path: Path | bytes) -> RobustnessPolicy:
     """Load the result-independent, canonical Card 3 policy."""
-    payload = Path(path).read_bytes()
+    payload = path if isinstance(path, bytes) else Path(path).read_bytes()
     try:
         root = json.loads(
             payload,
@@ -687,6 +687,28 @@ def _utc_z_from_ns(timestamp_ns: int) -> str:
     return f"{whole}.{nanos:09d}Z" if nanos else f"{whole}Z"
 
 
+def _economic_reason_codes(
+    policy: RobustnessPolicy,
+    cost_policy: NautilusCostPolicy,
+    net: Decimal,
+    drawdown: Decimal,
+    funding_truth: str,
+    slippage_status: object,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if net < policy.minimum_net_account_delta:
+        reasons.append("MINIMUM_NET_ACCOUNT_DELTA_NOT_MET")
+    if drawdown > policy.maximum_realized_drawdown:
+        reasons.append("MAXIMUM_REALIZED_DRAWDOWN_EXCEEDED")
+    if policy.require_official_funding and funding_truth != "official":
+        reasons.append("FUNDING_TRUTH_NOT_OFFICIAL")
+    if cost_policy.slippage_model == "one_tick" and slippage_status != "modeled_one_tick":
+        reasons.append("ONE_TICK_SLIPPAGE_NOT_MODELED_BY_NAUTILUS")
+    elif policy.require_modeled_stresses and slippage_status == "unmodeled":
+        reasons.append("UNMODELED_SLIPPAGE")
+    return tuple(reasons) if reasons else ("CELL_ECONOMIC_PASS",)
+
+
 def _cell_result_from_verdict(cell: RobustnessCell, returned: object, policy: RobustnessPolicy) -> RobustnessCellResult:
     verdict = getattr(returned, "verdict", returned)
     verdict_id = getattr(returned, "verdict_id", None)
@@ -737,29 +759,26 @@ def _cell_result_from_verdict(cell: RobustnessCell, returned: object, policy: Ro
             ("NAUTILUS_VERDICT_ECONOMIC_FIELDS_INVALID", str(error)),
             artifact_sha256,
         )
-    reasons: list[str] = []
-    if net < policy.minimum_net_account_delta:
-        reasons.append("MINIMUM_NET_ACCOUNT_DELTA_NOT_MET")
-    if drawdown > policy.maximum_realized_drawdown:
-        reasons.append("MAXIMUM_REALIZED_DRAWDOWN_EXCEEDED")
-    if policy.require_official_funding and funding_truth != "official":
-        reasons.append("FUNDING_TRUTH_NOT_OFFICIAL")
     execution = verdict.get("execution")
     slippage_status = execution.get("slippage_status") if isinstance(execution, dict) else None
-    if cell.cost_policy.slippage_model == "one_tick" and slippage_status != "modeled_one_tick":
-        reasons.append("ONE_TICK_SLIPPAGE_NOT_MODELED_BY_NAUTILUS")
-    elif policy.require_modeled_stresses and slippage_status == "unmodeled":
-        reasons.append("UNMODELED_SLIPPAGE")
+    reasons = _economic_reason_codes(
+        policy,
+        cell.cost_policy,
+        net,
+        drawdown,
+        funding_truth,
+        slippage_status,
+    )
     return RobustnessCellResult(
         cell.cell_id,
         cell.evaluation_context_id,
         "PASS",
-        "FAIL" if reasons else "PASS",
+        "PASS" if reasons == ("CELL_ECONOMIC_PASS",) else "FAIL",
         verdict_id if isinstance(verdict_id, str) else None,
         net,
         drawdown,
         funding_truth,
-        tuple(reasons) if reasons else ("CELL_ECONOMIC_PASS",),
+        reasons,
         artifact_sha256,
     )
 
@@ -1074,6 +1093,252 @@ def _result_document(cell: RobustnessCell, result: RobustnessCellResult) -> dict
     }
 
 
+def _validated_cell_document(
+    cell: object,
+    verdict: Mapping[str, object],
+    policy: RobustnessPolicy,
+) -> tuple[RobustnessCell, str, str, tuple[str, ...], str | None, bool]:
+    invalid = "robustness verdict cell-derived closure is invalid"
+    cell_fields = {
+        "artifact_sha256",
+        "cell_id",
+        "cost_policy",
+        "cost_policy_id",
+        "economic_status",
+        "evaluation_context_id",
+        "funding_truth_status",
+        "net_account_delta",
+        "parameter_relative_offset",
+        "parameters",
+        "reason_codes",
+        "realized_balance_drawdown",
+        "regime_label",
+        "schema_version",
+        "stress_scenario",
+        "technical_status",
+        "verdict_id",
+        "window",
+    }
+    window_fields = {
+        "data_as_of_ns",
+        "evaluation_context_id",
+        "ordinal",
+        "scheme",
+        "test_end_ns",
+        "test_start_ns",
+        "train_end_ns",
+        "train_start_ns",
+    }
+    cost_fields = {
+        "cost_policy_id",
+        "delay_bars",
+        "fee_multiplier",
+        "fee_source",
+        "funding_multiplier",
+        "funding_source",
+        "schema_version",
+        "slippage_model",
+    }
+    try:
+        if not isinstance(cell, dict) or set(cell) != cell_fields:
+            raise StrategyRobustnessError(invalid)
+        window_document = cell["window"]
+        cost_document = cell["cost_policy"]
+        trial_context = verdict.get("trial_context")
+        if (
+            cell["schema_version"] != "robustness-cell-result-v1"
+            or not isinstance(window_document, dict)
+            or set(window_document) != window_fields
+            or not isinstance(cost_document, dict)
+            or set(cost_document) != cost_fields
+            or not isinstance(trial_context, dict)
+        ):
+            raise StrategyRobustnessError(invalid)
+
+        scheme = window_document["scheme"]
+        ordinal = window_document["ordinal"]
+        timestamps = tuple(
+            window_document[field]
+            for field in (
+                "train_start_ns",
+                "train_end_ns",
+                "test_start_ns",
+                "test_end_ns",
+                "data_as_of_ns",
+            )
+        )
+        window_context_id = window_document["evaluation_context_id"]
+        regime_label = cell["regime_label"]
+        if (
+            scheme not in policy.window_schemes
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not 0 <= ordinal < policy.maximum_windows_per_scheme
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in timestamps)
+            or not timestamps[0] <= timestamps[1] < timestamps[2] <= timestamps[3] <= timestamps[4]
+            or timestamps[4] != verdict.get("data_as_of_ns")
+            or timestamps[4] != trial_context.get("data_as_of_ns")
+            or not isinstance(window_context_id, str)
+            or len(window_context_id) != 64
+            or any(character not in "0123456789abcdef" for character in window_context_id)
+            or regime_label not in {None, "TREND", "RANGE", "HIGH_VOLATILITY"}
+        ):
+            raise StrategyRobustnessError(invalid)
+        window = RobustnessWindow(
+            cast(WindowScheme, scheme),
+            ordinal,
+            cast(int, timestamps[0]),
+            cast(int, timestamps[1]),
+            cast(int, timestamps[2]),
+            cast(int, timestamps[3]),
+            cast(int, timestamps[4]),
+            window_context_id,
+            cast(RegimeLabel | None, regime_label),
+        )
+
+        if cost_document["schema_version"] != "nautilus-cost-policy-v1":
+            raise StrategyRobustnessError(invalid)
+        delay_bars = cost_document["delay_bars"]
+        if isinstance(delay_bars, bool) or not isinstance(delay_bars, int):
+            raise StrategyRobustnessError(invalid)
+        cost_policy = NautilusCostPolicy(
+            fee_multiplier=_decimal(cost_document["fee_multiplier"], "fee_multiplier", positive=True),
+            funding_multiplier=_decimal(cost_document["funding_multiplier"], "funding_multiplier", positive=True),
+            delay_bars=delay_bars,
+            slippage_model=cast(Literal["none", "one_tick"], cost_document["slippage_model"]),
+            fee_source=cast(str, cost_document["fee_source"]),
+            funding_source=cast(str, cost_document["funding_source"]),
+        )
+        scenario = cell["stress_scenario"]
+        if scenario not in policy.stress_scenarios:
+            raise StrategyRobustnessError(invalid)
+        expected_cost_policy, expected_offset = _scenario_cost_policy(
+            policy,
+            cast(StressScenario, scenario),
+        )
+        offset_value = cell["parameter_relative_offset"]
+        if not isinstance(offset_value, str):
+            raise StrategyRobustnessError(invalid)
+        offset = Decimal(offset_value)
+        if (
+            not offset.is_finite()
+            or offset_value != str(expected_offset)
+            or cost_policy != expected_cost_policy
+            or cost_document != {**cost_policy.document(), "cost_policy_id": cost_policy.cost_policy_id}
+            or cell["cost_policy_id"] != cost_policy.cost_policy_id
+        ):
+            raise StrategyRobustnessError(invalid)
+
+        parameters = cell["parameters"]
+        if not isinstance(parameters, dict) or not parameters:
+            raise StrategyRobustnessError(invalid)
+        canonical_json(parameters)
+        cell_id, evaluation_context_id = _cell_identity(
+            window=window,
+            stress_scenario=cast(StressScenario, scenario),
+            cost_policy=cost_policy,
+            parameters=parameters,
+            parameter_relative_offset=offset,
+        )
+        if cell["cell_id"] != cell_id or cell["evaluation_context_id"] != evaluation_context_id:
+            raise StrategyRobustnessError(invalid)
+        validated_cell = RobustnessCell(
+            cell_id,
+            evaluation_context_id,
+            window,
+            cast(StressScenario, scenario),
+            cost_policy,
+            dict(parameters),
+            offset,
+        )
+
+        artifact_sha256 = cell["artifact_sha256"]
+        verdict_id = cell["verdict_id"]
+        references_missing = artifact_sha256 is None and verdict_id is None
+        if not references_missing and (
+            any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in (artifact_sha256, verdict_id)
+            )
+            or artifact_sha256 != verdict_id
+        ):
+            raise StrategyRobustnessError(invalid)
+
+        technical_status = cell["technical_status"]
+        economic_status = cell["economic_status"]
+        reason_codes_value = cell["reason_codes"]
+        if (
+            technical_status not in {"PASS", "ERROR"}
+            or economic_status not in {"PASS", "FAIL", "NOT_MODELED"}
+            or not isinstance(reason_codes_value, list)
+            or not reason_codes_value
+            or not all(isinstance(reason, str) and reason for reason in reason_codes_value)
+        ):
+            raise StrategyRobustnessError(invalid)
+        reason_codes = tuple(reason_codes_value)
+        funding_truth = cell["funding_truth_status"]
+        if technical_status == "ERROR":
+            if (
+                economic_status != "NOT_MODELED"
+                or cell["net_account_delta"] is not None
+                or cell["realized_balance_drawdown"] is not None
+                or funding_truth is not None
+            ):
+                raise StrategyRobustnessError(invalid)
+        else:
+            net_value = cell["net_account_delta"]
+            drawdown_value = cell["realized_balance_drawdown"]
+            if not isinstance(net_value, str) or not isinstance(drawdown_value, str):
+                raise StrategyRobustnessError(invalid)
+            net = Decimal(net_value)
+            drawdown = Decimal(drawdown_value)
+            if (
+                not net.is_finite()
+                or not drawdown.is_finite()
+                or drawdown < 0
+                or funding_truth not in {"official", "modeled_funding", "mixed", "missing"}
+            ):
+                raise StrategyRobustnessError(invalid)
+            slippage_status = (
+                "unmodeled"
+                if any(
+                    reason in {
+                        "ONE_TICK_SLIPPAGE_NOT_MODELED_BY_NAUTILUS",
+                        "UNMODELED_SLIPPAGE",
+                    }
+                    for reason in reason_codes
+                )
+                else "modeled_one_tick"
+                if cost_policy.slippage_model == "one_tick"
+                else "modeled"
+            )
+            expected_reasons = _economic_reason_codes(
+                policy,
+                cost_policy,
+                net,
+                drawdown,
+                cast(str, funding_truth),
+                slippage_status,
+            )
+            if (
+                reason_codes != expected_reasons
+                or economic_status != ("PASS" if expected_reasons == ("CELL_ECONOMIC_PASS",) else "FAIL")
+            ):
+                raise StrategyRobustnessError(invalid)
+        return (
+            validated_cell,
+            cast(str, technical_status),
+            cast(str, economic_status),
+            reason_codes,
+            cast(str | None, funding_truth),
+            references_missing,
+        )
+    except (InvalidOperation, KeyError, TypeError, ValueError, StrategyRobustnessError) as error:
+        raise StrategyRobustnessError(invalid) from error
+
+
 def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, object]:
     shape = verdict.get("matrix_shape")
     cells = verdict.get("cells")
@@ -1089,18 +1354,16 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
     ):
         raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
     policy_document = verdict.get("policy")
-    if policy_document is None:
-        frozen_policy = load_robustness_policy(_REPOSITORY_POLICY_PATH)
-        if verdict.get("policy_id") != frozen_policy.policy_id:
-            raise StrategyRobustnessError("robustness verdict policy-bound matrix is invalid")
-        policy_document = frozen_policy.document()
-    if (
-        not isinstance(policy_document, dict)
-        or set(policy_document) != _POLICY_FIELDS
-        or not isinstance(policy_document.get("windowing"), dict)
-        or set(cast(dict[str, object], policy_document["windowing"])) != _WINDOW_FIELDS
-        or sha256(canonical_json(policy_document)).hexdigest() != verdict.get("policy_id")
-    ):
+    try:
+        frozen_policy = (
+            load_robustness_policy(_REPOSITORY_POLICY_PATH)
+            if policy_document is None
+            else load_robustness_policy(canonical_json(policy_document))
+        )
+    except StrategyRobustnessError as error:
+        raise StrategyRobustnessError("robustness verdict policy-bound matrix is invalid") from error
+    policy_document = frozen_policy.document()
+    if frozen_policy.policy_id != verdict.get("policy_id"):
         raise StrategyRobustnessError("robustness verdict policy-bound matrix is invalid")
     expected_shape = {
         "maximum_windows_per_scheme": policy_document.get("maximum_windows_per_scheme"),
@@ -1137,42 +1400,27 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
     }
     performance_unclaimable = False
     cell_ids: list[str] = []
+    validated_cells: list[RobustnessCell] = []
     for cell in cells:
-        if not isinstance(cell, dict) or cell.get("schema_version") != "robustness-cell-result-v1":
-            raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
-        window = cell.get("window")
-        technical_status = cell.get("technical_status")
-        economic_status = cell.get("economic_status")
-        reason_codes = cell.get("reason_codes")
-        if (
-            not isinstance(window, dict)
-            or window.get("scheme") not in schemes
-            or isinstance(window.get("ordinal"), bool)
-            or not isinstance(window.get("ordinal"), int)
-            or window["ordinal"] < 0
-            or cell.get("stress_scenario") not in scenarios
-            or technical_status not in {"PASS", "ERROR"}
-            or economic_status not in {"PASS", "FAIL", "NOT_MODELED"}
-            or (technical_status == "ERROR") != (economic_status == "NOT_MODELED")
-            or not isinstance(reason_codes, list)
-            or not reason_codes
-            or not all(isinstance(reason, str) and reason for reason in reason_codes)
-        ):
-            raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
-        cell_id = cell.get("cell_id")
-        if not isinstance(cell_id, str) or len(cell_id) != 64:
-            raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
-        cell_ids.append(cell_id)
+        validated_cell, technical_status, economic_status, reason_codes, funding_truth, references_missing = (
+            _validated_cell_document(cell, verdict, frozen_policy)
+        )
+        validated_cells.append(validated_cell)
+        cell_ids.append(validated_cell.cell_id)
         actual_matrix.append(
-            (cast(str, window["scheme"]), cast(int, window["ordinal"]), cast(str, cell["stress_scenario"])),
+            (
+                validated_cell.window.scheme,
+                validated_cell.window.ordinal,
+                validated_cell.stress_scenario,
+            ),
         )
         technical_invalid |= technical_status != "PASS"
         economic_fail |= economic_status == "FAIL"
-        funding_truth = cell.get("funding_truth_status")
         if funding_truth in funding_truth_counts:
             funding_truth_counts[cast(str, funding_truth)] += 1
         else:
             performance_unclaimable = True
+        performance_unclaimable |= references_missing
         performance_unclaimable |= any(
             reason in {
                 "ONE_TICK_SLIPPAGE_NOT_MODELED_BY_NAUTILUS",
@@ -1182,6 +1430,25 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
         )
 
     if len(cell_ids) != len(set(cell_ids)):
+        raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
+    baseline_parameters = next(
+        (cell.parameters for cell in validated_cells if cell.stress_scenario == "baseline"),
+        None,
+    )
+    if baseline_parameters is None or any(
+        cell.parameters
+        != (
+            parameter_neighborhood(baseline_parameters, cell.parameter_relative_offset)
+            if cell.parameter_relative_offset
+            else baseline_parameters
+        )
+        for cell in validated_cells
+    ):
+        raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
+    if verdict.get("evaluation_context_id") != robustness_evaluation_context_id(
+        frozen_policy,
+        validated_cells,
+    ):
         raise StrategyRobustnessError("robustness verdict cell-derived closure is invalid")
 
     expected_matrix = {
@@ -1263,6 +1530,8 @@ def build_robustness_verdict_v2(
     ]
     closure = _cell_derived_verdict_closure(
         {
+            "data_as_of_ns": bound_identity["data_as_of_ns"],
+            "evaluation_context_id": bound_identity["evaluation_context_id"],
             "cells": cell_documents,
             "matrix_shape": {
                 "maximum_windows_per_scheme": policy.maximum_windows_per_scheme,
@@ -1275,6 +1544,7 @@ def build_robustness_verdict_v2(
             "policy": policy.document(),
             "policy_id": policy.policy_id,
             "policy_version": policy.policy_version,
+            "trial_context": bound_trial_context,
         },
     )
     economic_results = [
@@ -1659,6 +1929,7 @@ def _verify_formal_cell_artifacts(
     experiment_id = verdict.get("experiment_id")
     if not isinstance(cells, list) or not isinstance(experiment_id, str):
         raise StrategyRobustnessError("formal cell artifact references are invalid")
+    claimable_advance = verdict.get("action") == "ADVANCE" and verdict.get("performance_claimable") is True
     for cell in cells:
         if not isinstance(cell, dict):
             raise StrategyRobustnessError("formal cell artifact references are invalid")
@@ -1666,6 +1937,8 @@ def _verify_formal_cell_artifacts(
         artifact_sha256 = cell.get("artifact_sha256")
         verdict_id = cell.get("verdict_id")
         if artifact_sha256 is None and verdict_id is None:
+            if claimable_advance:
+                raise StrategyRobustnessError("formal cell artifact references are invalid")
             continue
         if any(
             not isinstance(value, str)
@@ -1913,6 +2186,7 @@ def run_persisted_robustness(
             )
         else:
             action = build_action_v1(verdict, campaign_id=campaign_id)
+        _verify_formal_cell_artifacts(verdict, artifact_directory)
         publish_kwargs = {
             "experiment_hypothesis_id": survivor.hypothesis_id,
             "experiment_identity": identity,
