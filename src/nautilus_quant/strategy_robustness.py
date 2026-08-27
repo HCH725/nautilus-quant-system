@@ -188,10 +188,11 @@ class NautilusCostPolicy:
             raise StrategyRobustnessError("fee source must be Nautilus instrument metadata")
         if self.funding_source != "canonical_funding_observation_v1":
             raise StrategyRobustnessError("funding source must be canonical observations")
+        canonical_id = sha256(canonical_json(self.document())).hexdigest()
         if not self.cost_policy_id:
-            object.__setattr__(self, "cost_policy_id", sha256(canonical_json(self.document())).hexdigest())
-        elif len(self.cost_policy_id) != 64 or any(char not in "0123456789abcdef" for char in self.cost_policy_id):
-            raise StrategyRobustnessError("cost_policy_id must be lowercase SHA-256")
+            object.__setattr__(self, "cost_policy_id", canonical_id)
+        elif self.cost_policy_id != canonical_id:
+            raise StrategyRobustnessError("cost_policy_id must match the canonical cost policy")
 
     def document(self) -> dict[str, object]:
         return {
@@ -1501,13 +1502,21 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
         "funding_truth_counts": funding_truth_counts,
         "performance_claimable": performance_claimable,
         "reason_codes": [
-            *(["TECHNICAL_INVALID"] if technical_invalid or not complete else []),
+            *(["TECHNICAL_INVALID"] if technical_invalid or not complete or evidence_modeling_gap else []),
             *(["EVIDENCE_OR_MODELING_GAP"] if evidence_modeling_gap else []),
             *(["ECONOMIC_ROBUSTNESS_FAILED"] if economic_fail and not evidence_modeling_gap else []),
             "DSR_PBO_NOT_MODELED",
         ],
-        "status": "TECHNICAL_INVALID" if technical_invalid or not complete else "COMPLETE",
-        "technical_status": "ERROR" if technical_invalid or not complete else "PASS",
+        "status": (
+            "TECHNICAL_INVALID"
+            if technical_invalid or not complete or evidence_modeling_gap
+            else "COMPLETE"
+        ),
+        "technical_status": (
+            "ERROR"
+            if technical_invalid or not complete or evidence_modeling_gap
+            else "PASS"
+        ),
     }
 
 
@@ -1942,6 +1951,8 @@ def _verify_formal_cell_artifacts(
     verdict: Mapping[str, object],
     artifact_directory: Path,
 ) -> None:
+    from .candidate_backtest import load_candidate_backtest_verdict
+
     cells = verdict.get("cells")
     experiment_id = verdict.get("experiment_id")
     if not isinstance(cells, list) or not isinstance(experiment_id, str):
@@ -1973,11 +1984,29 @@ def _verify_formal_cell_artifacts(
         )
         try:
             payload = path.read_bytes()
-            decoded = json.loads(payload)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            decoded = load_candidate_backtest_verdict(payload)
+        except (OSError, RuntimeError) as error:
             raise StrategyRobustnessError("formal cell artifact readback failed") from error
         if sha256(payload).hexdigest() != artifact_sha256 or canonical_json(decoded) != payload:
             raise StrategyRobustnessError("formal cell artifact readback failed")
+        cost_policy = decoded.get("cost_policy")
+        execution = decoded.get("execution")
+        aggregate_cost_policy = cell.get("cost_policy")
+        if (
+            not isinstance(cost_policy, dict)
+            or not isinstance(execution, dict)
+            or not isinstance(aggregate_cost_policy, dict)
+            or cost_policy.get("cost_policy_id") != cell.get("cost_policy_id")
+            or execution.get("slippage_status")
+            != (
+                "modeled_one_tick"
+                if aggregate_cost_policy.get("slippage_model") == "one_tick"
+                else "modeled"
+                if aggregate_cost_policy.get("slippage_model") == "none"
+                else None
+            )
+        ):
+            raise StrategyRobustnessError("formal cell artifact policy binding is invalid")
 
 
 def run_persisted_robustness(

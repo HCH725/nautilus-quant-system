@@ -58,6 +58,28 @@ def _canonical(value: JsonValue) -> bytes:
     ).encode()
 
 
+def _cost_policy_id(
+    *,
+    fee_multiplier: Decimal = Decimal("1"),
+    funding_multiplier: Decimal = Decimal("1"),
+    delay_bars: int = 0,
+    slippage_model: str = "none",
+) -> str:
+    return sha256(
+        _canonical(
+            {
+                "delay_bars": delay_bars,
+                "fee_multiplier": str(fee_multiplier),
+                "fee_source": "nautilus_instrument_metadata",
+                "funding_multiplier": str(funding_multiplier),
+                "funding_source": "canonical_funding_observation_v1",
+                "schema_version": "nautilus-cost-policy-v1",
+                "slippage_model": slippage_model,
+            },
+        ),
+    ).hexdigest()
+
+
 def _instrument(*, production_constraints: bool = False) -> CryptoPerpetual:
     return CryptoPerpetual(
         InstrumentId.from_str(INSTRUMENT_ID),
@@ -757,6 +779,12 @@ class CandidateBacktestTests(unittest.TestCase):
                     load_candidate_backtest_verdict(_canonical(invalid))
 
     def test_tracked_cost_policy_is_bound_to_a_formal_replay(self) -> None:
+        cost_policy_id = _cost_policy_id(
+            fee_multiplier=Decimal("2"),
+            funding_multiplier=Decimal("2"),
+            delay_bars=1,
+            slippage_model="one_tick",
+        )
         request = replace(
             self.request,
             code_commit="a" * 40,
@@ -768,12 +796,12 @@ class CandidateBacktestTests(unittest.TestCase):
             funding_multiplier=Decimal("2"),
             delay_bars=1,
             slippage_model="one_tick",
-            cost_policy_id="f" * 64,
+            cost_policy_id=cost_policy_id,
         )
         result = run_candidate_backtest(request)
         verdict = load_candidate_backtest_verdict(result.canonical_bytes)
         self.assertEqual(verdict["cost_policy"], {
-            "cost_policy_id": "f" * 64,
+            "cost_policy_id": cost_policy_id,
             "delay_bars": 1,
             "fee_multiplier": "2",
             "fee_source": "nautilus_instrument_metadata",
@@ -782,6 +810,14 @@ class CandidateBacktestTests(unittest.TestCase):
             "schema_version": "nautilus-cost-policy-v1",
             "slippage_model": "one_tick",
         })
+
+    def test_request_rejects_cost_policy_id_mismatched_to_canonical_policy(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "cost_policy_id.*canonical"):
+            replace(
+                self.request,
+                fee_multiplier=Decimal("2"),
+                cost_policy_id="f" * 64,
+            )
 
     def test_one_tick_slippage_is_executed_by_nautilus_not_only_labeled(self) -> None:
         base = replace(
@@ -795,7 +831,11 @@ class CandidateBacktestTests(unittest.TestCase):
 
         unstressed = run_candidate_backtest(base).verdict
         stressed = run_candidate_backtest(
-            replace(base, slippage_model="one_tick", cost_policy_id="f" * 64),
+            replace(
+                base,
+                slippage_model="one_tick",
+                cost_policy_id=_cost_policy_id(slippage_model="one_tick"),
+            ),
         ).verdict
 
         self.assertEqual(stressed["execution"]["slippage_status"], "modeled_one_tick")
@@ -814,7 +854,7 @@ class CandidateBacktestTests(unittest.TestCase):
                 data_as_of_ns=10 * HOUR_NS,
                 evaluation_context_id="e" * 64,
                 delay_bars=1,
-                cost_policy_id="f" * 64,
+                cost_policy_id=_cost_policy_id(delay_bars=1),
             ),
         )
 
@@ -849,13 +889,33 @@ class CandidateBacktestTests(unittest.TestCase):
                 data_as_of_ns=10 * HOUR_NS,
                 evaluation_context_id="e" * 64,
                 fee_multiplier=Decimal("2"),
-                cost_policy_id="f" * 64,
+                cost_policy_id=_cost_policy_id(fee_multiplier=Decimal("2")),
             ),
         )
         verdict = load_candidate_backtest_verdict(formal.canonical_bytes)
         self.assertEqual(verdict["execution"]["slippage_status"], "modeled")
-        self.assertEqual(verdict["cost_policy"]["cost_policy_id"], "f" * 64)
+        self.assertEqual(
+            verdict["cost_policy"]["cost_policy_id"],
+            _cost_policy_id(fee_multiplier=Decimal("2")),
+        )
         self.assertEqual(verdict["cost_policy"]["slippage_model"], "none")
+
+    def test_verdict_loader_rejects_rehashed_mismatched_cost_policy_id(self) -> None:
+        result = run_candidate_backtest(
+            replace(
+                self.request,
+                code_commit="a" * 40,
+                fee_multiplier=Decimal("2"),
+                cost_policy_id=_cost_policy_id(fee_multiplier=Decimal("2")),
+            ),
+        )
+        invalid = json.loads(json.dumps(result.verdict))
+        invalid["cost_policy"]["cost_policy_id"] = "f" * 64
+        invalid.pop("canonical_result_hash")
+        invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+        with self.assertRaisesRegex(RuntimeError, "cost policy.*identity"):
+            load_candidate_backtest_verdict(_canonical(invalid))
 
     def test_verdict_loader_rejects_modeled_slippage_without_bound_cost_policy(self) -> None:
         result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))

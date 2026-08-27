@@ -258,6 +258,13 @@ class CandidateBacktestRequest:
         for name, value in (("cost_policy_id", self.cost_policy_id), ("robustness_cell_id", self.robustness_cell_id)):
             if value is not None and (_SHA256.fullmatch(value) is None):
                 raise CandidateBacktestError(f"{name} must be lowercase SHA-256")
+        if self.cost_policy_id is not None and self.cost_policy_id != _canonical_cost_policy_id(
+            self.fee_multiplier,
+            self.funding_multiplier,
+            self.delay_bars,
+            self.slippage_model,
+        ):
+            raise CandidateBacktestError("cost_policy_id must match the canonical cost policy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +363,41 @@ def _canonical(value: JsonValue) -> bytes:
         )
         + "\n"
     ).encode()
+
+
+def _cost_policy_document(
+    fee_multiplier: Decimal,
+    funding_multiplier: Decimal,
+    delay_bars: int,
+    slippage_model: str,
+) -> dict[str, JsonValue]:
+    return {
+        "delay_bars": delay_bars,
+        "fee_multiplier": str(fee_multiplier),
+        "fee_source": "nautilus_instrument_metadata",
+        "funding_multiplier": str(funding_multiplier),
+        "funding_source": "canonical_funding_observation_v1",
+        "schema_version": "nautilus-cost-policy-v1",
+        "slippage_model": slippage_model,
+    }
+
+
+def _canonical_cost_policy_id(
+    fee_multiplier: Decimal,
+    funding_multiplier: Decimal,
+    delay_bars: int,
+    slippage_model: str,
+) -> str:
+    return sha256(
+        _canonical(
+            _cost_policy_document(
+                fee_multiplier,
+                funding_multiplier,
+                delay_bars,
+                slippage_model,
+            ),
+        ),
+    ).hexdigest()
 
 
 def _mapping(value: JsonValue, name: str) -> dict[str, JsonValue]:
@@ -607,11 +649,31 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
             raise CandidateBacktestError("Nautilus verdict cost policy schema is invalid")
         if cost_policy["fee_source"] != "nautilus_instrument_metadata" or cost_policy["funding_source"] != "canonical_funding_observation_v1":
             raise CandidateBacktestError("Nautilus verdict cost policy source is invalid")
-        _verdict_decimal(cost_policy["fee_multiplier"], "cost_policy.fee_multiplier", positive=True)
-        _verdict_decimal(cost_policy["funding_multiplier"], "cost_policy.funding_multiplier", positive=True)
-        _verdict_integer(cost_policy["delay_bars"], "cost_policy.delay_bars")
+        fee_multiplier = _verdict_decimal(
+            cost_policy["fee_multiplier"],
+            "cost_policy.fee_multiplier",
+            positive=True,
+        )
+        funding_multiplier = _verdict_decimal(
+            cost_policy["funding_multiplier"],
+            "cost_policy.funding_multiplier",
+            positive=True,
+        )
+        delay_bars = _verdict_integer(cost_policy["delay_bars"], "cost_policy.delay_bars")
         if cost_policy["slippage_model"] not in {"none", "one_tick"}:
             raise CandidateBacktestError("Nautilus verdict cost policy slippage is invalid")
+        if (
+            delay_bars is None
+            or delay_bars < 0
+            or cost_policy["cost_policy_id"]
+            != _canonical_cost_policy_id(
+                fee_multiplier,
+                funding_multiplier,
+                delay_bars,
+                str(cost_policy["slippage_model"]),
+            )
+        ):
+            raise CandidateBacktestError("Nautilus verdict cost policy identity is invalid")
     claimed_result_hash = _verdict_content_id(
         document["canonical_result_hash"],
         "canonical_result_hash",
@@ -1677,21 +1739,20 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
                 "reason_code": parity.reason_code,
             }
         if formal_cost_policy:
-            cost_policy_document: dict[str, JsonValue] = {
-                "delay_bars": request.delay_bars,
-                "fee_multiplier": str(request.fee_multiplier),
-                "fee_source": "nautilus_instrument_metadata",
-                "funding_multiplier": str(request.funding_multiplier),
-                "funding_source": "canonical_funding_observation_v1",
-                "schema_version": "nautilus-cost-policy-v1",
-                "slippage_model": request.slippage_model,
-            }
-            cost_policy_id = request.cost_policy_id or sha256(
-                _canonical(cost_policy_document),
-            ).hexdigest()
+            cost_policy_document = _cost_policy_document(
+                request.fee_multiplier,
+                request.funding_multiplier,
+                request.delay_bars,
+                request.slippage_model,
+            )
             verdict["cost_policy"] = {
                 **cost_policy_document,
-                "cost_policy_id": cost_policy_id,
+                "cost_policy_id": _canonical_cost_policy_id(
+                    request.fee_multiplier,
+                    request.funding_multiplier,
+                    request.delay_bars,
+                    request.slippage_model,
+                ),
             }
         verdict["canonical_result_hash"] = sha256(_canonical(verdict)).hexdigest()
         payload = _canonical(verdict)

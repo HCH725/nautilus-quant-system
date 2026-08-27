@@ -16,13 +16,18 @@ matches the repository's frozen policy, whose shape is then authoritative. A
 window, tier, cost policy, or identity change therefore produces a new artifact
 and cannot reuse the old verdict.
 
+Each formal `nautilus-cost-policy-v1` identity is SHA-256 over its canonical
+policy document. The producer and loader reject caller-supplied or persisted
+identities that do not match those bytes. Persisted formal cell reuse decodes
+each candidate verdict through the candidate loader and requires its cost-policy
+identity and modeled slippage status to match the aggregate cell.
+
 Technical and economic evidence are orthogonal:
 
 | evidence | action |
 | --- | --- |
-| incomplete matrix or technical cell error | `FIX_TECHNICAL` |
+| incomplete matrix, technical cell error, or required evidence/modeling gap | `FIX_TECHNICAL` with `status=TECHNICAL_INVALID` and `technical_status=ERROR` |
 | complete technical run with failed economic threshold | `MUTATE`, `NEW_FAMILY`, or `KILL` |
-| complete pass with a required cost/stress not modeled | `MUTATE`/`HOLD` |
 | complete, technically valid, economically valid, fully modeled evidence | `ADVANCE` |
 
 `DSR` and `PBO` remain explicitly `NOT_MODELED`, but that status alone does

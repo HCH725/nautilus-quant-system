@@ -56,6 +56,7 @@ from nautilus_quant.strategy_robustness import (
     parameter_neighborhood,
     robustness_evaluation_context_id,
     FormalNautilusEvaluator,
+    NautilusCostPolicy,
     RobustnessCellResult,
 )
 
@@ -630,8 +631,19 @@ def _run_persisted_mutation(
     candidate_id = fixture["candidate_id"]
 
     def reject(_request: object, _cell: object) -> SimpleNamespace:
+        cell = cast(Any, _cell)
         verdict = {
-            "execution": {"slippage_status": "modeled_one_tick"},
+            "cost_policy": {
+                **cell.cost_policy.document(),
+                "cost_policy_id": cell.cost_policy.cost_policy_id,
+            },
+            "execution": {
+                "slippage_status": (
+                    "modeled_one_tick"
+                    if cell.cost_policy.slippage_model == "one_tick"
+                    else "modeled"
+                ),
+            },
             "funding": {"truth_status": "official"},
             "net_account_delta": "-1",
             "realized_balance_drawdown": "0",
@@ -657,6 +669,10 @@ def _run_persisted_mutation(
         patch(
             "nautilus_quant.strategy_lab.load_candidate_backtest_verdict",
             return_value=fixture["historical_document"],
+        ),
+        patch(
+            "nautilus_quant.candidate_backtest.load_candidate_backtest_verdict",
+            side_effect=lambda payload: json.loads(payload),
         ),
         patch(
             "nautilus_quant.candidate_backtest.validated_candidate_source_bars",
@@ -704,6 +720,10 @@ def _run_persisted_mutation(
 
 
 class StrategyRobustnessPolicyTests(unittest.TestCase):
+    def test_cost_policy_rejects_explicit_noncanonical_identity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cost_policy_id.*canonical"):
+            NautilusCostPolicy(fee_multiplier=Decimal("2"), cost_policy_id="f" * 64)
+
     def test_loaded_policy_preserves_canonical_config_identity(self) -> None:
         path = ROOT / "config/strategy_robustness_policy.json"
         policy = load_robustness_policy(path)
@@ -781,8 +801,19 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         def evaluate(request: object, cell: object) -> SimpleNamespace:
             self.assertEqual(getattr(request, "policy_path"), Path("accounting-policy.json"))
             self.assertGreaterEqual(getattr(cell, "window").train_start_ns, 3)
+            cost_policy = getattr(cell, "cost_policy")
             verdict = {
-                "execution": {"slippage_status": "modeled_one_tick"},
+                "cost_policy": {
+                    **cost_policy.document(),
+                    "cost_policy_id": cost_policy.cost_policy_id,
+                },
+                "execution": {
+                    "slippage_status": (
+                        "modeled_one_tick"
+                        if cost_policy.slippage_model == "one_tick"
+                        else "modeled"
+                    ),
+                },
                 "funding": {"truth_status": "official"},
                 "net_account_delta": "1",
                 "realized_balance_drawdown": "0",
@@ -835,6 +866,10 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             patch(
                 "nautilus_quant.strategy_lab._hash_tree",
                 return_value="3" * 64,
+            ),
+            patch(
+                "nautilus_quant.candidate_backtest.load_candidate_backtest_verdict",
+                side_effect=lambda payload: json.loads(payload),
             ),
         ):
             summary = strategy_robustness.run_persisted_robustness(
@@ -2035,6 +2070,8 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             trial_context=_trial_context(),
         )
         self.assertEqual(verdict["action"], "MUTATE")
+        self.assertEqual(verdict["status"], "COMPLETE")
+        self.assertEqual(verdict["technical_status"], "PASS")
         with self.assertRaisesRegex(ValueError, "mutation lineage"):
             build_action_v1(verdict)
         inputs = {
@@ -2097,6 +2134,9 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             trial_context=_trial_context(),
         )
         self.assertEqual(verdict["action"], "FIX_TECHNICAL")
+        self.assertEqual(verdict["status"], "TECHNICAL_INVALID")
+        self.assertEqual(verdict["technical_status"], "ERROR")
+        self.assertTrue(verdict["complete_matrix"])
         self.assertIn("EVIDENCE_OR_MODELING_GAP", verdict["reason_codes"])
         self.assertFalse(verdict["performance_claimable"])
         action = build_action_v1(verdict, campaign_id="b" * 64)
@@ -2174,14 +2214,19 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
 
         def evaluate(request: object, cell: object) -> SimpleNamespace:
             window = getattr(cell, "window")
+            cost_policy = getattr(cell, "cost_policy")
             seen.append(window.train_start_ns)
             self.assertGreaterEqual(window.train_start_ns, first_official_funding_ns)
             slippage_status = (
                 "modeled_one_tick"
-                if getattr(cell, "cost_policy").slippage_model == "one_tick"
+                if cost_policy.slippage_model == "one_tick"
                 else "modeled"
             )
             verdict = {
+                "cost_policy": {
+                    **cost_policy.document(),
+                    "cost_policy_id": cost_policy.cost_policy_id,
+                },
                 "execution": {"slippage_status": slippage_status},
                 "funding": {"truth_status": "official"},
                 "net_account_delta": "1",
@@ -2233,6 +2278,10 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                 },
             ),
             patch("nautilus_quant.strategy_lab._hash_tree", return_value="3" * 64),
+            patch(
+                "nautilus_quant.candidate_backtest.load_candidate_backtest_verdict",
+                side_effect=lambda payload: json.loads(payload),
+            ),
         ):
             summary = strategy_robustness.run_persisted_robustness(
                 ledger=ledger,
@@ -2337,6 +2386,36 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             )
             self.assertEqual(reuse["action"], summary["action"])
             self.assertEqual(reuse["reused"], True)
+
+            persisted = strategy_robustness.load_robustness_verdict_v2(
+                Path(cast(str, summary["verdict_path"])).read_bytes(),
+            )
+            persisted_cells = cast(list[dict[str, object]], persisted["cells"])
+            baseline = next(cell for cell in persisted_cells if cell["stress_scenario"] == "baseline")
+            fee_stress = next(cell for cell in persisted_cells if cell["stress_scenario"] == "fee_2x")
+            baseline_payload = (
+                artifact_directory
+                / str(summary["experiment_id"])
+                / "cells"
+                / str(baseline["cell_id"])
+                / "nautilus-verdict-v1.json"
+            ).read_bytes()
+            fee_stress_path = (
+                artifact_directory
+                / str(summary["experiment_id"])
+                / "cells"
+                / str(fee_stress["cell_id"])
+                / "nautilus-verdict-v1.json"
+            )
+            fee_stress_path.write_bytes(baseline_payload)
+            fee_stress["artifact_sha256"] = hashlib.sha256(baseline_payload).hexdigest()
+            fee_stress["verdict_id"] = fee_stress["artifact_sha256"]
+
+            with self.assertRaisesRegex(ValueError, "formal cell artifact"):
+                strategy_robustness._verify_formal_cell_artifacts(
+                    persisted,
+                    artifact_directory,
+                )
 
     def test_windows_use_closed_training_bars_and_verdict_exposes_cell_identity(self) -> None:
         frozen = load_robustness_policy(ROOT / "config/strategy_robustness_policy.json")
