@@ -281,6 +281,7 @@ class _Policy:
     quantity: Quantity
     historical_start: str
     historical_start_ns: int
+    official_only_window_start: str
     decision_version: str
     signal_timing: str
     slippage_status: str
@@ -704,13 +705,16 @@ def load_candidate_backtest_verdict(payload: bytes) -> dict[str, JsonValue]:
         raise CandidateBacktestError("Nautilus verdict execution boundary is invalid")
     slippage_status = execution["slippage_status"]
     allowed_slippage_statuses = {_SLIPPAGE_STATUS}
-    if isinstance(cost_policy, dict) and cost_policy["slippage_model"] == "one_tick":
-        allowed_slippage_statuses.add("modeled_one_tick")
+    if isinstance(cost_policy, dict):
+        if cost_policy["slippage_model"] == "one_tick":
+            allowed_slippage_statuses.add("modeled_one_tick")
+        else:
+            allowed_slippage_statuses.add("modeled")
     if slippage_status not in allowed_slippage_statuses:
         raise CandidateBacktestError("Nautilus verdict slippage policy is invalid")
-    if slippage_status == "modeled_one_tick" and (
+    if slippage_status in {"modeled", "modeled_one_tick"} and (
         not isinstance(cost_policy, dict)
-        or cost_policy["slippage_model"] != "one_tick"
+        or (slippage_status == "modeled_one_tick") != (cost_policy["slippage_model"] == "one_tick")
     ):
         raise CandidateBacktestError("Nautilus verdict modeled slippage is unbound")
     fixed_quantity = _verdict_decimal(
@@ -935,6 +939,7 @@ def _load_policy(path: Path) -> _Policy:
         quantity=Quantity.from_str(str(_decimal(root["fixed_quantity_btc"], "fixed_quantity_btc"))),
         historical_start=root["historical_start"],
         historical_start_ns=int(historical_start.timestamp()) * 1_000_000_000,
+        official_only_window_start=root["official_only_window_start"],
         decision_version=root["decision_policy_version"],
         signal_timing=root["signal_timing"],
         slippage_status=root["slippage_status"],
@@ -1566,9 +1571,18 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
             if modeled_count and official_count
             else "missing"
         )
+        formal_cost_policy = (
+            request.fee_multiplier != Decimal("1")
+            or request.funding_multiplier != Decimal("1")
+            or request.delay_bars != 0
+            or request.slippage_model != "none"
+            or request.cost_policy_id is not None
+        )
         slippage_status = (
             "modeled_one_tick"
             if request.slippage_model == "one_tick"
+            else "modeled"
+            if formal_cost_policy
             else policy.slippage_status
         )
         reason_codes = [
@@ -1662,13 +1676,7 @@ def run_candidate_backtest(request: CandidateBacktestRequest) -> CandidateBackte
                 "outcome": parity.outcome,
                 "reason_code": parity.reason_code,
             }
-        if (
-            request.fee_multiplier != Decimal("1")
-            or request.funding_multiplier != Decimal("1")
-            or request.delay_bars != 0
-            or request.slippage_model != "none"
-            or request.cost_policy_id is not None
-        ):
+        if formal_cost_policy:
             cost_policy_document: dict[str, JsonValue] = {
                 "delay_bars": request.delay_bars,
                 "fee_multiplier": str(request.fee_multiplier),

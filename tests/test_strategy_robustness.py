@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,9 +14,32 @@ from tempfile import TemporaryDirectory
 from typing import Any, cast
 import unittest
 
+from nautilus_trader.model import (
+    CryptoPerpetual,
+    Currency,
+    InstrumentId,
+    Price,
+    Quantity,
+    Symbol,
+)
+from nautilus_trader.persistence import ParquetDataCatalog
 import nautilus_quant.strategy_lab as strategy_lab
 import nautilus_quant.strategy_robustness as strategy_robustness
-from nautilus_quant.candidate_backtest import CandidateBacktestError, CandidateBacktestRequest
+from nautilus_quant.candidate_backtest import (
+    CandidateBacktestError,
+    CandidateBacktestRequest,
+    load_candidate_backtest_verdict,
+    run_candidate_backtest,
+    run_signal_parity_gate,
+)
+from nautilus_quant.funding_observation import migrate_funding_observations
+from nautilus_quant.nautilus_io import make_bar
+from nautilus_quant.strategy_families import (
+    KERNEL_HASH,
+    KERNEL_VERSION,
+    ClosedBar,
+    evaluate_batch,
+)
 from nautilus_quant.strategy_robustness import (
     deterministic_regime_label,
     build_action_v1,
@@ -37,6 +61,317 @@ from nautilus_quant.strategy_robustness import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+_INTEGRATION_INSTRUMENT_ID = "BTCUSDT-PERP.BINANCE"
+_INTEGRATION_BAR_TYPE = f"{_INTEGRATION_INSTRUMENT_ID}-1-HOUR-LAST-EXTERNAL"
+_INTEGRATION_HOUR_NS = 60 * 60 * 1_000_000_000
+_INTEGRATION_HOUR_MS = _INTEGRATION_HOUR_NS // 1_000_000
+_INTEGRATION_USDT = Currency.from_str("USDT")
+_INTEGRATION_BTC = Currency.from_str("BTC")
+_INTEGRATION_BARS = 24
+
+
+def _integration_instrument() -> CryptoPerpetual:
+    return CryptoPerpetual(
+        InstrumentId.from_str(_INTEGRATION_INSTRUMENT_ID),
+        Symbol("BTCUSDT"),
+        _INTEGRATION_BTC,
+        _INTEGRATION_USDT,
+        _INTEGRATION_USDT,
+        False,
+        2,
+        3,
+        Price.from_str("0.01"),
+        Quantity.from_str("0.001"),
+        0,
+        0,
+        multiplier=None,
+        lot_size=None,
+        max_quantity=None,
+        min_quantity=None,
+        min_notional=None,
+        max_price=None,
+        min_price=None,
+        margin_init=Decimal("0.01"),
+        margin_maint=Decimal("0.005"),
+        maker_fee=Decimal("0.001"),
+        taker_fee=Decimal("0.001"),
+    )
+
+
+def _integration_catalog_digest(catalog_path: Path) -> str:
+    digest = hashlib.sha256()
+    files = sorted((catalog_path / "data" / "bars" / _INTEGRATION_BAR_TYPE).glob("*.parquet"))
+    for item in files:
+        digest.update(item.relative_to(catalog_path).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(item.read_bytes())
+    return digest.hexdigest()
+
+
+class _IntegrationFundingClient:
+    def funding(self, symbol: str, start_ms: int, end_ms: int) -> list[dict[str, object]]:
+        del start_ms, end_ms
+        return [
+            {"symbol": symbol, "fundingTime": hour * _INTEGRATION_HOUR_MS, "fundingRate": "0.01", "markPrice": "1000"}
+            for hour in (4, 12, 20)
+        ]
+
+
+def _build_integration_evidence(root: Path) -> dict[str, Any]:
+    """Build a real catalog, funding store, and parity-passed v2 candidate on disk.
+
+    Returns the survivor inputs the persisted robustness orchestration needs.
+    """
+    catalog_path = root / "catalog"
+    catalog_path.mkdir()
+    catalog = ParquetDataCatalog(str(catalog_path))
+    catalog.write_instruments([_integration_instrument()])
+    catalog.write_bars(
+        [
+            make_bar(
+                instrument_id=_INTEGRATION_INSTRUMENT_ID,
+                interval="1h",
+                price_type="LAST",
+                price_precision=2,
+                size_precision=3,
+                open_="1000",
+                high="1000",
+                low="1000",
+                close="1000",
+                volume="10",
+                close_ms=hour * _INTEGRATION_HOUR_MS,
+            )
+            for hour in range(1, _INTEGRATION_BARS + 1)
+        ],
+    )
+    funding_path = root / "funding"
+    migrate_funding_observations(
+        client=_IntegrationFundingClient(),
+        funding_path=funding_path,
+        symbols=("BTCUSDT",),
+        start_ms=4 * _INTEGRATION_HOUR_MS,
+        end_ms=21 * _INTEGRATION_HOUR_MS,
+    )
+    bars = [
+        ClosedBar(
+            ts_event_ns=hour * _INTEGRATION_HOUR_NS,
+            open=1000,
+            high=1000,
+            low=1000,
+            close=1000,
+            volume=10,
+        )
+        for hour in range(1, _INTEGRATION_BARS + 1)
+    ]
+    parameters = {"entry_threshold": 0.0, "lookback_bars": 2}
+    decisions = evaluate_batch(
+        family_id="lookback-momentum-long-flat",
+        family_version="lookback-momentum-long-flat-v1",
+        parameters=parameters,
+        bars=bars,
+    )
+    source_hash = _integration_catalog_digest(catalog_path)
+    candidate = {
+        "bar_type": _INTEGRATION_BAR_TYPE,
+        "evaluation_context_id": "7" * 64,
+        "instrument_id": _INTEGRATION_INSTRUMENT_ID,
+        "runtime": {
+            "environment_id": "d" * 64,
+            "pybroker_version": "1.2.14",
+            "python_version": "3.12.13",
+            "seed": 42,
+        },
+        "schema_version": "pybroker-candidate-v2",
+        "signals": [asdict(item) for item in decisions],
+        "source": {
+            "data_as_of_ns": _INTEGRATION_BARS * _INTEGRATION_HOUR_NS,
+            "data_snapshot_id": source_hash,
+            "first_ts_event_ns": _INTEGRATION_HOUR_NS,
+            "last_ts_event_ns": _INTEGRATION_BARS * _INTEGRATION_HOUR_NS,
+            "row_count": _INTEGRATION_BARS,
+            "sha256": source_hash,
+        },
+        "strategy": {
+            "decision_timing": "bar-close; effective no earlier than next event",
+            "family_id": "lookback-momentum-long-flat",
+            "family_version": "lookback-momentum-long-flat-v1",
+            "kernel_hash": KERNEL_HASH,
+            "kernel_version": KERNEL_VERSION,
+            "parameters": parameters,
+        },
+        "truth_status": "provisional",
+    }
+    run_dir = root / "historical-run"
+    run_dir.mkdir()
+    candidate_path = run_dir / "candidate.json"
+    candidate_path.write_bytes(canonical_json(candidate))
+    candidate_id = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    parity = run_signal_parity_gate(candidate_path, catalog_path)
+    return {
+        "candidate": candidate,
+        "candidate_id": candidate_id,
+        "candidate_path": candidate_path,
+        "catalog_path": catalog_path,
+        "funding_path": funding_path,
+        "parity": parity,
+        "run_dir": run_dir,
+        "source_hash": source_hash,
+    }
+
+
+def _integration_utc_from_ns(timestamp_ns: int) -> str:
+    from datetime import datetime, timezone
+
+    seconds, nanos = divmod(timestamp_ns, 1_000_000_000)
+    whole = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return f"{whole}.{nanos:09d}Z" if nanos else f"{whole}Z"
+
+
+def _seed_real_ledger(
+    root: Path,
+    evidence: dict[str, Any],
+    accounting_policy_path: Path,
+    robustness_policy_path: Path,
+    market_data_path: Path,
+    artifact_directory: Path,
+) -> tuple[Any, str, Any]:
+    ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
+    ledger.initialize()
+    hypothesis = {
+        "bar_type": _INTEGRATION_BAR_TYPE,
+        "based_on_verdict_id": None,
+        "falsification": "Economic instability rejects the hypothesis",
+        "family_version": "lookback-momentum-long-flat-v1",
+        "instrument_id": _INTEGRATION_INSTRUMENT_ID,
+        "parameters": {"entry_threshold": 0.0, "lookback_bars": 2},
+        "parent_strategy_id": None,
+        "schema_version": "strategy-hypothesis-v2",
+        "strategy_family": "lookback-momentum-long-flat",
+        "thesis": "Positive momentum persists",
+    }
+    hypothesis_path = root / "source-hypothesis.json"
+    hypothesis_path.write_bytes(canonical_json(hypothesis))
+    source = strategy_lab.load_strategy_hypothesis(hypothesis_path)
+    ledger.record_hypothesis(source)
+    data_source_id = strategy_lab._hash_tree(
+        strategy_lab.StrategyLoopPaths(
+            market_data_path=market_data_path,
+            policy_path=accounting_policy_path,
+            catalog_path=evidence["catalog_path"],
+            funding_path=evidence["funding_path"],
+            state_path=artifact_directory,
+        ),
+    )
+    as_of_ns = _INTEGRATION_BARS * _INTEGRATION_HOUR_NS
+    base_identity = strategy_lab.ExperimentIdentity(
+        source.strategy_id,
+        data_source_id,
+        "5" * 64,
+        "historical-engine",
+        "6" * 64,
+        as_of_ns,
+        evidence["source_hash"],
+    )
+    historical_experiment_id = ledger.record_experiment(source.hypothesis_id, base_identity)
+    run_dir = evidence["run_dir"]
+    pybroker_path = run_dir / "pybroker-result.json"
+    pybroker_path.write_bytes(canonical_json({"candidate_id": evidence["candidate_id"]}))
+    request = CandidateBacktestRequest(
+        candidate_path=evidence["candidate_path"],
+        catalog_path=evidence["catalog_path"],
+        funding_path=evidence["funding_path"],
+        policy_path=accounting_policy_path,
+        hypothesis_id=source.hypothesis_id,
+        strategy_id=source.strategy_id,
+        experiment_id=historical_experiment_id,
+        code_commit="c" * 40,
+        evaluation_start_utc="1970-01-01T00:00:00.000000001Z",
+        evaluation_end_utc=_integration_utc_from_ns(as_of_ns),
+        data_as_of_ns=as_of_ns,
+        evaluation_context_id="7" * 64,
+        signal_parity=evidence["parity"],
+    )
+    historical = run_candidate_backtest(request)
+    historical_path = run_dir / "nautilus-verdict.json"
+    historical_path.write_bytes(historical.canonical_bytes)
+    historical_reason = cast(str, historical.verdict["reason_codes"][0])
+    historical_sha256 = hashlib.sha256(historical_path.read_bytes()).hexdigest()
+    campaign_document = {
+        "approved_bar_types": [_INTEGRATION_BAR_TYPE],
+        "approved_instruments": [_INTEGRATION_INSTRUMENT_ID],
+        "data_as_of_ns": as_of_ns,
+        "family_id": source.family_id,
+        "family_version": source.family_version,
+        "generation_budget": 1,
+        "maximum_candidates": 1,
+        "parameter_search_policy_id": "9" * 64,
+        "schema_version": "strategy-campaign-v1",
+        "screen_policy_id": "a" * 64,
+        "search_space": {"entry_threshold": [0.0], "lookback_bars": [2]},
+        "seed": 42,
+    }
+    campaign_payload = canonical_json(campaign_document)
+    campaign_id = hashlib.sha256(campaign_payload).hexdigest()
+    historical_record = strategy_lab.VerdictRecord(
+        historical_experiment_id,
+        "SUCCESS",
+        historical_reason,
+        str(historical_path),
+        historical_sha256,
+    )
+    historical_verdict_id = strategy_lab._verdict_record_id(historical_record)
+    with closing(sqlite3.connect(ledger.path)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO campaigns VALUES (?, ?, ?, ?, ?)",
+            (campaign_id, campaign_payload.decode(), "a" * 64, as_of_ns, data_source_id),
+        )
+        connection.execute(
+            "INSERT INTO campaign_trials VALUES (?, 0, ?, ?, 'SURVIVED', 1, ?, ?)",
+            (
+                campaign_id,
+                source.strategy_id,
+                evidence["candidate_id"],
+                historical_experiment_id,
+                canonical_json(["SCREEN_PASSED"]).decode(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO stage_results VALUES (?, ?, 'PyBroker completed', 'PASSED', ?, ?, ?)",
+            (
+                historical_experiment_id,
+                source.strategy_id,
+                "PYBROKER_PROCESS_COMPLETED",
+                str(pybroker_path),
+                hashlib.sha256(pybroker_path.read_bytes()).hexdigest(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO signal_parity_results VALUES (?, ?, ?, ?, ?, 'PASS', ?, NULL, ?, ?)",
+            (
+                "8" * 64,
+                historical_experiment_id,
+                evidence["candidate_id"],
+                "7" * 64,
+                evidence["source_hash"],
+                "SIGNAL_PARITY_PASS",
+                str(run_dir / "parity.json"),
+                hashlib.sha256(b"parity").hexdigest(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO verdicts VALUES (?, ?, ?, 'SUCCESS', ?, ?, ?)",
+            (
+                historical_verdict_id,
+                historical_experiment_id,
+                source.strategy_id,
+                historical_reason,
+                str(historical_path),
+                historical_sha256,
+            ),
+        )
+    return ledger, campaign_id, source
 
 
 def _trial_context(
@@ -336,7 +671,22 @@ def _run_persisted_mutation(
         ),
         patch(
             "nautilus_quant.candidate_backtest._load_policy",
-            return_value=SimpleNamespace(historical_start_ns=1),
+            return_value=SimpleNamespace(
+                historical_start_ns=1,
+                official_only_window_start="first_official_funding_observation",
+            ),
+        ),
+        patch(
+            "nautilus_quant.candidate_backtest._funding_symbols",
+            return_value=("BTCUSDT",),
+        ),
+        patch(
+            "nautilus_quant.funding_observation.read_funding_observations",
+            return_value={
+                "BTCUSDT": [
+                    SimpleNamespace(truth_status="official", funding_time_ns=1),
+                ],
+            },
         ),
         patch("nautilus_quant.strategy_lab._hash_tree", return_value="3" * 64),
     ):
@@ -465,7 +815,22 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             ),
             patch(
                 "nautilus_quant.candidate_backtest._load_policy",
-                return_value=SimpleNamespace(historical_start_ns=3),
+                return_value=SimpleNamespace(
+                    historical_start_ns=3,
+                    official_only_window_start="first_official_funding_observation",
+                ),
+            ),
+            patch(
+                "nautilus_quant.candidate_backtest._funding_symbols",
+                return_value=("BTCUSDT",),
+            ),
+            patch(
+                "nautilus_quant.funding_observation.read_funding_observations",
+                return_value={
+                    "BTCUSDT": [
+                        SimpleNamespace(truth_status="official", funding_time_ns=1),
+                    ],
+                },
             ),
             patch(
                 "nautilus_quant.strategy_lab._hash_tree",
@@ -1685,6 +2050,293 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
         self.assertEqual(first["child_hypothesis_id"], inputs["child_hypothesis_id"])
         self.assertEqual(first["child_strategy_id"], inputs["child_strategy_id"])
         self.assertEqual(load_action_v1(canonical_json(first)), first)
+
+    def test_evidence_modeling_gap_dominates_closure_to_fix_technical_without_child(self) -> None:
+        # Root cause 3: a required evidence/modeling gap (nonofficial Funding) must
+        # dominate the aggregate closure to FIX_TECHNICAL and must not create a
+        # mutation child; only a pure economic failure with complete official/modeled
+        # evidence stays MUTATE.
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        windows = generate_robustness_windows(
+            tuple(range(1, 14)), policy,
+            evaluation_start_ns=1, evaluation_end_ns=13, data_as_of_ns=13,
+            evaluation_context_id="f" * 64,
+        )
+        cells = generate_robustness_matrix(
+            {"lookback_bars": 10, "entry_threshold": 0.02}, windows, policy,
+        )
+        results = tuple(
+            RobustnessCellResult(
+                cell.cell_id, cell.evaluation_context_id, "PASS",
+                "FAIL" if index == 0 else "PASS", "a" * 64,
+                Decimal("1"), Decimal("0"),
+                "modeled_funding" if index == 0 else "official",
+                ("FUNDING_TRUTH_NOT_OFFICIAL",)
+                if index == 0 else ("CELL_ECONOMIC_PASS",),
+                "a" * 64,
+            )
+            for index, cell in enumerate(cells)
+        )
+        identity = {
+            "candidate_id": "1" * 64, "code_commit": "c" * 40, "data_as_of_ns": 13,
+            "data_snapshot_id": "2" * 64, "data_source_id": "3" * 64,
+            "engine_id": "4" * 64,
+            "evaluation_context_id": robustness_evaluation_context_id(policy, cells),
+            "experiment_id": "6" * 64, "hypothesis_id": "7" * 64,
+            "policy_id": policy.policy_id, "runtime_id": "9" * 64, "strategy_id": "a" * 64,
+        }
+        verdict = build_robustness_verdict_v2(
+            identity, policy, cells, results,
+            trial_context=_trial_context(),
+        )
+        self.assertEqual(verdict["action"], "FIX_TECHNICAL")
+        self.assertIn("EVIDENCE_OR_MODELING_GAP", verdict["reason_codes"])
+        self.assertFalse(verdict["performance_claimable"])
+        action = build_action_v1(verdict, campaign_id="b" * 64)
+        self.assertIsNone(action.get("child_hypothesis_id"))
+        self.assertIsNone(action.get("child_strategy_id"))
+        with self.assertRaisesRegex(ValueError, "technical"):
+            build_action_v1(verdict, campaign_id="b" * 64, child_strategy_id="e" * 64)
+
+    def test_persisted_robustness_starts_formal_windows_at_first_official_funding(self) -> None:
+        # Root cause 2: run_persisted_robustness must start formal bars/windows no
+        # earlier than the candidate instrument's first official FundingObservation
+        # when the accounting policy requires official-only Funding, instead of
+        # bleeding modeled Funding into early windows from the full historical range.
+        policy = replace(
+            load_robustness_policy(ROOT / "config/strategy_robustness_policy.json"),
+            maximum_windows_per_scheme=1,
+            expanding_minimum_train_bars=3,
+            rolling_train_bars=4,
+            test_bars=2,
+            step_bars=2,
+        )
+        candidate_id = "1" * 64
+        campaign_id = "b" * 64
+        candidate = {
+            "bar_type": "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",
+            "instrument_id": "BTCUSDT-PERP.BINANCE",
+            "strategy": {
+                "family_id": "lookback-momentum-long-flat",
+                "family_version": "lookback-momentum-long-flat-v1",
+                "parameters": {"entry_threshold": 0.02, "lookback_bars": 10},
+            },
+        }
+        survivor = SimpleNamespace(
+            base_identity=strategy_lab.ExperimentIdentity(
+                "2" * 64, "3" * 64, "4" * 64, "historical-engine", "5" * 64, 13, "6" * 64,
+            ),
+            candidate_evaluation_context_id="7" * 64,
+            candidate_id=candidate_id,
+            candidate_path=Path("candidate.json"),
+            code_commit="c" * 40,
+            hypothesis_id="8" * 64,
+            strategy_id="2" * 64,
+        )
+        ledger = Mock()
+        ledger.robustness_trial_context.return_value = {
+            **_trial_context(),
+            "campaign_id": campaign_id,
+            "data_as_of_ns": 13,
+        }
+        ledger.robustness_survivor_context.return_value = survivor
+        ledger.existing_robustness.return_value = None
+        ledger.robustness_funnel.return_value = {
+            "economic_failed": 0,
+            "economic_passed": 1,
+            "robustness_evaluated": 1,
+            "robustness_passed": 1,
+            "technical_invalid": 0,
+            "technical_valid": 1,
+        }
+        ledger.publish_robustness.side_effect = lambda _directory, verdict, feedback, action, **_kwargs: SimpleNamespace(
+            action_path="action.json",
+            action_sha256=hashlib.sha256(canonical_json(action)).hexdigest(),
+            economic_status=verdict["economic_status"],
+            feedback_path="feedback.json",
+            feedback_sha256=hashlib.sha256(canonical_json(feedback)).hexdigest(),
+            outcome="PASS",
+            reason_codes=tuple(verdict["reason_codes"]),
+            technical_status=verdict["technical_status"],
+            verdict_path="verdict.json",
+            verdict_sha256=hashlib.sha256(canonical_json(verdict)).hexdigest(),
+        )
+
+        first_official_funding_ns = 5
+        seen: list[int] = []
+
+        def evaluate(request: object, cell: object) -> SimpleNamespace:
+            window = getattr(cell, "window")
+            seen.append(window.train_start_ns)
+            self.assertGreaterEqual(window.train_start_ns, first_official_funding_ns)
+            slippage_status = (
+                "modeled_one_tick"
+                if getattr(cell, "cost_policy").slippage_model == "one_tick"
+                else "modeled"
+            )
+            verdict = {
+                "execution": {"slippage_status": slippage_status},
+                "funding": {"truth_status": "official"},
+                "net_account_delta": "1",
+                "realized_balance_drawdown": "0",
+                "status": "EVALUATED",
+            }
+            payload = canonical_json(verdict)
+            return SimpleNamespace(
+                canonical_bytes=payload,
+                verdict=verdict,
+                verdict_id=hashlib.sha256(payload).hexdigest(),
+            )
+
+        with (
+            TemporaryDirectory() as temporary,
+            patch("nautilus_quant.strategy_robustness.load_robustness_policy", return_value=policy),
+            patch(
+                "nautilus_quant.pybroker_candidate.load_pybroker_candidate",
+                return_value=(candidate, candidate_id),
+            ),
+            patch(
+                "nautilus_quant.candidate_backtest.validated_candidate_source_bars",
+                return_value=tuple(
+                    SimpleNamespace(ts_event=index, close=100 + index)
+                    for index in range(1, 14)
+                ),
+            ),
+            patch("nautilus_quant.candidate_backtest.run_signal_parity_gate", return_value=object()),
+            patch(
+                "nautilus_quant.candidate_backtest._load_policy",
+                return_value=SimpleNamespace(
+                    historical_start_ns=1,
+                    official_only_window_start="first_official_funding_observation",
+                ),
+            ),
+            patch(
+                "nautilus_quant.candidate_backtest._funding_symbols",
+                return_value=("BTCUSDT",),
+            ),
+            patch(
+                "nautilus_quant.funding_observation.read_funding_observations",
+                return_value={
+                    "BTCUSDT": [
+                        SimpleNamespace(
+                            truth_status="official",
+                            funding_time_ns=first_official_funding_ns,
+                        ),
+                    ],
+                },
+            ),
+            patch("nautilus_quant.strategy_lab._hash_tree", return_value="3" * 64),
+        ):
+            summary = strategy_robustness.run_persisted_robustness(
+                ledger=ledger,
+                campaign_id=campaign_id,
+                market_data_path=Path("market-data.json"),
+                catalog_path=Path("catalog"),
+                funding_path=Path("funding"),
+                accounting_policy_path=Path("accounting-policy.json"),
+                robustness_policy_path=Path("robustness-policy.json"),
+                artifact_directory=Path(temporary),
+                evaluator=evaluate,
+            )
+
+        self.assertTrue(seen)
+        self.assertTrue(all(value >= first_official_funding_ns for value in seen))
+        self.assertEqual(summary["action"], "ADVANCE")
+
+    def test_real_producer_and_persisted_robustness_orchestrate_truthfully(self) -> None:
+        # Integration regression: drive run_persisted_robustness through the REAL
+        # candidate_backtest producer (FormalNautilusEvaluator) and a real ledger,
+        # not isolated mocks. Every formal cell must carry a truthful modeled
+        # slippage status bound to its persisted cost policy (never unmodeled), and
+        # an evidence/modeling gap must route to FIX_TECHNICAL without a mutation
+        # child through the real orchestration path.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = _build_integration_evidence(root)
+            accounting_policy = json.loads((ROOT / "config/strategy_loop_policy.json").read_bytes())
+            accounting_policy["historical_start"] = "1970-01-01T00:00:01Z"
+            accounting_policy_path = root / "accounting-policy.json"
+            accounting_policy_path.write_bytes(canonical_json(accounting_policy))
+            robustness_policy = json.loads((ROOT / "config/strategy_robustness_policy.json").read_bytes())
+            robustness_policy["windowing"] = {
+                "expanding_minimum_train_bars": 3,
+                "rolling_train_bars": 4,
+                "step_bars": 2,
+                "test_bars": 2,
+            }
+            robustness_policy["maximum_windows_per_scheme"] = 1
+            robustness_policy_path = root / "robustness-policy.json"
+            robustness_policy_path.write_bytes(canonical_json(robustness_policy))
+            market_data_path = root / "market-data.json"
+            market_data_path.write_bytes(b"{}")
+            artifact_directory = root / "robustness"
+            artifact_directory.mkdir(parents=True, exist_ok=True)
+
+            ledger, campaign_id, _source = _seed_real_ledger(
+                root,
+                evidence,
+                accounting_policy_path,
+                robustness_policy_path,
+                market_data_path,
+                artifact_directory,
+            )
+            summary = strategy_robustness.run_persisted_robustness(
+                ledger=ledger,
+                campaign_id=campaign_id,
+                market_data_path=market_data_path,
+                catalog_path=evidence["catalog_path"],
+                funding_path=evidence["funding_path"],
+                accounting_policy_path=accounting_policy_path,
+                robustness_policy_path=robustness_policy_path,
+                artifact_directory=artifact_directory,
+            )
+            self.assertIn(summary["action"], {"ADVANCE", "MUTATE", "FIX_TECHNICAL"})
+            self.assertIsNone(summary["child_hypothesis_id"])
+            self.assertIsNone(summary["child_strategy_id"])
+            self.assertEqual(summary["reused"], False)
+
+            # Every persisted real-producer cell verdict is contract-valid and truthfully
+            # modeled against its bound cost policy; none may be unmodeled under a
+            # formal-cost-policy run, and none may claim modeled without a bound policy.
+            cell_paths = sorted(
+                (artifact_directory / summary["experiment_id"] / "cells").glob(
+                    "*/nautilus-verdict-v1.json",
+                ),
+            )
+            self.assertGreaterEqual(len(cell_paths), 1)
+            for payload_path in cell_paths:
+                cell_verdict = load_candidate_backtest_verdict(payload_path.read_bytes())
+                self.assertIn(
+                    cell_verdict["execution"]["slippage_status"],
+                    {"modeled", "modeled_one_tick"},
+                    msg=str(payload_path),
+                )
+                self.assertIn("cost_policy", cell_verdict)
+                if cell_verdict["execution"]["slippage_status"] == "modeled":
+                    self.assertEqual(cell_verdict["cost_policy"]["slippage_model"], "none")
+                else:
+                    self.assertEqual(cell_verdict["cost_policy"]["slippage_model"], "one_tick")
+
+            # Reuse through the real ledger is idempotent and artifact-verified.
+            reuse = strategy_robustness.run_persisted_robustness(
+                ledger=ledger,
+                campaign_id=campaign_id,
+                market_data_path=market_data_path,
+                catalog_path=evidence["catalog_path"],
+                funding_path=evidence["funding_path"],
+                accounting_policy_path=accounting_policy_path,
+                robustness_policy_path=robustness_policy_path,
+                artifact_directory=artifact_directory,
+            )
+            self.assertEqual(reuse["action"], summary["action"])
+            self.assertEqual(reuse["reused"], True)
 
     def test_windows_use_closed_training_bars_and_verdict_exposes_cell_identity(self) -> None:
         frozen = load_robustness_policy(ROOT / "config/strategy_robustness_policy.json")

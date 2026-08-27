@@ -23,6 +23,14 @@ StressScenario = Literal[
     "slippage_one_tick",
 ]
 
+_EVIDENCE_OR_MODELING_GAP_REASONS: Final = frozenset(
+    {
+        "FUNDING_TRUTH_NOT_OFFICIAL",
+        "ONE_TICK_SLIPPAGE_NOT_MODELED_BY_NAUTILUS",
+        "UNMODELED_SLIPPAGE",
+    },
+)
+
 _POLICY_FIELDS: Final = frozenset(
     {
         "action_policy_version",
@@ -1394,6 +1402,7 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
     actual_matrix: list[tuple[str, int, str]] = []
     technical_invalid = False
     economic_fail = False
+    evidence_modeling_gap = False
     funding_truth_counts = {
         truth: 0
         for truth in ("official", "modeled_funding", "mixed", "missing")
@@ -1416,6 +1425,13 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
         )
         technical_invalid |= technical_status != "PASS"
         economic_fail |= economic_status == "FAIL"
+        if technical_status == "PASS":
+            evidence_modeling_gap |= cast(str, funding_truth) != "official"
+            evidence_modeling_gap |= any(
+                reason in _EVIDENCE_OR_MODELING_GAP_REASONS
+                for reason in reason_codes
+            )
+            evidence_modeling_gap |= references_missing
         if funding_truth in funding_truth_counts:
             funding_truth_counts[cast(str, funding_truth)] += 1
         else:
@@ -1474,9 +1490,9 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
     return {
         "action": (
             "FIX_TECHNICAL"
-            if not complete or technical_invalid
+            if not complete or technical_invalid or evidence_modeling_gap
             else "MUTATE"
-            if economic_fail or not performance_claimable
+            if economic_fail
             else "ADVANCE"
         ),
         "cell_count": len(cells),
@@ -1486,7 +1502,8 @@ def _cell_derived_verdict_closure(verdict: Mapping[str, object]) -> dict[str, ob
         "performance_claimable": performance_claimable,
         "reason_codes": [
             *(["TECHNICAL_INVALID"] if technical_invalid or not complete else []),
-            *(["ECONOMIC_ROBUSTNESS_FAILED"] if economic_fail else []),
+            *(["EVIDENCE_OR_MODELING_GAP"] if evidence_modeling_gap else []),
+            *(["ECONOMIC_ROBUSTNESS_FAILED"] if economic_fail and not evidence_modeling_gap else []),
             "DSR_PBO_NOT_MODELED",
         ],
         "status": "TECHNICAL_INVALID" if technical_invalid or not complete else "COMPLETE",
@@ -1978,11 +1995,13 @@ def run_persisted_robustness(
 ) -> dict[str, object]:
     """Evaluate one persisted Card 2 survivor and append its complete Card 3 chain."""
     from .candidate_backtest import (
+        _funding_symbols,
         _load_policy,
         CandidateBacktestRequest,
         run_signal_parity_gate,
         validated_candidate_source_bars,
     )
+    from .funding_observation import OFFICIAL, read_funding_observations
     from .pybroker_candidate import load_pybroker_candidate
     from .strategy_lab import (
         _atomic_publish,
@@ -2012,14 +2031,46 @@ def run_persisted_robustness(
     if loaded_candidate_id != survivor.candidate_id:
         raise StrategyRobustnessError("persisted survivor candidate identity mismatch")
     signal_parity = run_signal_parity_gate(survivor.candidate_path, catalog_path)
-    historical_start_ns = _load_policy(accounting_policy_path).historical_start_ns
+    accounting_policy = _load_policy(accounting_policy_path)
+    formal_start_ns = accounting_policy.historical_start_ns
+    if accounting_policy.official_only_window_start == "first_official_funding_observation":
+        instrument_id = candidate.get("instrument_id")
+        if (
+            not isinstance(instrument_id, str)
+            or not instrument_id.endswith("-PERP.BINANCE")
+        ):
+            raise StrategyRobustnessError(
+                "persisted survivor candidate instrument identity is incomplete",
+            )
+        symbol = instrument_id.partition("-PERP.")[0]
+        observations = read_funding_observations(
+            funding_path,
+            symbols=_funding_symbols(funding_path),
+        ).get(symbol)
+        if not observations:
+            raise StrategyRobustnessError(
+                f"official-only Funding policy has no observations for {symbol}",
+            )
+        first_official_ns = next(
+            (item.funding_time_ns for item in observations if item.truth_status == OFFICIAL),
+            None,
+        )
+        if first_official_ns is None:
+            raise StrategyRobustnessError(
+                "official-only Funding policy cannot derive a first official "
+                f"observation for {symbol}",
+            )
+        formal_start_ns = max(formal_start_ns, first_official_ns)
     bars = tuple(
         bar
         for bar in validated_candidate_source_bars(candidate, catalog_path)
-        if bar.ts_event >= historical_start_ns
+        if bar.ts_event >= formal_start_ns
     )
     if not bars:
-        raise StrategyRobustnessError("accounting policy leaves no persisted survivor bars")
+        raise StrategyRobustnessError(
+            "official-only Funding policy leaves no persisted survivor bars "
+            "after official coverage",
+        )
     timestamps = tuple(bar.ts_event for bar in bars)
     data_as_of_ns = survivor.base_identity.data_as_of_ns
     if data_as_of_ns is None or data_as_of_ns != trial_context.get("data_as_of_ns"):

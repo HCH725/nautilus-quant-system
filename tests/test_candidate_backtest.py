@@ -831,6 +831,42 @@ class CandidateBacktestTests(unittest.TestCase):
             ],
         )
 
+    def test_formal_non_one_tick_cost_policy_reports_truthful_modeled_zero_slippage(self) -> None:
+        # Root cause 1: a formal robustness cell that is not one_tick but carries an
+        # explicit, tracked cost policy must report a truthful explicit zero-slippage
+        # model, while an ordinary historical run without that formal policy stays
+        # unmodeled (fail closed).
+        ordinary = run_candidate_backtest(self.request).verdict
+        self.assertEqual(ordinary["execution"]["slippage_status"], "unmodeled")
+        self.assertNotIn("cost_policy", ordinary)
+
+        formal = run_candidate_backtest(
+            replace(
+                self.request,
+                code_commit="a" * 40,
+                evaluation_start_utc="1970-01-01T00:00:00Z",
+                evaluation_end_utc="1970-01-01T10:00:00Z",
+                data_as_of_ns=10 * HOUR_NS,
+                evaluation_context_id="e" * 64,
+                fee_multiplier=Decimal("2"),
+                cost_policy_id="f" * 64,
+            ),
+        )
+        verdict = load_candidate_backtest_verdict(formal.canonical_bytes)
+        self.assertEqual(verdict["execution"]["slippage_status"], "modeled")
+        self.assertEqual(verdict["cost_policy"]["cost_policy_id"], "f" * 64)
+        self.assertEqual(verdict["cost_policy"]["slippage_model"], "none")
+
+    def test_verdict_loader_rejects_modeled_slippage_without_bound_cost_policy(self) -> None:
+        result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
+        invalid = json.loads(json.dumps(result.verdict))
+        invalid["execution"]["slippage_status"] = "modeled"
+        invalid.pop("canonical_result_hash")
+        invalid["canonical_result_hash"] = sha256(_canonical(invalid)).hexdigest()
+
+        with self.assertRaisesRegex(RuntimeError, "slippage"):
+            load_candidate_backtest_verdict(_canonical(invalid))
+
 
 if __name__ == "__main__":
     unittest.main()
