@@ -926,6 +926,167 @@ class StrategyLedgerTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.ledger.record_hypothesis(invalid_child)
 
+    def test_screen_reject_revision_lineage_is_append_only_and_has_no_verdict(self):
+        self.ledger.initialize()
+        parent = self._hypothesis(24)
+        child = self._hypothesis(48)
+        self.ledger.record_hypothesis(parent)
+        self.ledger.record_hypothesis(child)
+        parent_experiment = self._experiment(parent, "screen-parent")
+        policy = {
+            "max_provisional_drawdown": 0.25,
+            "max_turnover": 4.0,
+            "minimum_signal_count": 1,
+            "minimum_trade_count": 1,
+            "policy_version": "strategy-research-screen-v1",
+            "reject_no_signal": True,
+            "schema_version": "strategy-research-policy-v1",
+        }
+        policy_id = sha256(canonical_bytes(policy)).hexdigest()
+        screen = {
+            "candidate_id": "a" * 64,
+            "provisional_metrics": {
+                "max_drawdown": 0.0,
+                "signal_count": 1,
+                "total_return": 0.0,
+                "trade_count": 1,
+                "turnover": 5.0,
+            },
+            "schema_version": "research-screen-result-v1",
+            "screen_outcome": "SCREEN_REJECTED",
+            "screen_policy": policy,
+            "screen_policy_id": policy_id,
+            "screen_reason_codes": ["TURNOVER_CEILING_EXCEEDED"],
+            "truth_status": "provisional",
+        }
+        screen_path = self.root / "screen-rejected.json"
+        screen_path.write_bytes(canonical_bytes(screen))
+        screen_hash = sha256(screen_path.read_bytes()).hexdigest()
+        self.ledger.record_stage(
+            strategy_lab.StageRecord(
+                parent_experiment,
+                "Research screened",
+                "REJECTED",
+                "TURNOVER_CEILING_EXCEEDED",
+                str(screen_path),
+                screen_hash,
+            ),
+        )
+
+        record = strategy_lab.ScreenRevisionLineage(
+            child_hypothesis_id=child.hypothesis_id,
+            parent_hypothesis_id=parent.hypothesis_id,
+            source_experiment_id=parent_experiment,
+            source_stage="Research screened",
+            source_artifact_path=str(screen_path),
+            source_artifact_sha256=screen_hash,
+        )
+        first_id = self.ledger.record_screen_revision_lineage(record)
+        second_id = self.ledger.record_screen_revision_lineage(record)
+
+        self.assertEqual(first_id, second_id)
+        self.ledger.verify_screen_revision_lineage()
+        with closing(sqlite3.connect(self.ledger.path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0], 0)
+            stored = connection.execute(
+                """SELECT lineage_id, child_hypothesis_id, parent_hypothesis_id,
+                source_experiment_id, source_stage, source_artifact_path,
+                source_artifact_sha256 FROM screen_revision_lineage""",
+            ).fetchone()
+            self.assertEqual(
+                stored,
+                (
+                    first_id,
+                    child.hypothesis_id,
+                    parent.hypothesis_id,
+                    parent_experiment,
+                    "Research screened",
+                    str(screen_path),
+                    screen_hash,
+                ),
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    "UPDATE screen_revision_lineage SET source_stage = 'Nautilus replayed'",
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute("DELETE FROM screen_revision_lineage")
+
+    def test_screen_revision_lineage_verifier_checks_each_stored_row(self):
+        self.ledger.initialize()
+        policy = {
+            "max_provisional_drawdown": 0.25,
+            "max_turnover": 4.0,
+            "minimum_signal_count": 1,
+            "minimum_trade_count": 1,
+            "policy_version": "strategy-research-screen-v1",
+            "reject_no_signal": True,
+            "schema_version": "strategy-research-policy-v1",
+        }
+        policy_id = sha256(canonical_bytes(policy)).hexdigest()
+        screen = {
+            "candidate_id": "a" * 64,
+            "provisional_metrics": {
+                "max_drawdown": 0.0,
+                "signal_count": 1,
+                "total_return": 0.0,
+                "trade_count": 1,
+                "turnover": 5.0,
+            },
+            "schema_version": "research-screen-result-v1",
+            "screen_outcome": "SCREEN_REJECTED",
+            "screen_policy": policy,
+            "screen_policy_id": policy_id,
+            "screen_reason_codes": ["TURNOVER_CEILING_EXCEEDED"],
+            "truth_status": "provisional",
+        }
+        for index, (parent_bars, child_bars) in enumerate(((24, 48), (72, 96))):
+            parent = self._hypothesis(parent_bars)
+            child = self._hypothesis(child_bars)
+            self.ledger.record_hypothesis(parent)
+            self.ledger.record_hypothesis(child)
+            experiment_id = self._experiment(parent, f"screen-parent-{index}")
+            screen_path = self.root / f"screen-rejected-{index}.json"
+            screen_path.write_bytes(canonical_bytes(screen))
+            screen_hash = sha256(screen_path.read_bytes()).hexdigest()
+            self.ledger.record_stage(
+                strategy_lab.StageRecord(
+                    experiment_id,
+                    "Research screened",
+                    "REJECTED",
+                    "TURNOVER_CEILING_EXCEEDED",
+                    str(screen_path),
+                    screen_hash,
+                ),
+            )
+            self.ledger.record_screen_revision_lineage(
+                strategy_lab.ScreenRevisionLineage(
+                    child.hypothesis_id,
+                    parent.hypothesis_id,
+                    experiment_id,
+                    "Research screened",
+                    str(screen_path),
+                    screen_hash,
+                ),
+            )
+
+        self.ledger.verify_screen_revision_lineage()
+        with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM screen_revision_lineage").fetchone()[0],
+                2,
+            )
+            first_lineage_id = connection.execute(
+                "SELECT lineage_id FROM screen_revision_lineage ORDER BY lineage_id LIMIT 1",
+            ).fetchone()[0]
+            connection.execute("DROP TRIGGER screen_revision_lineage_immutable_update")
+            connection.execute(
+                "UPDATE screen_revision_lineage SET source_artifact_path = ? WHERE lineage_id = ?",
+                (str(self.root / "missing-screen.json"), first_lineage_id),
+            )
+        with self.assertRaisesRegex(ValueError, "screen revision lineage evidence is inconsistent"):
+            self.ledger.verify_screen_revision_lineage()
+
     def test_records_are_append_only_and_funnel_counts_are_query_derived(self):
         self.ledger.initialize()
         hypotheses = [self._hypothesis(lookback) for lookback in (24, 48, 72)]
@@ -1128,6 +1289,11 @@ class StrategyLoopControllerTests(unittest.TestCase):
             funding_path=self.funding_path,
             state_path=self.root / "strategy-loop",
         )
+        self._code_commit_patch = patch.object(
+            strategy_lab, "_code_commit", return_value="a" * 40
+        )
+        self._code_commit_patch.start()
+        self.addCleanup(self._code_commit_patch.stop)
 
     def _hypothesis(
         self,
@@ -1457,6 +1623,21 @@ class StrategyLoopControllerTests(unittest.TestCase):
         ):
             feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
 
+        legacy_path = self._hypothesis(3)
+        legacy = strategy_lab.load_strategy_hypothesis(legacy_path)
+        ledger = strategy_lab.StrategyLedger(self.paths.state_path / "ledger.sqlite3")
+        ledger.record_hypothesis(legacy)
+        ledger.record_experiment(
+            legacy.hypothesis_id,
+            strategy_lab.ExperimentIdentity(
+                strategy_id=legacy.strategy_id,
+                data_source_id=strategy_lab._hash_tree(self.paths),
+                policy_id=strategy_lab._policy_identity(self.paths.policy_path)[0],
+                engine_id="legacy-engine",
+                runtime_id="legacy-runtime",
+            ),
+        )
+
         report, _markdown = strategy_lab.write_funnel_reports(self.paths)
 
         self.assertEqual(feedback["status"], "EVALUATED")
@@ -1775,6 +1956,38 @@ class StrategyLoopIdentityAndConfinementTests(unittest.TestCase):
 
             with patch.object(strategy_lab, "_REPO_ROOT", worktree):
                 self.assertEqual(strategy_lab._code_commit(), expected)
+
+    def test_code_commit_rejects_tracked_dirty_worktree_but_ignores_untracked_artifacts(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(repository)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("tracked\n")
+            subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "test"],
+                check=True,
+                capture_output=True,
+            )
+            tracked.write_text("changed\n")
+            (repository / "research-result.json").write_text("artifact\n")
+
+            with patch.object(strategy_lab, "_REPO_ROOT", repository):
+                with self.assertRaisesRegex(ValueError, "tracked working tree is dirty"):
+                    strategy_lab._code_commit()
 
     def test_subprocess_capture_is_bounded_while_both_streams_are_drained(self):
         size = strategy_lab.PROCESS_OUTPUT_LIMIT + 10_000
