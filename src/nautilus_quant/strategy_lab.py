@@ -318,6 +318,20 @@ CREATE TABLE IF NOT EXISTS robustness_lineage (
     FOREIGN KEY (child_hypothesis_id, child_strategy_id)
         REFERENCES hypotheses(hypothesis_id, strategy_id)
 );
+CREATE TABLE IF NOT EXISTS screen_revision_lineage (
+    lineage_id TEXT PRIMARY KEY,
+    child_hypothesis_id TEXT NOT NULL UNIQUE,
+    parent_hypothesis_id TEXT NOT NULL,
+    source_experiment_id TEXT NOT NULL,
+    source_stage TEXT NOT NULL CHECK (source_stage = 'Research screened'),
+    source_artifact_path TEXT NOT NULL,
+    source_artifact_sha256 TEXT NOT NULL,
+    FOREIGN KEY (child_hypothesis_id) REFERENCES hypotheses(hypothesis_id),
+    FOREIGN KEY (parent_hypothesis_id) REFERENCES hypotheses(hypothesis_id),
+    FOREIGN KEY (source_experiment_id) REFERENCES experiments(experiment_id),
+    FOREIGN KEY (source_experiment_id, source_stage)
+        REFERENCES stage_results(experiment_id, stage)
+);
 """
 _IMMUTABLE_TABLES: Final = (
     "strategies",
@@ -332,6 +346,7 @@ _IMMUTABLE_TABLES: Final = (
     "campaign_trials",
     "robustness_results",
     "robustness_lineage",
+    "screen_revision_lineage",
 )
 
 
@@ -470,6 +485,16 @@ class StageRecord:
     reason_code: str
     artifact_path: str
     artifact_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenRevisionLineage:
+    child_hypothesis_id: str
+    parent_hypothesis_id: str
+    source_experiment_id: str
+    source_stage: Literal["Research screened"]
+    source_artifact_path: str
+    source_artifact_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,6 +1048,37 @@ def _robustness_lineage_id(
     ).hexdigest()
 
 
+def _screen_revision_lineage_id(record: ScreenRevisionLineage) -> str:
+    return sha256(
+        _canonical_json(
+            {
+                "child_hypothesis_id": _content_id(
+                    record.child_hypothesis_id,
+                    "child_hypothesis_id",
+                ),
+                "parent_hypothesis_id": _content_id(
+                    record.parent_hypothesis_id,
+                    "parent_hypothesis_id",
+                ),
+                "schema_version": "screen-revision-lineage-v1",
+                "source_artifact_path": _identifier(
+                    record.source_artifact_path,
+                    "source_artifact_path",
+                ),
+                "source_artifact_sha256": _content_id(
+                    record.source_artifact_sha256,
+                    "source_artifact_sha256",
+                ),
+                "source_experiment_id": _content_id(
+                    record.source_experiment_id,
+                    "source_experiment_id",
+                ),
+                "source_stage": record.source_stage,
+            },
+        ),
+    ).hexdigest()
+
+
 def _error_record_id(record: ErrorRecord) -> str:
     values: dict[str, JsonValue] = {
         "artifact_path": _identifier(record.artifact_path, "artifact_path"),
@@ -1275,6 +1331,92 @@ class StrategyLedger:
             connection.execute("PRAGMA foreign_keys = ON")
             stored = _record_hypothesis_row(connection, hypothesis)
         _verified_artifact(Path(stored[3]), stored[4])
+
+    def record_screen_revision_lineage(self, record: ScreenRevisionLineage) -> str:
+        """Append a child-to-rejected-screen relation without manufacturing a verdict."""
+        if record.source_stage != "Research screened":
+            raise StrategyLabError("screen revision lineage source stage is invalid")
+        lineage_id = _screen_revision_lineage_id(record)
+        source_payload = _verified_artifact(
+            Path(_identifier(record.source_artifact_path, "source_artifact_path")),
+            _content_id(record.source_artifact_sha256, "source_artifact_sha256"),
+        )
+        try:
+            source_document = load_screen_result_v1(source_payload)
+        except (StrategyCampaignError, ValueError) as error:
+            raise StrategyLabError("screen revision lineage source artifact is invalid") from error
+        if source_document.get("screen_outcome") != "SCREEN_REJECTED":
+            raise StrategyLabError("screen revision lineage source is not rejected")
+        source_reasons = source_document.get("screen_reason_codes")
+        if not isinstance(source_reasons, list) or not source_reasons:
+            raise StrategyLabError("screen revision lineage source has no rejection reason")
+
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            child = connection.execute(
+                "SELECT strategy_id FROM hypotheses WHERE hypothesis_id = ?",
+                (record.child_hypothesis_id,),
+            ).fetchone()
+            parent = connection.execute(
+                "SELECT strategy_id FROM hypotheses WHERE hypothesis_id = ?",
+                (record.parent_hypothesis_id,),
+            ).fetchone()
+            source = connection.execute(
+                """SELECT experiments.hypothesis_id, stage_results.outcome,
+                stage_results.reason_code, stage_results.artifact_path,
+                stage_results.artifact_sha256
+                FROM stage_results JOIN experiments USING (experiment_id, strategy_id)
+                WHERE stage_results.experiment_id = ? AND stage_results.stage = ?""",
+                (record.source_experiment_id, record.source_stage),
+            ).fetchone()
+            if child is None or parent is None or source is None:
+                raise StrategyLabError("screen revision lineage references missing evidence")
+            if record.child_hypothesis_id == record.parent_hypothesis_id:
+                raise StrategyLabError("screen revision lineage child and parent must differ")
+            if source[0] != record.parent_hypothesis_id:
+                raise StrategyLabError("screen revision lineage parent does not own source experiment")
+            if source[1] != "REJECTED":
+                raise StrategyLabError("screen revision lineage source stage is not rejected")
+            if source[2] != source_reasons[0]:
+                raise StrategyLabError("screen revision lineage reason does not match artifact")
+            if source[3:] != (
+                record.source_artifact_path,
+                record.source_artifact_sha256,
+            ):
+                raise StrategyLabError("screen revision lineage artifact does not match ledger")
+            connection.execute(
+                """INSERT INTO screen_revision_lineage VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lineage_id) DO NOTHING""",
+                (
+                    lineage_id,
+                    record.child_hypothesis_id,
+                    record.parent_hypothesis_id,
+                    record.source_experiment_id,
+                    record.source_stage,
+                    record.source_artifact_path,
+                    record.source_artifact_sha256,
+                ),
+            )
+            stored = connection.execute(
+                """SELECT lineage_id, child_hypothesis_id, parent_hypothesis_id,
+                source_experiment_id, source_stage, source_artifact_path,
+                source_artifact_sha256 FROM screen_revision_lineage
+                WHERE lineage_id = ?""",
+                (lineage_id,),
+            ).fetchone()
+        expected = (
+            lineage_id,
+            record.child_hypothesis_id,
+            record.parent_hypothesis_id,
+            record.source_experiment_id,
+            record.source_stage,
+            record.source_artifact_path,
+            record.source_artifact_sha256,
+        )
+        if stored != expected:
+            raise StrategyLabError("screen revision lineage record conflict")
+        self.verify_screen_revision_lineage()
+        return lineage_id
 
     def record_campaign(self, spec: CampaignSpec, preflight: CampaignPreflight) -> None:
         """Insert one immutable campaign specification with readback checks."""
@@ -3195,6 +3337,73 @@ class StrategyLedger:
         if contradiction is not None:
             raise StrategyLabError("contradictory terminal evidence")
 
+        self.verify_screen_revision_lineage()
+
+    def verify_screen_revision_lineage(self) -> None:
+        """Verify every screen-rejection relation against its immutable evidence."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            rows = connection.execute(
+                """SELECT lineage_id, child_hypothesis_id, parent_hypothesis_id,
+                source_experiment_id, source_stage, source_artifact_path,
+                source_artifact_sha256 FROM screen_revision_lineage
+                ORDER BY lineage_id""",
+            ).fetchall()
+            for row in rows:
+                source = connection.execute(
+                    """SELECT experiments.hypothesis_id, stage_results.outcome,
+                    stage_results.reason_code, stage_results.artifact_path,
+                    stage_results.artifact_sha256
+                    FROM stage_results JOIN experiments USING (experiment_id, strategy_id)
+                    WHERE stage_results.experiment_id = ? AND stage_results.stage = ?""",
+                    (row[3], row[4]),
+                ).fetchone()
+                child = connection.execute(
+                    "SELECT 1 FROM hypotheses WHERE hypothesis_id = ?",
+                    (row[1],),
+                ).fetchone()
+                parent = connection.execute(
+                    "SELECT 1 FROM hypotheses WHERE hypothesis_id = ?",
+                    (row[2],),
+                ).fetchone()
+                if source is None or child is None or parent is None:
+                    raise StrategyLabError("screen revision lineage evidence is incomplete")
+                record = ScreenRevisionLineage(
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    cast(Literal["Research screened"], str(row[4])),
+                    str(row[5]),
+                    str(row[6]),
+                )
+                if (
+                    str(row[0]) != _screen_revision_lineage_id(record)
+                    or source[0] != record.parent_hypothesis_id
+                    or source[1] != "REJECTED"
+                    or source[3:]
+                    != (record.source_artifact_path, record.source_artifact_sha256)
+                ):
+                    raise StrategyLabError("screen revision lineage evidence is inconsistent")
+                source_payload = _verified_artifact(
+                    Path(record.source_artifact_path),
+                    record.source_artifact_sha256,
+                )
+                try:
+                    document = load_screen_result_v1(source_payload)
+                except (StrategyCampaignError, ValueError) as error:
+                    raise StrategyLabError(
+                        "screen revision lineage source artifact is invalid",
+                    ) from error
+                reasons = document.get("screen_reason_codes")
+                if (
+                    document.get("screen_outcome") != "SCREEN_REJECTED"
+                    or not isinstance(reasons, list)
+                    or not reasons
+                    or reasons[0] != source[2]
+                ):
+                    raise StrategyLabError(
+                        "screen revision lineage source artifact is inconsistent",
+                    )
+
     def verify_experiment_artifacts(self, experiment_id: str) -> None:
         self.require_terminal_consistency(experiment_id)
         with closing(sqlite3.connect(self.path)) as connection:
@@ -3499,6 +3708,25 @@ def _require_execution_snapshot(
 
 
 def _code_commit() -> str:
+    try:
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(_REPO_ROOT),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise StrategyLabError("git working tree status cannot be resolved") from error
+    if status:
+        raise StrategyLabError("tracked working tree is dirty")
     try:
         commit = subprocess.run(
             ["git", "-C", str(_REPO_ROOT), "rev-parse", "--verify", "HEAD"],
@@ -4960,7 +5188,6 @@ def write_funnel_reports(
     ledger.require_terminal_consistency()
     data_source_id = _hash_tree(paths)
     policy_id, policy_version = _policy_identity(paths.policy_path)
-    policy_ids = (policy_id, policy_id)
     research_policy_path = paths.research_policy_path or (
         _REPO_ROOT / "config/strategy_research_policy.json"
     )
@@ -4969,55 +5196,60 @@ def write_funnel_reports(
     except (OSError, StrategyCampaignError):
         pass
     else:
-        policy_ids = (
-            policy_id,
-            sha256(
-                _canonical_json(
-                    {
-                        "accounting_policy_id": policy_id,
-                        "screen_policy_id": screen_policy.policy_id,
-                    },
-                ),
-            ).hexdigest(),
-        )
+        composite_policy_id = sha256(
+            _canonical_json(
+                {
+                    "accounting_policy_id": policy_id,
+                    "screen_policy_id": screen_policy.policy_id,
+                },
+            ),
+        ).hexdigest()
+        with closing(sqlite3.connect(ledger.path)) as connection:
+            composite_rows = connection.execute(
+                """SELECT COUNT(*) FROM experiments
+                WHERE data_source_id = ? AND policy_id = ?""",
+                (data_source_id, composite_policy_id),
+            ).fetchone()[0]
+        if composite_rows:
+            policy_id = composite_policy_id
     with closing(sqlite3.connect(ledger.path)) as connection:
         proposed = connection.execute(
             """SELECT COUNT(DISTINCT strategy_id) FROM experiments
-            WHERE data_source_id = ? AND policy_id IN (?, ?)""",
-            (data_source_id, *policy_ids),
+            WHERE data_source_id = ? AND policy_id = ?""",
+            (data_source_id, policy_id),
         ).fetchone()[0]
         contract_valid = connection.execute(
             """SELECT COUNT(DISTINCT experiments.strategy_id)
             FROM experiments JOIN hypotheses USING (hypothesis_id, strategy_id)
-            WHERE data_source_id = ? AND policy_id IN (?, ?)""",
-            (data_source_id, *policy_ids),
+            WHERE data_source_id = ? AND policy_id = ?""",
+            (data_source_id, policy_id),
         ).fetchone()[0]
         operational = {
-            label: _stage_projection(connection, label, data_source_id, policy_ids)
+            label: _stage_projection(connection, label, data_source_id, policy_id)
             for label in _STAGE_LABELS[2:5]
         }
         robustness_rows = connection.execute(
             """SELECT robustness_results.strategy_id, robustness_results.action,
             robustness_results.outcome, robustness_results.reason_codes_json
             FROM robustness_results JOIN experiments USING (experiment_id, strategy_id)
-            WHERE experiments.data_source_id = ?""",
-            (data_source_id,),
+            WHERE experiments.data_source_id = ? AND experiments.policy_id = ?""",
+            (data_source_id, policy_id),
         ).fetchall()
         reason_rows = connection.execute(
             """SELECT errors.reason_code, experiments.strategy_id
             FROM errors JOIN experiments USING (experiment_id)
-            WHERE data_source_id = ? AND policy_id IN (?, ?)
+            WHERE data_source_id = ? AND policy_id = ?
             UNION ALL
             SELECT verdicts.reason_code, experiments.strategy_id
             FROM verdicts JOIN experiments USING (experiment_id, strategy_id)
-            WHERE data_source_id = ? AND policy_id IN (?, ?)""",
-            (data_source_id, *policy_ids, data_source_id, *policy_ids),
+            WHERE data_source_id = ? AND policy_id = ?""",
+            (data_source_id, policy_id, data_source_id, policy_id),
         ).fetchall()
         verdict_rows = connection.execute(
             """SELECT experiments.strategy_id, verdicts.artifact_path, verdicts.artifact_sha256
             FROM verdicts JOIN experiments USING (experiment_id, strategy_id)
-            WHERE data_source_id = ? AND policy_id IN (?, ?)""",
-            (data_source_id, *policy_ids),
+            WHERE data_source_id = ? AND policy_id = ?""",
+            (data_source_id, policy_id),
         ).fetchall()
 
     stage_counts = [
