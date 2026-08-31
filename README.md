@@ -1,5 +1,7 @@
 # Nautilus Quant System
 
+**繁體中文** | [English](README.en.md)
+
 > [!IMPORTANT]
 > 這是建立於官方 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) runtime 之上的獨立專案，並非 NautilusTrader 官方 fork，也不隸屬於、未受贊助或背書於 Nautech Systems。完整出處與第三方授權見 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
@@ -25,10 +27,7 @@ PyBroker 是隔離的上游策略研究前端：唯讀使用既有市場資料�
 - [`docs/contracts/pybroker-candidate-v1.md`](docs/contracts/pybroker-candidate-v1.md)
 - [`docs/contracts/strategy-loop-v1.md`](docs/contracts/strategy-loop-v1.md)
 
-The isolated runner and lock-rebuild commands are in
-[`research/README.md`](research/README.md). Runtime candidates, verdicts, and
-ledger state stay under ignored `var/`; the root `nautilus-research` CLI owns
-formal historical Nautilus evaluation, feedback, reuse, and funnel projection.
+隔離 runner 與 lock rebuild 指令見 [`research/README.md`](research/README.md)。Runtime candidates、verdicts 與 ledger state 保留在被忽略的 `var/` 下；root `nautilus-research` CLI 負責正式 Nautilus 歷史評估、feedback、reuse 與 funnel projection。
 
 ## 範圍
 
