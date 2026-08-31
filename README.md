@@ -7,6 +7,37 @@
 
 An independent, deterministic Binance USD-M Futures data core using NautilusTrader `2.0.0rc2`.
 
+## Research-to-Validation Workflow
+
+This repository is the downstream strategy-validation and execution layer of a broader research workflow. External alpha discovery is staged in [`alpha-strategy-research`](https://github.com/HCH725/alpha-strategy-research), where public-source ideas are normalized into Wiki Brain-ready research records for ChatGPT review and direct ingestion into Hermes Wiki Brain.
+
+Accepted knowledge can then be synthesized by Hermes into testable hypotheses and passed into this repository for structured research and validation:
+
+```text
+External public sources
+        ↓
+Antigravity research
+        ↓
+alpha-strategy-research
+(normalized, source-backed research records)
+        ↓
+ChatGPT review
+        ↓
+Hermes Wiki Brain
+        ↓
+Hermes hypothesis / synthesis
+        ↓
+PyBroker research candidate
+        ↓
+NautilusTrader historical verdict
+        ↓
+feedback / lineage / reuse
+        ↓
+later gated Paper → Binance Demo/Testnet → Live progression
+```
+
+The two repositories therefore serve different responsibilities: `alpha-strategy-research` is the public-safe upstream research and knowledge-handoff layer, while `nautilus-quant-system` is the controlled validation, accounting, execution-research, and eventual deployment layer. An idea appearing upstream is **research material only** and is not automatically considered validated or trading-eligible here.
+
 ## PyBroker Strategy Incubator
 
 PyBroker is an isolated upstream strategy-research frontend. It reads existing market data in read-only mode, executes research strategies, and emits data-only candidates. NautilusTrader remains the single source of truth for canonical data, formal backtests, fills, fees, funding, positions, PnL, and accounting.

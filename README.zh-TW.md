@@ -7,6 +7,37 @@
 
 獨立、deterministic 的 Binance USD-M Futures 資料核心，使用 NautilusTrader `2.0.0rc2`。
 
+## 從研究到驗證的工作流
+
+本 repository 是更完整策略研究工作流中的下游驗證與執行層。外部 alpha 策略的探索先進入 [`alpha-strategy-research`](https://github.com/HCH725/alpha-strategy-research)：公開來源中的策略想法會被整理成可直接供 Hermes Wiki Brain 吸收、保留來源與研究邊界的標準化紀錄，再由 ChatGPT review 後直接寫入 Hermes Wiki Brain。
+
+通過 review 的知識可再由 Hermes 組合、推演成可測試假說，並進入本 repository 做正式研究與驗證：
+
+```text
+外部公開來源
+        ↓
+Antigravity 研究
+        ↓
+alpha-strategy-research
+（標準化、保留來源的研究紀錄）
+        ↓
+ChatGPT review
+        ↓
+Hermes Wiki Brain
+        ↓
+Hermes hypothesis / synthesis
+        ↓
+PyBroker research candidate
+        ↓
+NautilusTrader historical verdict
+        ↓
+feedback / lineage / reuse
+        ↓
+後續經 gate 進入 Paper → Binance Demo/Testnet → Live
+```
+
+因此兩個 repository 的責任不同：`alpha-strategy-research` 是 public-safe 的上游策略研究與知識交接層；`nautilus-quant-system` 則是受控的策略驗證、accounting、execution research 與未來 deployment 層。策略出現在上游只代表**研究素材**，不代表已驗證，更不代表已具備交易資格。
+
 ## PyBroker 策略發源地
 
 PyBroker 是隔離的上游策略研究前端：唯讀使用既有市場資料，實跑研究策略並輸出純資料 candidate；NautilusTrader 保持 canonical data、正式回測、fills、fees、Funding、positions、PnL 與 accounting 的唯一真值。
