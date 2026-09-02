@@ -4,6 +4,8 @@
 
 **Goal:** Build and truly exercise one traceable two-generation research loop: Hermes hypothesis → PyBroker candidate → NautilusTrader verdict → Hermes child hypothesis.
 
+> **Note (2026-09-02, canonical provenance):** Historical linear / vertical-slice wording in this plan (including title/Goal arrows) is preserved for implementation provenance. The CURRENT canonical interpretation is "Three Layers, Two Loops, One Gate": Hermes Loop A (low-frequency) → PyBroker Loop B (high-throughput attrition) → fail-closed Signal-Parity Gate → Nautilus high-fidelity (survivors only). Historical wording must not be interpreted as a one-to-one per-backtest LLM flow (Loop B is deterministic N-candidate batch attrition with no LLM per candidate).
+
 **Architecture:** Hermes emits plain JSON hypotheses that may select only an approved strategy family and ordinary parameters. PyBroker remains an isolated, read-only provisional research frontend; NautilusTrader remains the sole owner of fills, fees, Funding, positions, accounting, and verdicts. A stdlib SQLite ledger records immutable identities, experiments, failures, verdicts, and parent/child lineage; ignored runtime artifacts live under `var/strategy-loop/`.
 
 **Tech Stack:** Python 3.13 root runtime, isolated Python 3.12 PyBroker runtime, PyBroker 1.2.14, NautilusTrader 2.0.0rc2, SQLite from Python stdlib, canonical JSON, `unittest`.

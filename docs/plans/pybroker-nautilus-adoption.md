@@ -1,5 +1,7 @@
 # PyBroker 策略研究前端導入計畫
 
+> **註記（2026-09-02，正典溯源）：** 本文為歷史實作計畫，原文的線性／縱切措辭（含上下游箭頭）為實作溯源而保留。當前正典詮釋為「Three Layers, Two Loops, One Gate」：Hermes Loop A（low-frequency）→ PyBroker Loop B（high-throughput attrition）→ fail-closed Signal-Parity Gate → Nautilus high-fidelity（survivors only）。歷史措辭不得被解讀為一對一、逐次回測皆呼叫 LLM 的流程（Loop B 為確定性 N-candidate 批次 attrition，無 LLM per candidate）。
+
 ## 目標
 
 把 PyBroker 導入為 Nautilus Quant System 的**上游策略發源地**：它負責研究、試跑與產生候選；NautilusTrader 繼續負責後續正式驗證，並保持唯一的回測、成交、費用、Funding、部位與帳務真值。

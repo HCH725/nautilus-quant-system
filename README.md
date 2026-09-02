@@ -25,13 +25,15 @@ ChatGPT review
         ↓
 Hermes Wiki Brain
         ↓
-Hermes hypothesis / synthesis
+Hermes hypothesis / synthesis — Loop A (low-frequency; one thesis/family iteration → bounded meaningful branches → experiment spec)
         ↓
-PyBroker research candidate
+PyBroker Experiment & Attrition Loop — Loop B (deterministic N provisional candidates → batch screens/attrition; no LLM per candidate)
         ↓
-NautilusTrader historical verdict
+Signal-Parity Gate (fail-closed)
         ↓
-feedback / lineage / reuse
+NautilusTrader high-fidelity historical verdict (survivors only)
+        ↓
+feedback / lineage / reuse — evidence-based outer feedback
         ↓
 later gated Paper → Binance Demo/Testnet → Live progression
 ```
