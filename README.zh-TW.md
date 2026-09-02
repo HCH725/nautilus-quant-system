@@ -36,6 +36,15 @@ feedback / lineage / reuse
 後續經 gate 進入 Paper → Binance Demo/Testnet → Live
 ```
 
+Quant Research Pipeline — Three Layers, Two Loops, One Gate（正典模型）：
+
+- **Data foundation**：Nautilus canonical market-data truth（bars / Funding / D-1）。
+- **Loop A — Hermes Research Loop（low-frequency, theory/evidence-driven）**：Wiki Brain / reviewed strategy intake → falsifiable research thesis / strategy family → bounded meaningful hypothesis branches → experiment specification。外層迭代單位是**一個研究假說／策略族**，不是單一參數組合；Hermes 可產生有限個有意義分支（LLM tokens 決定 *what* to test）。
+- **Loop B — PyBroker Experiment & Attrition Loop（high-throughput, deterministic）**：experiment specification → deterministic campaign expansion → N provisional candidates → batch backtests/screens → dedupe / invalid / reject / pass 記帳 → attrition funnel。**No LLM call per candidate**；machine compute 跑大量實驗。淘汰者不進入 Nautilus。
+- **Gate — Formal signal parity / promotion gate（fail-closed）**：對 canonical data 獨立重算、要求 parity 才可晉升。
+- **Nautilus High-Fidelity Validation（authoritative, scarce）**：僅 parity-passed survivors → historical accounting（含 fills/fees/funding/PnL）→ walk-forward / regime / cost robustness → strategy freeze → Shadow/Paper → Demo/Testnet → human/live boundary。
+- **Outer feedback**：Hermes 檢視 survivor summaries、failure taxonomy 與 information gain，再 evidence-based 決定 stop / refine / open new batch；不編碼固定次數的 machine backtests。Kanban / reasoning iteration ≠ 單一 backtest run。
+
 因此兩個 repository 的責任不同：`alpha-strategy-research` 是 public-safe 的上游策略研究與知識交接層；`nautilus-quant-system` 則是受控的策略驗證、accounting、execution research 與未來 deployment 層。策略出現在上游只代表**研究素材**，不代表已驗證，更不代表已具備交易資格。
 
 ## PyBroker 策略發源地
@@ -46,7 +55,7 @@ PyBroker 是隔離的上游策略研究前端：唯讀使用既有市場資料�
 - Research 不改寫 canonical catalog／Funding、不持有 credentials 或訂單權限。
 - Candidate 是 canonical JSON，不含 framework object、cache、pickle 或可執行 payload。
 - PyBroker 結果一律是 provisional；Shadow、Paper、Binance Demo／Testnet 與 live 不在 v1 實作範圍。
-- V1 已實跑 Hermes hypothesis → PyBroker → Nautilus historical verdict → Hermes child hypothesis，並將 lineage、成功與失敗寫入 append-only SQLite ledger。
+- V1 已實跑 **Two Loops + One Gate** 研究閉環（**Loop A Hermes thesis/branches low-frequency → Loop B PyBroker N-candidate deterministic attrition high-throughput，無 LLM per candidate → Gate signal-parity fail-closed → 僅 survivors 進 Nautilus historical verdict**），並將 lineage、成功與失敗寫入 append-only SQLite ledger。單一 Hermes 推理迭代對應**一個研究假說／策略族**，由 Loop B deterministic 展開為 N 個 machine experiments；Kanban iteration ≠ 單一 backtest run。
 - 長期操作模型允許 Hermes 自主新增 strategy family／公式，並要求 trading-eligible 候選通過 Paper 與 Binance Demo／Testnet；Live 仍是獨立授權。
 
 計畫、責任邊界與 contracts：
@@ -141,7 +150,7 @@ uv sync --dev
 
 ## 安全邊界
 
-目前已有隔離的 PyBroker → Nautilus 歷史策略閉環，但尚無 shared live Strategy、Paper／Demo execution client、API key 或真實資金路徑。資料 smoke、歷史閉環或模擬環境通過都不代表 production trading ready；長期驗證與自主權邊界見 [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)。
+目前已有隔離的 **Two Loops + One Gate** 歷史策略閉環（Loop B PyBroker attrition 為 high-throughput deterministic；僅 parity-passed survivors 進 Nautilus high-fidelity accounting），但尚無 shared live Strategy、Paper／Demo execution client、API key 或真實資金路徑。資料 smoke、歷史閉環或模擬環境通過都不代表 production trading ready；長期驗證與自主權邊界見 [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)。
 
 API key、token、憑證與個人資料不得寫入 repository；應放在受保護的環境檔或作業系統 Keychain，程式只讀環境變數。Repository 以三層降低誤傳風險：敏感檔 `.gitignore`、版本化的 pre-commit／pre-push fail-closed 掃描，以及 GitHub secret scanning／push protection。Clone 後啟用本機 hooks：
 

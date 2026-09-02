@@ -4,6 +4,8 @@
 
 This contract defines canonical hypothesis identity, isolated PyBroker handoff, Nautilus-owned evaluation, lineage, immutable evidence, and the derived funnel. It never accepts executable strategy payloads or writes canonical market data.
 
+Pipeline placement: this contract captures the **Loop A → Loop B entry** (one hypothesis = one Loop-A thesis/family branch) and the **Gate → Nautilus** step for that hypothesis. In the full Two Loops model the same hypothesis is expanded by `strategy-campaign-v1` (Loop B) into N deterministic candidates with attrition; isolated single-hypothesis runs remain valid but do not imply one-to-one Hermes → PyBroker → Nautilus without inner Loop B attrition and Gate.
+
 ## `strategy-hypothesis-v1`
 
 A hypothesis is a UTF-8 JSON object encoded with lexicographically sorted keys, compact `,` and `:` separators, no NaN or Infinity, and exactly one trailing LF. Duplicate keys and any other byte encoding are rejected.

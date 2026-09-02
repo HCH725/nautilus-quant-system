@@ -2,7 +2,7 @@
 
 ## Scope and truth boundary
 
-`strategy-campaign-v1` is a bounded, deterministic research-screen contract.
+`strategy-campaign-v1` is the bounded, deterministic **Loop B — PyBroker Experiment & Attrition Loop** contract (high-throughput, no LLM per candidate; survivors only → Gate → Nautilus high-fidelity).
 PyBroker is provisional research only. Nautilus remains the sole authoritative
 owner of fills, fees, Funding, PnL, accounting, and final historical verdicts.
 The campaign screen cannot produce a Nautilus verdict, a robustness verdict, a

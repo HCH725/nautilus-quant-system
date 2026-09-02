@@ -1,6 +1,6 @@
 # PyBroker research frontend
 
-This directory is an isolated, read-only research environment. It is not part
+This directory is an isolated, read-only research environment (Loop B — PyBroker Experiment & Attrition Loop: high-throughput, deterministic; no LLM per candidate; survivors only → Gate → Nautilus High-Fidelity). It is not part
 of the root Nautilus runtime and has no credentials, order routing, Testnet, or
 live-trading integration.
 

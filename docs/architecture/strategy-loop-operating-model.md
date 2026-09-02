@@ -14,6 +14,17 @@ Related implemented contracts and evidence:
 - [`../plans/2026-08-14-strategy-loop-family-paper-demo.md`](../plans/2026-08-14-strategy-loop-family-paper-demo.md)
 - [`hybrid-pybroker-nautilus.md`](hybrid-pybroker-nautilus.md)
 
+## Quant Research Pipeline — Three Layers, Two Loops, One Gate (canonical)
+
+- **Data foundation:** Nautilus canonical market-data truth.
+- **Loop A — Hermes Research Loop (low-frequency, theory/evidence-driven):** Wiki Brain / reviewed strategy intake → falsifiable research thesis or strategy family → bounded meaningful hypothesis branches → experiment specification. The outer-loop iteration unit is one research thesis / strategy family, not one parameter set. Hermes may generate a bounded set of meaningful hypothesis branches/variants; PyBroker expands those deterministically into N machine experiments. Kanban/reasoning iteration ≠ individual backtest run. LLM tokens decide *what* to test; machine compute runs high-volume experiments.
+- **Loop B — PyBroker Experiment & Attrition Loop (high-throughput, deterministic):** experiment specification → deterministic campaign expansion → N provisional candidates → batch backtests/screens → dedupe/invalid/reject/pass accounting → attrition funnel. No LLM call per candidate. Rejected candidates do not enter Nautilus.
+- **Gate — Formal signal parity / promotion gate (fail-closed):** independently recompute against canonical data and require parity before promotion.
+- **Nautilus High-Fidelity Validation (authoritative, scarce):** parity-passed survivors only → historical accounting including fills/fees/funding/PnL → walk-forward/regime/cost robustness → strategy freeze → Shadow/Paper → Demo/Testnet → human/live boundary.
+- **Outer feedback:** Hermes reviews survivor summaries, failure taxonomy and information gain, then decides whether to stop, refine or open a new experiment batch. Continuation is evidence-based; do not encode a fixed number of machine backtests.
+
+This section is the canonical wording. The existing 7-stage funnel (below) is the evidence-derived projection of that pipeline; the three nested feedback loops (§ Three nested feedback loops) are the operational decomposition of the two research loops + gate + prospective/execution validation.
+
 ## Decision summary
 
 1. Xiaoqian/Hermes may autonomously invent and implement new indicator families and formulas. New families must be tracked source with executable tests and independent audit; they do not require per-family operator approval.
@@ -43,7 +54,7 @@ Canonical market-data ingestion remains independent of Hermes, PyBroker, Paper, 
 
 ## Funnel forward path and loop return paths
 
-The funnel answers **which strategy advances**. Loop engineering answers **what happens after each verdict**.
+The funnel answers **which strategy advances**. Loop engineering answers **what happens after each verdict**. The 7-stage funnel is the projection of the canonical pipeline: stages 1–4 are the attrition inside **Loop B** (PyBroker high-throughput deterministic), the **Gate** sits before stage 5 (Nautilus), and stages 5–7 are **Nautilus High-Fidelity Validation** for survivors only; the three nested feedback loops below decompose those same tiers operationally.
 
 ```text
 Hermes new family / hypothesis
@@ -120,10 +131,18 @@ Previously inspected Paper data cannot be relabeled as a fresh prospective holdo
 
 ## Three nested feedback loops
 
+Operationally, the three nested loops are the decomposition of **Two Loops + One Gate**: loops 1 + 2 cover Loop A/B + Gate + robustness inside research/validation; loop 3 is prospective/paper; loop 4 (execution engineering) validates Nautilus survivor execution. See canonical pipeline at top for the single source of truth.
+
 ### 1. Strategy evolution loop
 
 ```text
-Hermes ↔ PyBroker ↔ Nautilus historical ↔ robustness verdict
+Hermes (Loop A: thesis/family → bounded branches/spec, low-frequency)
+    ↓
+PyBroker campaign / provisional screen (Loop B: N candidates → attrition, high-throughput, no LLM per candidate)
+    ↓
+SIGNAL PARITY GATE (fail-closed)
+    ↓
+Nautilus historical (survivors only) ↔ robustness verdict
 ```
 
 Hermes may autonomously change or create:
@@ -244,7 +263,7 @@ The family kernel answers only target intent, score, and reason. A separate trac
 
 ## Agent invocation discipline
 
-Hermes does not run inside every bar or order event.
+Hermes does not run inside every bar or order event. **Loop A is low-frequency (LLM tokens decide *what* to test); Loop B is high-throughput deterministic (machine compute runs N experiments, no LLM per candidate).**
 
 ```text
 Market-event frequency

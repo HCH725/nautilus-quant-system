@@ -36,6 +36,15 @@ feedback / lineage / reuse
 later gated Paper → Binance Demo/Testnet → Live progression
 ```
 
+Quant Research Pipeline — Three Layers, Two Loops, One Gate:
+
+- **Data foundation:** Nautilus canonical market-data truth (bars / Funding / D-1).
+- **Loop A — Hermes Research Loop (low-frequency, theory/evidence-driven):** Wiki Brain / reviewed strategy intake → falsifiable research thesis or strategy family → bounded meaningful hypothesis branches → experiment specification. The outer-loop iteration unit is **one research thesis / strategy family**, not one parameter set; Hermes may generate a bounded set of meaningful branches (LLM tokens decide *what* to test).
+- **Loop B — PyBroker Experiment & Attrition Loop (high-throughput, deterministic):** experiment specification → deterministic campaign expansion → N provisional candidates → batch backtests/screens → dedupe/invalid/reject/pass accounting → attrition funnel. **No LLM call per candidate**; machine compute runs high-volume experiments. Rejected candidates do not enter Nautilus.
+- **Gate — Formal signal parity / promotion gate (fail-closed):** independently recompute against canonical data and require parity before promotion.
+- **Nautilus High-Fidelity Validation (authoritative, scarce):** parity-passed survivors only → historical accounting including fills/fees/funding/PnL → walk-forward/regime/cost robustness → strategy freeze → Shadow/Paper → Demo/Testnet → human/live boundary.
+- **Outer feedback:** Hermes reviews survivor summaries, failure taxonomy and information gain, then decides whether to stop, refine or open a new experiment batch. Continuation is evidence-based; do not encode a fixed number of machine backtests. Kanban/reasoning iteration ≠ individual backtest run.
+
 The two repositories therefore serve different responsibilities: `alpha-strategy-research` is the public-safe upstream research and knowledge-handoff layer, while `nautilus-quant-system` is the controlled validation, accounting, execution-research, and eventual deployment layer. An idea appearing upstream is **research material only** and is not automatically considered validated or trading-eligible here.
 
 ## PyBroker Strategy Incubator
@@ -46,7 +55,7 @@ PyBroker is an isolated upstream strategy-research frontend. It reads existing m
 - Research does not rewrite the canonical catalog or funding data, and it has no credentials or order permissions.
 - Candidates are canonical JSON and contain no framework objects, caches, pickle payloads, or executable payloads.
 - PyBroker results are always provisional; Shadow, Paper, Binance Demo/Testnet, and live trading are outside the v1 implementation scope.
-- V1 has already executed the full Hermes hypothesis → PyBroker → Nautilus historical verdict → Hermes child hypothesis loop, with lineage, successes, and failures recorded in an append-only SQLite ledger.
+- V1 has already executed the full **Two Loops + One Gate** research loop (**Loop A Hermes thesis/branches low-frequency → Loop B PyBroker N-candidate deterministic attrition high-throughput, no LLM per candidate → Gate signal-parity fail-closed → Nautilus historical verdict for survivors only**), with lineage, successes, and failures recorded in an append-only SQLite ledger. A single Hermes reasoning iteration maps to **one research thesis / strategy family**, which Loop B expands deterministically into N machine experiments; Kanban iteration ≠ individual backtest run.
 - The long-term operating model allows Hermes to autonomously add strategy families and formulas, while requiring trading-eligible candidates to pass Paper and Binance Demo/Testnet validation. Live trading remains separately authorized.
 
 Plans, responsibility boundaries, and contracts:
@@ -141,7 +150,7 @@ See [`ops/RUNBOOK.md`](ops/RUNBOOK.md) for installation/reload procedures, Remov
 
 ## Safety Boundaries
 
-The system already contains an isolated PyBroker → Nautilus historical strategy loop, but it still has no shared live Strategy, Paper/Demo execution client, API key, or real-capital path. Passing data smoke tests, the historical loop, or a simulated environment does not mean the system is production-trading ready. See [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md) for long-term validation and autonomy boundaries.
+The system already contains an isolated **Two Loops + One Gate** historical research loop (Loop B PyBroker attrition is high-throughput deterministic; only parity-passed survivors reach Nautilus high-fidelity accounting), but it still has no shared live Strategy, Paper/Demo execution client, API key, or real-capital path. Passing data smoke tests, the historical loop, or a simulated environment does not mean the system is production-trading ready. See [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md) for long-term validation and autonomy boundaries.
 
 API keys, tokens, credentials, and personal data must never be committed to the repository. They should live in protected environment files or the operating-system Keychain, with programs reading them only through environment variables. The repository uses three layers to reduce accidental disclosure risk: sensitive-file rules in `.gitignore`, versioned pre-commit/pre-push fail-closed scanning, and GitHub secret scanning/push protection. Enable the local hooks after cloning:
 

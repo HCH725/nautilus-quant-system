@@ -2,16 +2,16 @@
 
 ## 決策
 
-PyBroker 是可移除的上游策略研究前端；NautilusTrader 保持 canonical data、正式回測、成交、費用、Funding、部位、帳務與未來 execution 的唯一真值。
+PyBroker 是可移除的上游策略研究前端；NautilusTrader 保持 canonical data、正式回測、成交、費用、Funding、部位、帳務與未來 execution 的唯一真值。此責任劃分即 **Quant Research Pipeline — Three Layers, Two Loops, One Gate** 中的 **Loop B（PyBroker high-throughput deterministic attrition）與 Nautilus High-Fidelity Validation（僅 survivors 經 Gate 後進入）**；Loop A 由 Hermes 維持 low-frequency 研究推理。
 
 ```text
 Nautilus canonical bars（唯讀）
         ↓
-PyBroker research：研究、試跑、候選產生
+PyBroker research：研究、試跑、候選產生（Loop B: deterministic N-candidate expansion → batch screens → attrition; No LLM per candidate; survivors only → Gate）
         ↓
-純資料 candidate
+純資料 candidate（僅 survivors 經 signal-parity Gate）
         ↓
-NautilusTrader：後續正式驗證
+NautilusTrader：後續正式驗證（High-Fidelity, scarce）
 ```
 
 這是責任分工，不是逐階段授權鏈。既有 FundingObservation 修正已完成，不再阻擋 PyBroker 研究前端導入。
