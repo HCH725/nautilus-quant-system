@@ -131,7 +131,7 @@ Previously inspected Paper data cannot be relabeled as a fresh prospective holdo
 
 ## Three nested feedback loops
 
-Operationally, the three nested loops are the decomposition of **Two Loops + One Gate**: loops 1 + 2 cover Loop A/B + Gate + robustness inside research/validation; loop 3 is prospective/paper; loop 4 (execution engineering) validates Nautilus survivor execution. See canonical pipeline at top for the single source of truth.
+Operationally, the three nested loops decompose **Two Loops + One Gate** plus downstream validation: loop 1 (Strategy evolution) operationalizes Loop A + Loop B + Gate + historical/robustness validation; loop 2 (Prospective Paper) is downstream prospective Paper validation; loop 3 (Execution engineering) is downstream execution engineering / Demo-Testnet validation of Nautilus survivors. See canonical pipeline at top for the single source of truth.
 
 ### 1. Strategy evolution loop
 
