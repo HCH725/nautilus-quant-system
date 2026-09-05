@@ -6,23 +6,20 @@ from hashlib import sha256
 import json
 from io import StringIO
 from pathlib import Path
+import platform
 import sqlite3
-import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import nautilus_trader
+
 import nautilus_quant.strategy_lab as strategy_lab
 import nautilus_quant.strategy_campaign as campaign
-from nautilus_quant.candidate_backtest import CandidateBacktestResult, SignalParityResult
-from nautilus_quant.pybroker_candidate import derive_signal_id
-from nautilus_quant.strategy_families import (
-    FamilyDecision,
-    KERNEL_HASH,
-    KERNEL_VERSION,
-    canonical_decision_bytes,
-)
+from nautilus_quant.candidate_backtest import CandidateBacktestResult
+from nautilus_quant.strategy_candidate import canonical_candidate_bytes
+from nautilus_quant.strategy_families import KERNEL_HASH, KERNEL_VERSION
 
 
 def _canonical(value: object) -> bytes:
@@ -44,149 +41,117 @@ def _hypothesis() -> dict[str, object]:
     }
 
 
-def _candidate_process(
-    metrics: dict[str, float | int],
+def _nautilus_candidate_document(
     *,
-    candidate_family_id: str = "lookback-momentum-long-flat",
-    candidate_family_version: str = "lookback-momentum-long-flat-v1",
-    candidate_parameters: dict[str, object] | None = None,
-    candidate_signal_count: int | None = None,
-    candidate_environment_id: str | None = None,
-    source_data_snapshot_id: str = "a" * 64,
-    source_last_timestamp: int | None = None,
-) -> Callable[..., strategy_lab._ProcessResult]:
-    parameters = candidate_parameters or {"entry_threshold": 0.0, "lookback_bars": 2}
-
-    def research_process(argv: list[str], **_kwargs: object) -> strategy_lab._ProcessResult:
-        context = argv[argv.index("--evaluation-context-id") + 1]
-        environment = (
-            argv[argv.index("--environment-id") + 1]
-            if candidate_environment_id is None
-            else candidate_environment_id
-        )
-        signal_count = (
-            int(metrics["signal_count"])
-            if candidate_signal_count is None
-            else candidate_signal_count
-        )
-        signals = []
-        for index in range(signal_count):
-            reason = f"test-signal-{index}"
-            score = "1" if index % 2 == 0 else "-1"
-            target_intent = "LONG" if index % 2 == 0 else "FLAT"
-            timestamp = index + 1
-            signals.append(
-                {
-                    "family_id": candidate_family_id,
-                    "family_version": candidate_family_version,
-                    "kernel_hash": KERNEL_HASH,
-                    "kernel_version": KERNEL_VERSION,
-                    "reason": reason,
-                    "score": score,
-                    "signal_id": derive_signal_id(
-                        family_id=candidate_family_id,
-                        family_version=candidate_family_version,
-                        kernel_hash=KERNEL_HASH,
-                        kernel_version=KERNEL_VERSION,
-                        parameters=parameters,
-                        reason=reason,
-                        score=score,
-                        target_intent=target_intent,
-                        ts_event_ns=timestamp,
-                    ),
-                    "target_intent": target_intent,
-                    "ts_event_ns": timestamp,
-                },
-            )
-        last_timestamp = (
-            max(1, signal_count)
-            if source_last_timestamp is None
-            else source_last_timestamp
-        )
-        candidate = {
-            "bar_type": "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",
-            "evaluation_context_id": context,
-            "instrument_id": "BTCUSDT-PERP.BINANCE",
-            "runtime": {
-                "environment_id": environment,
-                "pybroker_version": "1.2.14",
-                "python_version": "3.13.0",
-                "seed": 42,
-            },
-            "schema_version": "pybroker-candidate-v2",
-            "signals": signals,
-            "source": {
-                "data_as_of_ns": last_timestamp,
-                "data_snapshot_id": source_data_snapshot_id,
-                "first_ts_event_ns": 1,
-                "last_ts_event_ns": last_timestamp,
-                "row_count": last_timestamp,
-                "sha256": source_data_snapshot_id,
-            },
-            "strategy": {
-                "decision_timing": "bar-close; effective no earlier than next event",
-                "family_id": candidate_family_id,
-                "family_version": candidate_family_version,
-                "kernel_hash": KERNEL_HASH,
-                "kernel_version": KERNEL_VERSION,
-                "parameters": parameters,
-            },
-            "truth_status": "provisional",
-        }
-        candidate_bytes = _canonical(candidate)
-        output = Path(argv[argv.index("--output") + 1])
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(candidate_bytes)
-        result = {
-            "candidate_id": sha256(candidate_bytes).hexdigest(),
-            "provisional_metrics": metrics,
-            "schema_version": "research-result-v2",
-            "truth_status": "provisional",
-        }
-        return strategy_lab._ProcessResult(0, _canonical(result), b"", False, False, False)
-
-    return research_process
-
-
-def _parity_for_candidate(candidate_path: Path, _catalog_path: Path) -> SignalParityResult:
-    candidate_id = sha256(candidate_path.read_bytes()).hexdigest()
-    candidate = json.loads(candidate_path.read_bytes())
-    signal_count = len(candidate["signals"])
-    decisions = tuple(FamilyDecision(**row) for row in candidate["signals"])
-    decision_payload = b"".join(canonical_decision_bytes(item) for item in decisions)
-    payload = _canonical(
-        {
-            "candidate_id": candidate_id,
-            "candidate_signal_count": signal_count,
-            "detail": None,
-            "mismatch_index": None,
-            "outcome": "PASS",
-            "reason_code": "SIGNAL_PARITY_MATCH",
-            "recomputed_signal_count": signal_count,
-            "recomputed_signals_sha256": sha256(decision_payload).hexdigest(),
-            "required_action": None,
-            "schema_version": "signal-parity-result-v1",
+    family_id: str = "lookback-momentum-long-flat",
+    family_version: str = "lookback-momentum-long-flat-v1",
+    parameters: dict[str, object] | None = None,
+    evaluation_context_id: str,
+    data_snapshot_id: str = "a" * 64,
+    data_as_of_ns: int = 1,
+    first_ts_event_ns: int = 1,
+) -> dict[str, object]:
+    """Build one Nautilus-native strategy-candidate-v1 document (spec, no signals)."""
+    resolved_params: dict[str, object] = (
+        parameters if parameters is not None else {"entry_threshold": 0.0, "lookback_bars": 2}
+    )
+    last_ts = data_as_of_ns
+    first_ts = min(first_ts_event_ns, last_ts)
+    return {
+        "bar_type": "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",
+        "evaluation_context_id": evaluation_context_id,
+        "instrument_id": "BTCUSDT-PERP.BINANCE",
+        "runtime": {
+            "nautilus_trader": nautilus_trader.__version__,
+            "python_version": platform.python_version(),
         },
-    )
-    return SignalParityResult(
-        candidate_id=candidate_id,
-        outcome="PASS",
-        reason_code="SIGNAL_PARITY_MATCH",
-        required_action=None,
-        mismatch_index=None,
-        decisions=decisions,
-        canonical_bytes=payload,
-        artifact_sha256=sha256(payload).hexdigest(),
-    )
+        "schema_version": "strategy-candidate-v1",
+        "source": {
+            "data_as_of_ns": last_ts,
+            "data_snapshot_id": data_snapshot_id,
+            "first_ts_event_ns": first_ts,
+            "last_ts_event_ns": last_ts,
+            "row_count": max(1, last_ts),
+            "sha256": data_snapshot_id,
+        },
+        "strategy": {
+            "decision_timing": "bar-close; effective no earlier than next event",
+            "family_id": family_id,
+            "family_version": family_version,
+            "kernel_hash": KERNEL_HASH,
+            "kernel_version": KERNEL_VERSION,
+            "parameters": resolved_params,
+        },
+        "truth_status": "provisional",
+    }
+
+
+def _write_nautilus_candidate(
+    path: Path, document: dict[str, object]
+) -> tuple[dict[str, object], str]:
+    """Write one canonical candidate file and return it with its candidate_id."""
+    payload = canonical_candidate_bytes(document)
+    candidate_id = sha256(payload).hexdigest()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return document, candidate_id
+
+
+def _mock_build_candidate(
+    *,
+    family_id: str | None = None,
+    family_version: str | None = None,
+    parameters: dict[str, object] | None = None,
+    data_snapshot_id: str | None = None,
+    data_as_of_ns: int | None = None,
+    runtime_override: dict[str, str] | None = None,
+) -> Callable[..., tuple[dict[str, object], str]]:
+    """Build a side_effect for strategy_lab._build_strategy_candidate.
+
+    Defaults derive the candidate from the hypothesis and prepared execution
+    identity, so the Nautilus-only ledger chain validates. Pass explicit
+    overrides only to simulate a mismatched candidate.
+    """
+
+    def build(
+        hypothesis: strategy_lab.StrategyHypothesis,
+        _paths: object,
+        prepared: strategy_lab._PreparedExecution,
+        candidate_path: Path,
+    ) -> tuple[dict[str, object], str]:
+        evaluation_context_id = prepared.evaluation_context_id or "e" * 64
+        snapshot = data_snapshot_id or prepared.identity.data_snapshot_id or "a" * 64
+        as_of = (
+            data_as_of_ns
+            if data_as_of_ns is not None
+            else (prepared.data_as_of_ns if prepared.data_as_of_ns is not None else 1)
+        )
+        params: dict[str, object] = (
+            parameters if parameters is not None else dict(hypothesis.parameters.values)
+        )
+        document = _nautilus_candidate_document(
+            family_id=family_id or hypothesis.family_id,
+            family_version=family_version or hypothesis.family_version,
+            parameters=params,
+            evaluation_context_id=evaluation_context_id,
+            data_snapshot_id=snapshot,
+            data_as_of_ns=as_of,
+        )
+        if runtime_override is not None:
+            runtime = document["runtime"]
+            assert isinstance(runtime, dict)
+            runtime.update(runtime_override)
+        return _write_nautilus_candidate(Path(candidate_path), document)
+
+    return build
 
 
 def _backtest_for_request(request: object) -> CandidateBacktestResult:
+    """Build a minimal valid Nautilus verdict for one backtest request (no parity)."""
     candidate_path = getattr(request, "candidate_path")
-    candidate = json.loads(Path(candidate_path).read_bytes())
-    candidate_id = sha256(Path(candidate_path).read_bytes()).hexdigest()
+    candidate, candidate_id = strategy_lab.load_strategy_candidate(Path(candidate_path))
     source = candidate["source"]
-    runtime = candidate["runtime"]
-    parity = getattr(request, "signal_parity")
+    assert isinstance(source, dict)
     verdict = {
         "accounting_reconciled": True,
         "candidate_id": candidate_id,
@@ -239,17 +204,10 @@ def _backtest_for_request(request: object) -> CandidateBacktestResult:
             "FUNDING_TRUTH_MISSING",
         ],
         "runtime_versions": {
-            "nautilus_trader": getattr(strategy_lab.nautilus_trader, "__version__"),
-            "nautilus_python": sys.version.split()[0],
-            "pybroker": runtime["pybroker_version"],
-            "research_python": runtime["python_version"],
+            "nautilus_trader": nautilus_trader.__version__,
+            "nautilus_python": platform.python_version(),
         },
         "schema_version": "nautilus-verdict-v1",
-        "signal_parity": {
-            "artifact_sha256": parity.artifact_sha256,
-            "outcome": parity.outcome,
-            "reason_code": parity.reason_code,
-        },
         "source": {
             "first_ts_event_ns": source["first_ts_event_ns"],
             "last_ts_event_ns": source["last_ts_event_ns"],
@@ -298,11 +256,16 @@ def _persisted_terminal_fixture(
     family_version: str = "lookback-momentum-long-flat-v1",
     search_space: dict[str, tuple[campaign.JsonValue, ...]] | None = None,
     survived: bool = False,
+    record_verdict: bool = False,
     experiment_data_source_id: str = "a" * 64,
     experiment_policy_id: str | None = None,
     experiment_base_engine_id: str = "engine-v2",
     experiment_runtime_id: str = "d" * 64,
     experiment_data_as_of_ns: int = 1,
+    experiment_data_snapshot_id: str = "a" * 64,
+    candidate_family_id: str = "lookback-momentum-long-flat",
+    candidate_family_version: str = "lookback-momentum-long-flat-v1",
+    candidate_parameters: dict[str, object] | None = None,
     candidate_data_snapshot_id: str = "a" * 64,
     candidate_data_as_of_ns: int = 1,
     campaign_data_source_id: str = "a" * 64,
@@ -313,6 +276,14 @@ def _persisted_terminal_fixture(
     strategy_lab.VerdictRecord | None,
     str,
 ]:
+    """Build one Nautilus-native persisted terminal chain (no second engine).
+
+    The candidate is a plain strategy-candidate-v1 spec derived from the
+    experiment identity. ``candidate_family_*`` default to the lookback family,
+    so a hypothesis from another family stays mismatched (as before).
+    ``record_verdict`` persists the verdict for campaign-trial callers; record
+    callers that assert rejection leave it unrecorded and record it themselves.
+    """
     policy = _test_screen_policy()
     spec = campaign.CampaignSpec(
         family_id=family_id,
@@ -347,12 +318,12 @@ def _persisted_terminal_fixture(
     code_commit = "e" * 40
     candidate_context = strategy_lab._evaluation_context_id(
         hypothesis,
-        data_source_id="a" * 64,
-        data_snapshot_id="a" * 64,
-        data_as_of_ns=experiment_data_as_of_ns,
-        policy_id=correct_policy_id,
-        engine_id="engine-v2",
-        runtime_id="d" * 64,
+        data_source_id=experiment_data_source_id,
+        data_snapshot_id=candidate_data_snapshot_id,
+        data_as_of_ns=candidate_data_as_of_ns,
+        policy_id=experiment_policy_id or correct_policy_id,
+        engine_id=experiment_base_engine_id,
+        runtime_id=experiment_runtime_id,
         code_commit=code_commit,
         screen_policy_id=policy.policy_id,
     )
@@ -363,70 +334,45 @@ def _persisted_terminal_fixture(
         f"{experiment_base_engine_id}-evaluation-{candidate_context}",
         experiment_runtime_id,
         experiment_data_as_of_ns,
-        "a" * 64,
+        experiment_data_snapshot_id,
     )
     experiment_id = ledger.record_experiment(hypothesis.hypothesis_id, identity)
 
-    metrics: dict[str, float | int] = (
-        {
-            "trade_count": 1,
-            "signal_count": 1,
-            "total_return": 0.1,
-            "max_drawdown": 0.1,
-            "turnover": 1.0,
-        }
-        if survived
-        else {
-            "trade_count": 0,
-            "signal_count": 0,
-            "total_return": 0.0,
-            "max_drawdown": 0.0,
-            "turnover": 0.0,
-        }
-    )
     candidate_path = root / "candidate.json"
-    completed = _candidate_process(
-        metrics,
-        source_data_snapshot_id=candidate_data_snapshot_id,
-        source_last_timestamp=candidate_data_as_of_ns,
-    )(
-        [
-            "python",
-            "research.py",
-            "--evaluation-context-id",
-            candidate_context,
-            "--environment-id",
-            "d" * 64,
-            "--output",
-            str(candidate_path),
-        ],
+    _write_nautilus_candidate(
+        candidate_path,
+        _nautilus_candidate_document(
+            family_id=candidate_family_id,
+            family_version=candidate_family_version,
+            parameters=(
+                candidate_parameters
+                if candidate_parameters is not None
+                else {"entry_threshold": 0.0, "lookback_bars": 2}
+            ),
+            evaluation_context_id=candidate_context,
+            data_snapshot_id=candidate_data_snapshot_id,
+            data_as_of_ns=candidate_data_as_of_ns,
+        ),
     )
-    raw_path = root / "research-result-v2-raw.json"
-    raw_path.write_bytes(completed.stdout)
+    _, candidate_id = strategy_lab.load_strategy_candidate(candidate_path)
     ledger.record_stage(
         strategy_lab.StageRecord(
             experiment_id,
-            "PyBroker completed",
+            "Candidate specified",
             "PASSED",
-            "PYBROKER_COMPLETED",
-            str(raw_path),
-            sha256(raw_path.read_bytes()).hexdigest(),
+            "CANDIDATE_SPECIFIED",
+            str(candidate_path),
+            candidate_id,
         ),
-    )
-    result = campaign.load_research_result_v2(completed.stdout)
-    decision = campaign.screen_research_result(result, policy)
-    screen_path = root / "research-screen-result-v1.json"
-    screen_path.write_bytes(
-        _canonical(campaign.screened_result_document(result, decision, policy)),
     )
     ledger.record_stage(
         strategy_lab.StageRecord(
             experiment_id,
             "Research screened",
             "PASSED" if survived else "REJECTED",
-            "SCREEN_PASSED" if survived else decision.reason_codes[0],
-            str(screen_path),
-            sha256(screen_path.read_bytes()).hexdigest(),
+            "SCREEN_PASSED" if survived else "PROVISIONAL_SCREEN_RETIRED",
+            str(candidate_path),
+            candidate_id,
         ),
     )
     ledger.record_campaign(
@@ -444,38 +390,20 @@ def _persisted_terminal_fixture(
             campaign.TrialEvidence(
                 campaign.TerminalStatus.SCREEN_REJECTED,
                 True,
-                decision.reason_codes,
+                ("PROVISIONAL_SCREEN_RETIRED",),
                 experiment_id,
-                result.candidate_id,
+                candidate_id,
             ),
             None,
             code_commit,
         )
 
-    parity = _parity_for_candidate(candidate_path, root / "catalog")
-    parity_path = root / "signal-parity-result.json"
-    parity_path.write_bytes(parity.canonical_bytes)
-    ledger.record_signal_parity(
-        strategy_lab.SignalParityRecord(
-            experiment_id,
-            parity.candidate_id,
-            candidate_context,
-            candidate_data_snapshot_id,
-            "PASS",
-            "SIGNAL_PARITY_MATCH",
-            None,
-            str(parity_path),
-            parity.artifact_sha256,
-            parity.decisions,
-        ),
-    )
     backtest = _backtest_for_request(
         SimpleNamespace(
             candidate_path=candidate_path,
             code_commit=code_commit,
             experiment_id=experiment_id,
             hypothesis_id=hypothesis.hypothesis_id,
-            signal_parity=parity,
             strategy_id=hypothesis.strategy_id,
         ),
     )
@@ -484,15 +412,24 @@ def _persisted_terminal_fixture(
     ledger.record_stage(
         strategy_lab.StageRecord(
             experiment_id,
-            "Nautilus replayed",
+            "Nautilus evaluated",
             "PASSED",
-            "NAUTILUS_REPLAY_COMPLETED",
+            "NAUTILUS_EVALUATED",
             str(verdict_path),
             backtest.verdict_id,
         ),
     )
     reason_codes = backtest.verdict["reason_codes"]
     assert isinstance(reason_codes, list) and isinstance(reason_codes[0], str)
+    record = strategy_lab.VerdictRecord(
+        experiment_id,
+        "REJECTION",
+        reason_codes[0],
+        str(verdict_path),
+        backtest.verdict_id,
+    )
+    if record_verdict:
+        ledger.record_verdict(record, screen_policy_id=policy.policy_id)
     return (
         attempt,
         campaign.TrialEvidence(
@@ -500,15 +437,9 @@ def _persisted_terminal_fixture(
             True,
             ("SCREEN_PASSED",),
             experiment_id,
-            result.candidate_id,
+            candidate_id,
         ),
-        strategy_lab.VerdictRecord(
-            experiment_id,
-            "REJECTION",
-            reason_codes[0],
-            str(verdict_path),
-            backtest.verdict_id,
-        ),
+        record,
         code_commit,
     )
 
@@ -629,14 +560,10 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=_candidate_process(
-                        {"trade_count": 1, "signal_count": 1, "total_return": 0.1, "max_drawdown": 0.1, "turnover": 1.0},
-                        source_last_timestamp=123,
-                    ),
+                    "_build_strategy_candidate",
+                    side_effect=_mock_build_candidate(),
                 ),
                 patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(strategy_lab, "run_signal_parity_gate", side_effect=_parity_for_candidate),
                 patch.object(strategy_lab, "run_candidate_backtest", side_effect=_backtest_for_request),
                 redirect_stdout(stdout),
             ):
@@ -775,7 +702,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 "screen-rejected-without-chain",
             )
 
-            with self.assertRaisesRegex(ValueError, "terminal chain"):
+            with self.assertRaisesRegex(ValueError, "provisional screen rejection is retired"):
                 ledger.record_campaign_trial(
                     attempt,
                     campaign.TrialEvidence(
@@ -845,7 +772,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 candidate_data_snapshot_id="2" * 64,
             )
             hypothesis = strategy_lab.load_strategy_hypothesis(root / "hypothesis.json")
-            candidate, _candidate_id = strategy_lab.load_pybroker_candidate(
+            candidate, _candidate_id = strategy_lab.load_strategy_candidate(
                 root / "candidate.json",
             )
             evaluation_context_id = candidate["evaluation_context_id"]
@@ -897,11 +824,12 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 family_id="close-vs-sma-mean-reversion-long-flat",
                 family_version="close-vs-sma-mean-reversion-long-flat-v1",
                 search_space={"discount_threshold": (0.0,), "window_bars": (2,)},
+                survived=True,
             )
 
             with (
                 patch.object(strategy_lab, "_code_commit", return_value=code_commit),
-                self.assertRaisesRegex(ValueError, "immutable identity"),
+                self.assertRaisesRegex(ValueError, "terminal chain|immutable identity"),
             ):
                 ledger.record_campaign_trial(attempt, evidence)
 
@@ -920,11 +848,12 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                     ledger,
                     experiment_data_source_id=experiment_data_source_id,
                     campaign_data_as_of_ns=campaign_data_as_of_ns,
+                    survived=True,
                 )
 
                 with (
                     patch.object(strategy_lab, "_code_commit", return_value=code_commit),
-                    self.assertRaisesRegex(ValueError, "immutable identity"),
+                    self.assertRaisesRegex(ValueError, "terminal chain|immutable identity"),
                 ):
                     ledger.record_campaign_trial(attempt, evidence)
 
@@ -950,11 +879,12 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                     experiment_policy_id=experiment_policy_id,
                     experiment_base_engine_id=experiment_base_engine_id,
                     experiment_runtime_id=experiment_runtime_id,
+                    survived=True,
                 )
 
                 with (
                     patch.object(strategy_lab, "_code_commit", return_value=code_commit),
-                    self.assertRaisesRegex(ValueError, "immutable identity"),
+                    self.assertRaisesRegex(ValueError, "terminal chain|immutable identity|invalid terminal chain"),
                 ):
                     ledger.record_campaign_trial(attempt, evidence)
 
@@ -965,40 +895,33 @@ class StrategyCampaignScreenTests(unittest.TestCase):
         with self.subTest(identity="runtime"):
             assert_rejected(experiment_runtime_id="4" * 64)
 
-    def _cached_screen_fixture(
+    def _cached_error_fixture(
         self,
         root: Path,
         ledger: strategy_lab.StrategyLedger,
         identity: strategy_lab.ExperimentIdentity,
         *,
         semantic_tamper: bool = False,
-        metric_tamper: bool = False,
-        candidate_signal_count: int | None = None,
+        file_tamper: bool = False,
     ) -> tuple[campaign.ScreenPolicy, Path, Path, str]:
+        """Persist one Nautilus-native research-error chain for reuse tests.
+
+        The chain is Candidate specified (PASSED) plus Research screened (ERROR)
+        with a matching errors row, so ``existing_execution`` restores terminal
+        TECHNICAL_INVALID evidence. ``semantic_tamper`` makes the screen row
+        disagree with the errors row while hashes still match; ``file_tamper``
+        corrupts the error file after its hash is recorded.
+        """
         candidate_path = root / "candidate.json"
-        completed = _candidate_process(
-            {
-                "trade_count": 0,
-                "signal_count": 0,
-                "total_return": 0.0,
-                "max_drawdown": 0.0,
-                "turnover": 0.0,
-            },
-            candidate_signal_count=candidate_signal_count,
-        )(
-            [
-                "python",
-                "research.py",
-                "--evaluation-context-id",
-                "e" * 64,
-                "--environment-id",
-                "d" * 64,
-                "--output",
-                str(candidate_path),
-            ],
+        _write_nautilus_candidate(
+            candidate_path,
+            _nautilus_candidate_document(
+                evaluation_context_id="e" * 64,
+                data_snapshot_id="a" * 64,
+                data_as_of_ns=1,
+            ),
         )
-        raw_path = root / "research-result-v2-raw.json"
-        raw_path.write_bytes(completed.stdout)
+        _, candidate_id = strategy_lab.load_strategy_candidate(candidate_path)
         policy_document = {
             "max_provisional_drawdown": 0.5,
             "max_turnover": 10.0,
@@ -1017,17 +940,19 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             max_turnover=10.0,
             reject_no_signal=True,
         )
-        parsed = campaign.load_research_result_v2(completed.stdout)
-        decision = campaign.screen_research_result(parsed, policy)
-        screen_document = campaign.screened_result_document(parsed, decision, policy)
-        if semantic_tamper:
-            screen_document["screen_outcome"] = "PASSED"
-        if metric_tamper:
-            metrics = screen_document["provisional_metrics"]
-            assert isinstance(metrics, dict)
-            metrics["total_return"] = 1.0
-        screen_path = root / "research-screen-result-v1.json"
-        screen_path.write_bytes(_canonical(screen_document))
+        error_path = root / "research-error.json"
+        error_path.write_bytes(
+            _canonical(
+                {
+                    "detail": "invalid candidate cohort",
+                    "experiment_id": "5" * 64,
+                    "reason_code": "RESEARCH_CANDIDATE_INVALID",
+                    "schema_version": "strategy-loop-error-v1",
+                    "stage": "RESEARCH",
+                },
+            ),
+        )
+        error_hash = sha256(error_path.read_bytes()).hexdigest()
         experiment_id = "5" * 64
         with closing(sqlite3.connect(ledger.path)) as connection, connection:
             connection.execute(
@@ -1047,11 +972,11 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 (
                     experiment_id,
                     identity.strategy_id,
-                    "PyBroker completed",
+                    "Candidate specified",
                     "PASSED",
-                    "PYBROKER_COMPLETED",
-                    str(raw_path),
-                    sha256(raw_path.read_bytes()).hexdigest(),
+                    "CANDIDATE_SPECIFIED",
+                    str(candidate_path),
+                    candidate_id,
                 ),
             )
             connection.execute(
@@ -1060,15 +985,28 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                     experiment_id,
                     identity.strategy_id,
                     "Research screened",
-                    "REJECTED",
-                    decision.reason_codes[0],
-                    str(screen_path),
-                    sha256(screen_path.read_bytes()).hexdigest(),
+                    "ERROR",
+                    "TAMPERED" if semantic_tamper else "RESEARCH_CANDIDATE_INVALID",
+                    str(error_path),
+                    error_hash,
                 ),
             )
-        return policy, candidate_path, screen_path, parsed.candidate_id
+            connection.execute(
+                "INSERT INTO errors VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "6" * 64,
+                    experiment_id,
+                    "RESEARCH",
+                    "RESEARCH_CANDIDATE_INVALID",
+                    str(error_path),
+                    error_hash,
+                ),
+            )
+        if file_tamper:
+            error_path.write_bytes(error_path.read_bytes() + b" ")
+        return policy, candidate_path, error_path, candidate_id
 
-    def test_campaign_trial_rejects_screen_metrics_that_differ_from_raw_research(self) -> None:
+    def test_campaign_reuse_rejects_tampered_error_artifact_with_hash_mismatch(self) -> None:
         base_attempt = campaign.expand_campaign(self._spec())[0]
         assert base_attempt.strategy_id is not None
         identity = strategy_lab.ExperimentIdentity(
@@ -1082,32 +1020,17 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             root = Path(temporary)
             ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
             ledger.initialize()
-            policy, _candidate_path, _screen_path, candidate_id = self._cached_screen_fixture(
+            _policy, _candidate_path, _error_path, _candidate_id = self._cached_error_fixture(
                 root,
                 ledger,
                 identity,
-                metric_tamper=True,
-            )
-            spec = self._spec(screen_policy_id=policy.policy_id)
-            attempt = campaign.expand_campaign(spec)[0]
-            ledger.record_campaign(
-                spec,
-                campaign.CampaignPreflight(policy.policy_id, 123, "a" * 64),
+                file_tamper=True,
             )
 
-            with self.assertRaisesRegex(ValueError, "terminal chain"):
-                ledger.record_campaign_trial(
-                    attempt,
-                    campaign.TrialEvidence(
-                        campaign.TerminalStatus.SCREEN_REJECTED,
-                        True,
-                        ("NO_SIGNALS", "MINIMUM_TRADE_COUNT", "MINIMUM_SIGNAL_COUNT"),
-                        "5" * 64,
-                        candidate_id,
-                    ),
-                )
+            with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+                ledger.existing_execution(identity, _policy)
 
-    def test_campaign_trial_rejects_raw_signal_count_that_differs_from_candidate(self) -> None:
+    def test_campaign_trial_rejects_survived_trial_without_a_nautilus_verdict(self) -> None:
         base_attempt = campaign.expand_campaign(self._spec())[0]
         assert base_attempt.strategy_id is not None
         identity = strategy_lab.ExperimentIdentity(
@@ -1121,11 +1044,10 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             root = Path(temporary)
             ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
             ledger.initialize()
-            policy, _candidate_path, _screen_path, candidate_id = self._cached_screen_fixture(
+            policy, _candidate_path, _screen_path, candidate_id = self._cached_error_fixture(
                 root,
                 ledger,
                 identity,
-                candidate_signal_count=1,
             )
             spec = self._spec(screen_policy_id=policy.policy_id)
             attempt = campaign.expand_campaign(spec)[0]
@@ -1138,9 +1060,9 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 ledger.record_campaign_trial(
                     attempt,
                     campaign.TrialEvidence(
-                        campaign.TerminalStatus.SCREEN_REJECTED,
+                        campaign.TerminalStatus.SURVIVED,
                         True,
-                        ("NO_SIGNALS", "MINIMUM_TRADE_COUNT", "MINIMUM_SIGNAL_COUNT"),
+                        ("SCREEN_PASSED",),
                         "5" * 64,
                         candidate_id,
                     ),
@@ -1161,7 +1083,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             root = Path(temporary)
             ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
             ledger.initialize()
-            policy, _candidate_path, _screen_path, candidate_id = self._cached_screen_fixture(
+            policy, _candidate_path, _screen_path, candidate_id = self._cached_error_fixture(
                 root,
                 ledger,
                 identity,
@@ -1176,9 +1098,9 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 ledger.record_campaign_trial(
                     attempt,
                     campaign.TrialEvidence(
-                        campaign.TerminalStatus.SCREEN_REJECTED,
+                        campaign.TerminalStatus.SURVIVED,
                         True,
-                        ("NO_SIGNALS", "MINIMUM_TRADE_COUNT", "MINIMUM_SIGNAL_COUNT"),
+                        ("SCREEN_PASSED",),
                         "5" * 64,
                         candidate_id,
                     ),
@@ -1196,7 +1118,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             root = Path(temporary)
             ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
             ledger.initialize()
-            policy, candidate_path, artifact_path, candidate_id = self._cached_screen_fixture(
+            policy, candidate_path, artifact_path, candidate_id = self._cached_error_fixture(
                 root,
                 ledger,
                 identity,
@@ -1205,21 +1127,20 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             cached = ledger.existing_execution(identity, policy)
             self.assertIsNotNone(cached)
             assert cached is not None
-            self.assertEqual(cached.terminal_status, campaign.TerminalStatus.SCREEN_REJECTED)
+            self.assertEqual(cached.terminal_status, campaign.TerminalStatus.TECHNICAL_INVALID)
+            self.assertEqual(cached.reason_codes, ("RESEARCH_CANDIDATE_INVALID",))
             self.assertEqual(cached.candidate_id, candidate_id)
             candidate_bytes = candidate_path.read_bytes()
             candidate_path.unlink()
             with self.assertRaisesRegex(ValueError, "artifact is missing"):
                 ledger.existing_execution(identity, policy)
             candidate_path.write_bytes(candidate_bytes)
-            artifact_path.write_bytes(
-                artifact_path.read_bytes().replace(b'"NO_SIGNALS"', b'"TAMPERED"'),
-            )
+            artifact_path.write_bytes(artifact_path.read_bytes() + b" ")
 
             with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
                 ledger.existing_execution(identity, policy)
 
-    def test_campaign_reuse_rejects_semantically_inconsistent_screen_with_matching_hash(self) -> None:
+    def test_campaign_reuse_rejects_semantically_inconsistent_error_with_matching_hash(self) -> None:
         identity = strategy_lab.ExperimentIdentity(
             strategy_id="1" * 64,
             data_source_id="2" * 64,
@@ -1231,14 +1152,14 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             root = Path(temporary)
             ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
             ledger.initialize()
-            policy, _candidate_path, _screen_path, _candidate_id = self._cached_screen_fixture(
+            policy, _candidate_path, _screen_path, _candidate_id = self._cached_error_fixture(
                 root,
                 ledger,
                 identity,
                 semantic_tamper=True,
             )
 
-            with self.assertRaisesRegex(ValueError, "cached screen artifact does not match"):
+            with self.assertRaisesRegex(ValueError, "cached research error evidence is inconsistent"):
                 ledger.existing_execution(identity, policy)
 
     def test_v2_verdict_requires_a_valid_nautilus_terminal_chain(self) -> None:
@@ -1261,62 +1182,27 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             )
             experiment_id = ledger.record_experiment(hypothesis.hypothesis_id, identity)
             candidate_path = root / "candidate.json"
-            completed = _candidate_process(
-                {
-                    "trade_count": 1,
-                    "signal_count": 1,
-                    "total_return": 0.1,
-                    "max_drawdown": 0.1,
-                    "turnover": 1.0,
-                },
-            )(
-                [
-                    "python",
-                    "research.py",
-                    "--evaluation-context-id",
-                    "e" * 64,
-                    "--environment-id",
-                    "d" * 64,
-                    "--output",
-                    str(candidate_path),
-                ],
+            _write_nautilus_candidate(
+                candidate_path,
+                _nautilus_candidate_document(
+                    family_id=hypothesis.family_id,
+                    family_version=hypothesis.family_version,
+                    parameters=dict(hypothesis.parameters.values),
+                    evaluation_context_id="e" * 64,
+                    data_snapshot_id="a" * 64,
+                    data_as_of_ns=1,
+                ),
             )
-            raw_path = root / "research-result-v2-raw.json"
-            raw_path.write_bytes(completed.stdout)
+            _, candidate_id = strategy_lab.load_strategy_candidate(candidate_path)
             ledger.record_stage(
                 strategy_lab.StageRecord(
                     experiment_id,
-                    "PyBroker completed",
+                    "Candidate specified",
                     "PASSED",
-                    "PYBROKER_COMPLETED",
-                    str(raw_path),
-                    sha256(raw_path.read_bytes()).hexdigest(),
+                    "CANDIDATE_SPECIFIED",
+                    str(candidate_path),
+                    candidate_id,
                 ),
-            )
-            result = campaign.load_research_result_v2(completed.stdout)
-            policy_document = {
-                "max_provisional_drawdown": 0.5,
-                "max_turnover": 10.0,
-                "minimum_signal_count": 1,
-                "minimum_trade_count": 1,
-                "policy_version": "test-screen-v1",
-                "reject_no_signal": True,
-                "schema_version": "strategy-research-policy-v1",
-            }
-            policy = campaign.ScreenPolicy(
-                sha256(_canonical(policy_document)).hexdigest(),
-                "test-screen-v1",
-                1,
-                1,
-                0.5,
-                10.0,
-                True,
-            )
-            decision = campaign.screen_research_result(result, policy)
-            self.assertEqual(decision.outcome, "PASSED")
-            screen_path = root / "research-screen-result-v1.json"
-            screen_path.write_bytes(
-                _canonical(campaign.screened_result_document(result, decision, policy)),
             )
             ledger.record_stage(
                 strategy_lab.StageRecord(
@@ -1324,25 +1210,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                     "Research screened",
                     "PASSED",
                     "SCREEN_PASSED",
-                    str(screen_path),
-                    sha256(screen_path.read_bytes()).hexdigest(),
-                ),
-            )
-            parity = _parity_for_candidate(candidate_path, root / "catalog")
-            parity_path = root / "signal-parity-result.json"
-            parity_path.write_bytes(parity.canonical_bytes)
-            ledger.record_signal_parity(
-                strategy_lab.SignalParityRecord(
-                    experiment_id,
-                    parity.candidate_id,
-                    "e" * 64,
-                    "a" * 64,
-                    "PASS",
-                    "SIGNAL_PARITY_MATCH",
-                    None,
-                    str(parity_path),
-                    parity.artifact_sha256,
-                    parity.decisions,
+                    str(candidate_path),
+                    candidate_id,
                 ),
             )
             invalid_path = root / "nautilus-verdict.json"
@@ -1355,14 +1224,14 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 sha256(invalid_path.read_bytes()).hexdigest(),
             )
 
-            with self.assertRaisesRegex(strategy_lab.StrategyLabError, "Nautilus replay"):
+            with self.assertRaisesRegex(strategy_lab.StrategyLabError, "Nautilus evaluated stage"):
                 ledger.record_verdict(record)
             ledger.record_stage(
                 strategy_lab.StageRecord(
                     experiment_id,
-                    "Nautilus replayed",
+                    "Nautilus evaluated",
                     "PASSED",
-                    "NAUTILUS_REPLAY_COMPLETED",
+                    "NAUTILUS_EVALUATED",
                     str(invalid_path),
                     record.artifact_sha256,
                 ),
@@ -1454,190 +1323,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
 
         self.assertIsNone(attempt.strategy_id)
 
-    def test_valid_v2_candidate_with_no_activity_is_screen_rejected_before_nautilus(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hypothesis_path = root / "hypothesis.json"
-            hypothesis_path.write_bytes(_canonical(_hypothesis()))
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market-data.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-            )
 
-            research_process = _candidate_process(
-                {"trade_count": 0, "signal_count": 0, "total_return": 0.0, "max_drawdown": 0.0, "turnover": 0.0},
-            )
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(strategy_lab, "_run_bounded_process", side_effect=research_process),
-                patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=AssertionError("screen-rejected candidate reached Nautilus"),
-                ) as run_nautilus,
-            ):
-                feedback = strategy_lab.run_strategy_loop(hypothesis_path, paths)
 
-            self.assertEqual(feedback["status"], "SCREEN_REJECTED")
-            self.assertEqual(
-                feedback["reason_codes"],
-                ["NO_SIGNALS", "MINIMUM_TRADE_COUNT", "MINIMUM_SIGNAL_COUNT"],
-            )
-            run_directory = paths.state_path / "runs" / feedback["experiment_id"]
-            self.assertTrue((run_directory / "candidate.json").is_file())
-            self.assertTrue((run_directory / "research-screen-result-v1.json").is_file())
-            result = json.loads((run_directory / "research-screen-result-v1.json").read_bytes())
-            self.assertEqual(result["schema_version"], "research-screen-result-v1")
-            self.assertEqual(
-                campaign.load_screen_result_v1(
-                    (run_directory / "research-screen-result-v1.json").read_bytes(),
-                ),
-                result,
-            )
-            self.assertEqual(
-                result["screen_reason_codes"],
-                ["NO_SIGNALS", "MINIMUM_TRADE_COUNT", "MINIMUM_SIGNAL_COUNT"],
-            )
-            metrics = result["provisional_metrics"]
-            self.assertTrue(all(isinstance(value, (int, float)) and value == value for value in metrics.values()))
-            run_nautilus.assert_not_called()
-
-    def test_signal_count_mismatch_is_technical_and_never_reaches_nautilus(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hypothesis_path = root / "hypothesis.json"
-            hypothesis_path.write_bytes(_canonical(_hypothesis()))
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market-data.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-            )
-            research_process = _candidate_process(
-                {
-                    "trade_count": 1,
-                    "signal_count": 1,
-                    "total_return": 0.1,
-                    "max_drawdown": 0.1,
-                    "turnover": 1.0,
-                },
-                candidate_signal_count=0,
-            )
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(strategy_lab, "_run_bounded_process", side_effect=research_process),
-                patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(strategy_lab, "run_signal_parity_gate", side_effect=_parity_for_candidate),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=AssertionError("mismatched signal count reached Nautilus"),
-                ) as run_nautilus,
-            ):
-                feedback = strategy_lab.run_strategy_loop(hypothesis_path, paths)
-
-        self.assertEqual(feedback["status"], "ERROR")
-        self.assertEqual(feedback["reason_codes"], ["RESEARCH_RESULT_INVALID"])
-        run_nautilus.assert_not_called()
-
-    def test_valid_v2_candidate_that_passes_screen_is_the_only_path_to_nautilus(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hypothesis_path = root / "hypothesis.json"
-            hypothesis_path.write_bytes(_canonical(_hypothesis()))
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market-data.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-            )
-            research_process = _candidate_process(
-                {"trade_count": 1, "signal_count": 1, "total_return": 0.1, "max_drawdown": 0.1, "turnover": 1.0},
-            )
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(strategy_lab, "_run_bounded_process", side_effect=research_process),
-                patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(strategy_lab, "run_signal_parity_gate", side_effect=_parity_for_candidate),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=_backtest_for_request,
-                ) as run_nautilus,
-            ):
-                feedback = strategy_lab.run_strategy_loop(hypothesis_path, paths)
-
-            self.assertEqual(feedback["status"], "EVALUATED")
-            run_nautilus.assert_called_once()
-            run_directory = paths.state_path / "runs" / feedback["experiment_id"]
-            screen_path = run_directory / "research-screen-result-v1.json"
-            self.assertEqual(json.loads(screen_path.read_bytes())["screen_outcome"], "PASSED")
-            with closing(sqlite3.connect(paths.state_path / "ledger.sqlite3")) as connection:
-                stage = connection.execute(
-                    """SELECT outcome, reason_code, artifact_path
-                    FROM stage_results WHERE stage = 'Research screened'""",
-                ).fetchone()
-            self.assertEqual(stage, ("PASSED", "SCREEN_PASSED", str(screen_path)))
-            run_directory = paths.state_path / "runs" / str(feedback["experiment_id"])
-            candidate_path = run_directory / "candidate.json"
-            candidate_bytes = candidate_path.read_bytes()
-            candidate_path.unlink()
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(
-                    strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("untrusted terminal chain relaunched research"),
-                ),
-                self.assertRaisesRegex(ValueError, "artifact is missing"),
-            ):
-                strategy_lab.run_strategy_loop(hypothesis_path, paths)
-            candidate_path.write_bytes(candidate_bytes)
-            ledger_path = paths.state_path / "ledger.sqlite3"
-            with closing(sqlite3.connect(ledger_path)) as connection, connection:
-                connection.execute("DROP TRIGGER signal_parity_results_immutable_delete")
-                connection.execute("DELETE FROM signal_parity_results")
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=1),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(
-                    strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("missing parity relaunched research"),
-                ),
-                self.assertRaisesRegex(ValueError, "PASS parity"),
-            ):
-                strategy_lab.run_strategy_loop(hypothesis_path, paths)
 
     def test_campaign_expansion_uses_canonical_strategy_ids_after_parameter_normalization(self) -> None:
         spec = campaign.CampaignSpec(
@@ -1827,9 +1514,9 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 )
                 if attempt.ordinal == 1:
                     return campaign.TrialEvidence(
-                        campaign.TerminalStatus.SCREEN_REJECTED,
+                        campaign.TerminalStatus.SURVIVED,
                         True,
-                        ("NO_SIGNALS",),
+                        ("SCREEN_PASSED",),
                         experiment_id,
                         candidate_id,
                     )
@@ -1938,8 +1625,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("preflight mismatch launched research process"),
+                    "_build_strategy_candidate",
+                    side_effect=AssertionError("preflight mismatch launched candidate build"),
                 ) as run_process,
             ):
                 summary = strategy_lab.run_strategy_campaign(spec, paths)
@@ -2104,24 +1791,10 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=_candidate_process(
-                        {
-                            "trade_count": 1,
-                            "signal_count": 1,
-                            "total_return": 0.1,
-                            "max_drawdown": 0.1,
-                            "turnover": 1.0,
-                        },
-                        source_last_timestamp=123,
-                    ),
+                    "_build_strategy_candidate",
+                    side_effect=_mock_build_candidate(),
                 ),
                 patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(
-                    strategy_lab,
-                    "run_signal_parity_gate",
-                    side_effect=_parity_for_candidate,
-                ),
                 patch.object(
                     strategy_lab,
                     "run_candidate_backtest",
@@ -2134,8 +1807,10 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 .campaign_trials(spec.campaign_id)[0]
                 .evidence.experiment_id
             )
-            screen_path = run_directory / "research-screen-result-v1.json"
-            screen_path.write_bytes(screen_path.read_bytes().replace(b'"PASSED"', b'"BROKEN"'))
+            candidate_file = run_directory / "candidate.json"
+            candidate_file.write_bytes(
+                candidate_file.read_bytes().replace(b'"provisional"', b'"tampered!!"')
+            )
 
             with (
                 patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
@@ -2146,8 +1821,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("completed campaign relaunched research"),
+                    "_build_strategy_candidate",
+                    side_effect=AssertionError("completed campaign relaunched candidate build"),
                 ) as research,
             ):
                 with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
@@ -2213,8 +1888,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_code_commit", return_value="d" * 40),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("drifted campaign launched research"),
+                    "_build_strategy_candidate",
+                    side_effect=AssertionError("drifted campaign launched candidate build"),
                 ) as run_process,
             ):
                 summary = strategy_lab.run_strategy_campaign(spec, paths)
@@ -2223,81 +1898,6 @@ class StrategyCampaignScreenTests(unittest.TestCase):
         self.assertEqual(summary["technical_invalid_count"], 1)
         self.assertEqual(summary["top_reason_codes"][0]["reason_code"], "CAMPAIGN_PREFLIGHT_DRIFT")
 
-    def test_post_run_data_drift_is_terminal_campaign_technical_evidence(self) -> None:
-        screen_policy_id = campaign.load_screen_policy(
-            Path("config/strategy_research_policy.json"),
-        ).policy_id
-        spec = campaign.CampaignSpec(
-            family_id="lookback-momentum-long-flat",
-            family_version="lookback-momentum-long-flat-v1",
-            search_space={"entry_threshold": (0.0,), "lookback_bars": (2,)},
-            approved_instruments=("BTCUSDT-PERP.BINANCE",),
-            approved_bar_types=("BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",),
-            parameter_search_policy_id="f" * 64,
-            seed=42,
-            data_as_of_ns=123,
-            generation_budget=1,
-            maximum_candidates=1,
-            screen_policy_id=screen_policy_id,
-        )
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market-data.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-                research_policy_path=Path("config/strategy_research_policy.json"),
-            )
-            with (
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(
-                    strategy_lab,
-                    "_hash_tree",
-                    side_effect=("a" * 64,) * 12 + ("b" * 64,) * 12,
-                ),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(
-                    strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=_candidate_process(
-                        {
-                            "trade_count": 1,
-                            "signal_count": 1,
-                            "total_return": 0.1,
-                            "max_drawdown": 0.1,
-                            "turnover": 1.0,
-                        },
-                        source_last_timestamp=123,
-                    ),
-                ),
-                patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(
-                    strategy_lab,
-                    "run_signal_parity_gate",
-                    side_effect=_parity_for_candidate,
-                ),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=_backtest_for_request,
-                ) as run_nautilus,
-            ):
-                summary = strategy_lab.run_strategy_campaign(spec, paths)
-            trials = strategy_lab.StrategyLedger(
-                paths.state_path / "ledger.sqlite3",
-            ).campaign_trials(spec.campaign_id)
-
-        run_nautilus.assert_called_once()
-        self.assertEqual(summary["technical_invalid_count"], 1)
-        self.assertEqual(summary["top_reason_codes"][0]["reason_code"], "CAMPAIGN_PREFLIGHT_DRIFT")
-        self.assertEqual(trials[0].evidence.reason_codes, ("CAMPAIGN_PREFLIGHT_DRIFT",))
-        self.assertTrue(trials[0].evidence.execution_started)
-        self.assertIsNotNone(trials[0].evidence.experiment_id)
 
     def test_campaign_trial_rejects_cross_strategy_experiment_and_started_without_one(self) -> None:
         spec = self._spec()
@@ -2363,49 +1963,6 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                     ),
                 )
 
-    def test_candidate_data_cohort_mismatch_is_technical_before_screen_or_nautilus(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hypothesis_path = root / "hypothesis.json"
-            hypothesis_path.write_bytes(_canonical(_hypothesis()))
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market-data.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-            )
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(
-                    strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=_candidate_process(
-                        {
-                            "trade_count": 0,
-                            "signal_count": 0,
-                            "total_return": 0.0,
-                            "max_drawdown": 0.0,
-                            "turnover": 0.0,
-                        },
-                    ),
-                ),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=AssertionError("stale candidate reached Nautilus"),
-                ) as run_nautilus,
-            ):
-                feedback = strategy_lab.run_strategy_loop(hypothesis_path, paths)
-
-        self.assertEqual(feedback["status"], "ERROR")
-        self.assertEqual(feedback["reason_codes"], ["RESEARCH_CANDIDATE_INVALID"])
-        run_nautilus.assert_not_called()
 
     def test_standalone_claim_rejects_identity_drift_before_launch(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2463,99 +2020,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
 
         execute.assert_not_called()
 
-    def test_candidate_runtime_attestation_mismatch_never_reaches_nautilus(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hypothesis_path = root / "hypothesis.json"
-            hypothesis_path.write_bytes(_canonical(_hypothesis()))
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-                research_policy_path=Path("config/strategy_research_policy.json"),
-            )
-            research_process = _candidate_process(
-                {
-                    "trade_count": 1,
-                    "signal_count": 1,
-                    "total_return": 0.1,
-                    "max_drawdown": 0.1,
-                    "turnover": 1.0,
-                },
-                candidate_environment_id="f" * 64,
-                source_last_timestamp=123,
-            )
-            with (
-                patch.object(strategy_lab, "_hash_tree", return_value="c" * 64),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(strategy_lab, "_run_bounded_process", side_effect=research_process),
-                patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(strategy_lab, "run_signal_parity_gate", side_effect=_parity_for_candidate),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=AssertionError("unbound runtime reached Nautilus"),
-                ) as run_nautilus,
-            ):
-                feedback = strategy_lab.run_strategy_loop(hypothesis_path, paths)
 
-        self.assertEqual(feedback["status"], "ERROR")
-        self.assertEqual(feedback["reason_codes"], ["RESEARCH_CANDIDATE_INVALID"])
-        run_nautilus.assert_not_called()
-
-    def test_standalone_data_drift_after_pybroker_never_reaches_nautilus(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hypothesis_path = root / "hypothesis.json"
-            hypothesis_path.write_bytes(_canonical(_hypothesis()))
-            paths = strategy_lab.StrategyLoopPaths(
-                market_data_path=root / "market.json",
-                policy_path=Path("config/strategy_loop_policy.json"),
-                catalog_path=root / "catalog",
-                funding_path=root / "funding",
-                state_path=root / "state",
-                research_policy_path=Path("config/strategy_research_policy.json"),
-            )
-            research_process = _candidate_process(
-                {
-                    "trade_count": 1,
-                    "signal_count": 1,
-                    "total_return": 0.1,
-                    "max_drawdown": 0.1,
-                    "turnover": 1.0,
-                },
-                source_last_timestamp=123,
-            )
-            with (
-                patch.object(
-                    strategy_lab,
-                    "_hash_tree",
-                    side_effect=("a" * 64,) * 4 + ("b" * 64,) * 8,
-                ),
-                patch.object(strategy_lab, "_catalog_digest", return_value="a" * 64),
-                patch.object(strategy_lab, "_catalog_last_timestamp", return_value=123),
-                patch.object(strategy_lab, "_runtime_identity", return_value="d" * 64),
-                patch.object(strategy_lab, "_engine_identity", return_value="engine-v2"),
-                patch.object(strategy_lab, "_code_commit", return_value="e" * 40),
-                patch.object(strategy_lab, "_run_bounded_process", side_effect=research_process),
-                patch.object(strategy_lab, "validated_candidate_source_bars", return_value=[]),
-                patch.object(strategy_lab, "run_signal_parity_gate", side_effect=_parity_for_candidate),
-                patch.object(
-                    strategy_lab,
-                    "run_candidate_backtest",
-                    side_effect=AssertionError("drifted standalone reached Nautilus"),
-                ) as run_nautilus,
-            ):
-                feedback = strategy_lab.run_strategy_loop(hypothesis_path, paths)
-
-        self.assertEqual(feedback["status"], "ERROR")
-        run_nautilus.assert_not_called()
 
     def test_existing_nonterminal_experiment_never_relaunches_execution(self) -> None:
         spec = self._spec()
@@ -2635,8 +2100,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_prepare_execution", return_value=prepared),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("nonterminal campaign relaunched PyBroker"),
+                    "_build_strategy_candidate",
+                    side_effect=AssertionError("nonterminal campaign relaunched candidate build"),
                 ) as run_process,
             ):
                 try:
@@ -2694,8 +2159,8 @@ class StrategyCampaignScreenTests(unittest.TestCase):
                 patch.object(strategy_lab, "_prepare_execution", return_value=prepared),
                 patch.object(
                     strategy_lab,
-                    "_run_bounded_process",
-                    side_effect=AssertionError("standalone nonterminal relaunched PyBroker"),
+                    "_build_strategy_candidate",
+                    side_effect=AssertionError("standalone nonterminal relaunched candidate build"),
                 ) as run_process,
                 self.assertRaisesRegex(
                     strategy_lab.StrategyLabError,
@@ -2747,109 +2212,7 @@ class StrategyCampaignScreenTests(unittest.TestCase):
             [("CAMPAIGN_PREFLIGHT_DRIFT",), ("CAMPAIGN_PREFLIGHT_DRIFT",)],
         )
 
-    def test_research_screen_error_restores_terminal_technical_evidence(self) -> None:
-        identity = strategy_lab.ExperimentIdentity(
-            "1" * 64,
-            "2" * 64,
-            "3" * 64,
-            "engine-v2",
-            "4" * 64,
-        )
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
-            ledger.initialize()
-            experiment_id = "5" * 64
-            error_path = root / "research-error.json"
-            error_path.write_bytes(
-                _canonical(
-                    {
-                        "detail": "invalid provisional result",
-                        "experiment_id": experiment_id,
-                        "reason_code": "RESEARCH_RESULT_INVALID",
-                        "schema_version": "strategy-loop-error-v1",
-                        "stage": "RESEARCH",
-                    },
-                ),
-            )
-            artifact_hash = sha256(error_path.read_bytes()).hexdigest()
-            with closing(sqlite3.connect(ledger.path)) as connection, connection:
-                connection.execute(
-                    "INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        experiment_id,
-                        "6" * 64,
-                        identity.strategy_id,
-                        identity.data_source_id,
-                        identity.policy_id,
-                        identity.engine_id,
-                        identity.runtime_id,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO stage_results VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        experiment_id,
-                        identity.strategy_id,
-                        "Research screened",
-                        "ERROR",
-                        "RESEARCH_RESULT_INVALID",
-                        str(error_path),
-                        artifact_hash,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO errors VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        "7" * 64,
-                        experiment_id,
-                        "RESEARCH",
-                        "RESEARCH_RESULT_INVALID",
-                        str(error_path),
-                        artifact_hash,
-                    ),
-                )
 
-            evidence = ledger.existing_execution(identity, None)
-
-        self.assertIsNotNone(evidence)
-        assert evidence is not None
-        self.assertEqual(evidence.terminal_status, campaign.TerminalStatus.TECHNICAL_INVALID)
-        self.assertEqual(evidence.reason_codes, ("RESEARCH_RESULT_INVALID",))
-
-    def test_campaign_preflight_drift_cannot_mask_started_terminal_execution(self) -> None:
-        identity = strategy_lab.ExperimentIdentity(
-            "1" * 64,
-            "2" * 64,
-            "3" * 64,
-            "engine-v2",
-            "4" * 64,
-        )
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            ledger = strategy_lab.StrategyLedger(root / "ledger.sqlite3")
-            ledger.initialize()
-            policy, _candidate_path, _screen_path, candidate_id = self._cached_screen_fixture(
-                root,
-                ledger,
-                identity,
-            )
-            trial = campaign.CampaignTrial(
-                "8" * 64,
-                0,
-                identity.strategy_id,
-                candidate_id,
-                campaign.TrialEvidence(
-                    campaign.TerminalStatus.TECHNICAL_INVALID,
-                    False,
-                    ("CAMPAIGN_PREFLIGHT_DRIFT",),
-                    "5" * 64,
-                    candidate_id,
-                ),
-            )
-
-            with self.assertRaisesRegex(ValueError, "execution_started mismatch"):
-                ledger.verify_campaign_trial(trial, policy)
 
     def test_unexpected_executor_exception_becomes_terminal_technical_evidence(self) -> None:
         spec = self._spec()

@@ -1,0 +1,11 @@
+# Strategy Paper Evidence v1
+
+Paper evidence begins only after a content-addressed Strategy Freeze derived from the persisted historical/robustness ADVANCE chain. The freeze binds strategy, hypothesis, candidate, family/version, parameters, kernel version/hash, code commit, historical and robustness verdict IDs, inspected data boundary and snapshot, runtime, instrument/bar type and metadata, Paper admission policy, and Risk & Execution Policy.
+
+A runtime run is prospective only when `cohort_start_ns` is later than the inspected historical boundary. SHADOW uses Binance USD-M production public data with no execution client and must keep its order cache empty. PAPER uses the same `FamilyStrategy`, production public data, active Nautilus risk, and sandbox execution. The deterministic forced `LONG → FLAT` fixture is infrastructure evidence and is never counted as the prospective cohort.
+
+`runtime_runs` and `runtime_verdicts` are append-only and artifact-backed. Verdict identity includes the frozen Paper policy and restart count. A passing PAPER cohort requires at least the policy's completed-bar count, wall-clock duration, and controlled restart count; terminal position must be flat, open orders zero, and missing/revised bars zero. Technical and economic statuses remain separate. Paper never sets promotion eligible; Binance Demo evidence is still required.
+
+Live bars write only runtime evidence, never the canonical Catalog or Funding store. After the existing D-1 writer ingests the same bars, reconciliation compares normalized canonical bar bytes and content-addressed signal identities. Any bar, timestamp, signal, metadata, fee, account, position, order, artifact, policy, runtime, or restart mismatch fails closed with `FIX_TECHNICAL`; live payload is never backfilled as historical truth.
+
+Required runtime evidence includes cohort bounds, completed/missing/revised bars, signals and intent mapping, Mark Price and instrument/filter/fee metadata IDs, sandbox fills/fees/positions/account, restart/reconnect and duplicate suppression, terminal reconciliation, reason codes, and artifact paths/hashes. Credentials, signatures, private headers, canonical market data, and real-money execution are forbidden.

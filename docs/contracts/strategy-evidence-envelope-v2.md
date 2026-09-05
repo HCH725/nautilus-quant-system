@@ -1,74 +1,51 @@
 # Strategy Evidence Envelope v2 Contract
 
-> **Card 1 control-plane contract.** Evidence remains distributed across canonical artifacts and append-only ledger rows; this document defines how identities must resolve together. It does not invent a mutable envelope database row or declare later tiers implemented.
+This control-plane contract defines how canonical evidence identities resolve across Nautilus-only research, robustness, and prospective runtime tiers. Evidence remains distributed across canonical artifacts and append-only ledger rows; no mutable envelope service is introduced.
 
 ## Permanent rules
 
 1. A tier cannot declare PASS when an identity required for that tier is missing.
-2. A verdict cannot be reused when strategy/family/kernel, data, policy, evaluation context, runtime, or environment identity changes.
-3. Campaign membership is lineage/context only and does not change execution identity.
-4. A field that does not apply at the current tier is `N/A`, not `0`, an empty placeholder, or model-generated content.
-5. Artifact truth is the canonical bytes plus SHA-256 read back from immutable storage; read-only projections cannot create evidence.
-6. Existing V1 identities and rows remain historical facts and are never recomputed to fit V2.
+2. A verdict cannot be reused when strategy/family/kernel, data, policy, evaluation context, runtime, engine, or code identity changes.
+3. Campaign membership is lineage/context only and does not alter execution identity.
+4. Non-applicable fields are `N/A`, not fabricated zero values.
+5. Artifact truth is exact canonical bytes plus verified SHA-256.
+6. Existing immutable identities are not silently reidentified.
 
 ## Identity vocabulary
 
-| Identity | Card 1 source of truth |
+| Identity | Source of truth |
 |---|---|
-| `strategy_id` | `strategy-hypothesis-v2` normalized execution identity |
-| `family_id`, `family_version` | tracked family registry plus hypothesis/candidate |
-| `kernel_version`, `kernel_hash` | tracked family-kernel manifest plus Candidate v2 |
-| `data_snapshot_id`, `data_as_of` | Candidate v2 source identity; snapshot equals source digest |
-| `code_commit` | controller evaluation-context preimage and Nautilus verdict |
-| `screen_policy_id` | canonical strategy-loop policy digest |
-| `robustness_policy_id` | tracked `strategy-robustness-policy-v1` content ID |
-| `cost_policy_id` | tracked Nautilus fee/Funding/delay/one-tick cost-policy content ID |
-| `risk_policy_id` | `N/A` until the independent Risk & Execution Policy in Card 4 |
-| `evaluation_context_id` | SHA-256 over strategy, family/kernel, code, data, screen policy, engine, and runtime identities |
-| `runtime_identity`, `environment_identity` | root runtime digest and isolated PyBroker environment digest |
-| `artifact_hash` | SHA-256 of exact canonical artifact bytes |
+| `strategy_id` | normalized hypothesis strategy intent |
+| `hypothesis_id` | canonical hypothesis bytes |
+| `family_id`, `family_version` | tracked family registry + hypothesis/candidate |
+| `kernel_version`, `kernel_hash` | tracked deterministic family kernel |
+| `candidate_id` | canonical `strategy-candidate-v1` bytes |
+| `data_snapshot_id`, `data_as_of_ns` | canonical candidate/source identity |
+| `code_commit` | controller context + Nautilus verdict |
+| policy IDs | canonical frozen policy bytes |
+| `evaluation_context_id` | strategy/family/kernel/code/data/policy/engine/runtime preimage |
+| `runtime_id` | Nautilus-only root runtime identity |
+| `experiment_id` | strategy/data/policy/engine/runtime identity |
+| artifact hash | SHA-256 of exact immutable artifact bytes |
 
-## Card 1 requirement matrix
+## Requirement matrix
 
-`R` = required, `N/A` = not applicable at this tier, `Resolve` = required and resolved through a bound parent identity/artifact.
+| Identity | Hypothesis | Candidate | Nautilus historical | Robustness | Paper/runtime |
+|---|---:|---:|---:|---:|---:|
+| strategy/hypothesis | R | Resolve | R | Resolve | Resolve |
+| family/version | R | R | Resolve | Resolve | Resolve |
+| kernel version/hash | Resolve | R | Resolve | Resolve | Resolve |
+| data snapshot/as-of | N/A | R | R | R | prospective boundary |
+| code commit | N/A | Resolve | R | Resolve | Resolve |
+| relevant policy IDs | N/A/Resolve | Resolve | R | R | R |
+| evaluation context | N/A | R | Resolve | R | Resolve |
+| root runtime | N/A | R | R | Resolve | R |
+| artifact hash | R | R | R | R | R |
 
-| Identity | Hypothesis v2 | Candidate v2 | Parity result | Nautilus historical verdict |
-|---|---:|---:|---:|---:|
-| strategy ID | R | Resolve | Resolve | R |
-| family/version | R | R | Resolve from candidate | Resolve |
-| kernel version/hash | Resolve from tracked registry | R | Resolve from candidate and recomputation | Resolve |
-| data snapshot/as-of | N/A | R | R/Resolve | R/Resolve |
-| code commit | N/A | Resolve via evaluation context | Resolve via evaluation context | R |
-| screen policy | N/A | Resolve via evaluation context | Resolve via evaluation context | Resolve via experiment |
-| robustness policy | N/A | N/A | N/A | N/A |
-| cost policy | N/A | N/A | N/A | Resolve via evaluator policy |
-| risk policy | N/A | N/A | N/A | N/A |
-| evaluation context | N/A | R | R | Resolve via experiment/parity |
-| runtime/environment | N/A | R | Resolve via evaluation context | R/Resolve |
-| artifact hash | R | R | R | R |
+## Evaluation context
 
-Later tiers must extend this matrix under new versioned contracts rather than weakening Card 1 fields.
-
-## Evaluation and experiment identity
-
-For a V2 run, `evaluation_context_id` binds:
-
-```text
-schema_version = evaluation-context-v1
-strategy_id
-family_id + family_version
-kernel_version + kernel_hash
-code_commit
-data_source_id
-screen_policy_id
-engine_id
-runtime_id
-```
-
-The V2 experiment identity then binds strategy, data source, policy, runtime, and an engine identity that includes the evaluation context. Therefore a change to kernel code/identity, canonical data, screen/evaluator policy, code commit, evaluation context, or runtime/environment creates a new experiment identity and prevents verdict reuse.
+The evaluation context binds the applicable strategy/family/kernel identity, code commit, canonical data identity, policy IDs, engine ID, and root runtime ID. Any material change creates a new context/experiment rather than mutating old evidence.
 
 ## Current implementation boundary
 
-Card 1 implements Hypothesis v2, Candidate v2, shared deterministic family kernel, evaluation context, formal Signal Parity Gate, append-only parity evidence, V1-safe strategy-ledger migration, and Nautilus consumption of recomputed signals.
-
-The following remain outside this contract: independent Risk & Execution Policy, Shadow/Paper, Binance Demo/Testnet evidence, promotion projection, runtime qualification, and all real-funds Live capability. Card 3 robustness artifacts are defined separately by the strategy robustness, verdict, feedback, and action contracts; DSR/PBO remain `NOT_MODELED` there.
+The repository implements hypothesis/candidate identity, shared deterministic family kernels, Nautilus historical evaluation, campaign census, append-only ledger evidence, Nautilus robustness evidence, strategy freeze, and Shadow/Paper runtime evidence. Venue qualification and real-capital authorization remain separately gated.

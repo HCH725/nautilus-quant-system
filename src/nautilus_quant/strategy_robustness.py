@@ -796,9 +796,9 @@ def evaluate_robustness_matrix(
         parameters = getattr(request, "candidate_parameters", None)
     if not isinstance(parameters, dict):
         try:
-            from .pybroker_candidate import load_pybroker_candidate
+            from .strategy_candidate import load_strategy_candidate
 
-            candidate, _candidate_id = load_pybroker_candidate(getattr(request, "candidate_path"))
+            candidate, _candidate_id = load_strategy_candidate(getattr(request, "candidate_path"))
             strategy = candidate.get("strategy")
             parameters = strategy.get("parameters") if isinstance(strategy, dict) else None
         except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
@@ -1980,10 +1980,9 @@ def run_persisted_robustness(
     from .candidate_backtest import (
         _load_policy,
         CandidateBacktestRequest,
-        run_signal_parity_gate,
         validated_candidate_source_bars,
     )
-    from .pybroker_candidate import load_pybroker_candidate
+    from .strategy_candidate import load_strategy_candidate
     from .strategy_lab import (
         _atomic_publish,
         _hash_tree,
@@ -2007,11 +2006,10 @@ def run_persisted_robustness(
     )
     if source_id != survivor.base_identity.data_source_id:
         raise StrategyRobustnessError("formal robustness data source identity mismatch")
-    loaded_candidate, loaded_candidate_id = load_pybroker_candidate(survivor.candidate_path)
+    loaded_candidate, loaded_candidate_id = load_strategy_candidate(survivor.candidate_path)
     candidate = cast(dict[str, Any], loaded_candidate)
     if loaded_candidate_id != survivor.candidate_id:
         raise StrategyRobustnessError("persisted survivor candidate identity mismatch")
-    signal_parity = run_signal_parity_gate(survivor.candidate_path, catalog_path)
     historical_start_ns = _load_policy(accounting_policy_path).historical_start_ns
     bars = tuple(
         bar
@@ -2086,7 +2084,6 @@ def run_persisted_robustness(
         data_as_of_ns=data_as_of_ns,
         evaluation_context_id=evaluation_context_id,
         candidate_evaluation_context_id=survivor.candidate_evaluation_context_id,
-        signal_parity=signal_parity,
     )
     formal_evaluator = evaluator or FormalNautilusEvaluator()
     created_cell_paths: list[Path] = []

@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Sequence
-from concurrent.futures import TimeoutError as FuturesTimeoutError
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -16,11 +14,10 @@ import os
 import platform
 from pathlib import Path
 import re
-import signal
 import sqlite3
 import subprocess
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import Final, IO, Literal, assert_never, cast
+from typing import Final, Literal, assert_never, cast
 
 import nautilus_trader
 from nautilus_trader.persistence import ParquetDataCatalog
@@ -29,16 +26,12 @@ from .candidate_backtest import (
     _catalog_digest,
     CandidateBacktestError,
     CandidateBacktestRequest,
-    SignalParityResult,
-    candidate_signal_decisions,
-    load_signal_parity_result,
     load_candidate_backtest_verdict,
     run_candidate_backtest,
-    run_signal_parity_gate,
     validated_candidate_source_bars,
 )
-from .pybroker_candidate import load_pybroker_candidate
-from .runtime_attestation import research_runtime_identity
+from .runtime_attestation import root_runtime_identity
+from .strategy_candidate import canonical_candidate_bytes, load_strategy_candidate
 from .strategy_campaign import (
     CampaignAttempt,
     CampaignPreflight,
@@ -51,16 +44,11 @@ from .strategy_campaign import (
     TrialEvidence,
     expand_campaign,
     load_campaign_spec,
-    load_research_result_v2,
     load_screen_policy,
-    load_screen_result_v1,
     run_campaign,
-    screen_research_result,
-    screened_result_document,
 )
 from .strategy_families import (
     DEFAULT_REGISTRY,
-    FamilyDecision,
     KERNEL_HASH,
     KERNEL_VERSION,
     FamilyKernelError,
@@ -85,24 +73,36 @@ _INSTRUMENT_ID: Final = "BTCUSDT-PERP.BINANCE"
 _BAR_TYPE: Final = "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL"
 _MAX_LOOKBACK_BARS: Final = 8_760
 _SQLITE_INTEGER_MAX: Final = (1 << 63) - 1
-PROCESS_OUTPUT_LIMIT: Final = 65_536
-PYBROKER_TIMEOUT_SECONDS: Final = 7_200
 _REPO_ROOT: Final = Path(__file__).resolve().parents[2]
-_PYBROKER_COMMAND: Final = (
-    "research/.venv/bin/python",
-    "-I",
-    "research/pybroker_research.py",
-)
+_DATA_SYNC_LOCK: Final = _REPO_ROOT / "var/locks/data-sync.lock"
 _STAGE_LABELS: Final = (
     "Proposed",
     "Contract valid",
-    "PyBroker completed",
+    "Candidate specified",
     "Research screened",
-    "Nautilus replayed",
+    "Nautilus evaluated",
     "Robustness passed",
     "Promotion eligible",
 )
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@contextmanager
+def _hold_data_snapshot_shared(lock_path: Path | None = None) -> Iterator[None]:
+    """Prevent canonical data sync while one immutable research snapshot is in use."""
+    path = Path(lock_path) if lock_path is not None else _DATA_SYNC_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 _TOP_LEVEL_FIELDS: Final = frozenset(
     {
         "bar_type",
@@ -226,7 +226,7 @@ CREATE TABLE IF NOT EXISTS stage_results (
     experiment_id TEXT NOT NULL,
     strategy_id TEXT NOT NULL,
     stage TEXT NOT NULL CHECK (stage IN (
-        'PyBroker completed', 'Research screened', 'Nautilus replayed'
+        'Candidate specified', 'Research screened', 'Nautilus evaluated'
     )),
     outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED', 'ERROR')),
     reason_code TEXT NOT NULL,
@@ -235,24 +235,6 @@ CREATE TABLE IF NOT EXISTS stage_results (
     PRIMARY KEY (experiment_id, stage),
     FOREIGN KEY (experiment_id, strategy_id)
         REFERENCES experiments(experiment_id, strategy_id)
-);
-CREATE TABLE IF NOT EXISTS signal_parity_results (
-    parity_result_id TEXT PRIMARY KEY,
-    experiment_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    evaluation_context_id TEXT NOT NULL,
-    data_snapshot_id TEXT NOT NULL,
-    outcome TEXT NOT NULL CHECK (outcome IN ('PASS', 'ERROR')),
-    reason_code TEXT NOT NULL,
-    required_action TEXT,
-    artifact_path TEXT NOT NULL,
-    artifact_sha256 TEXT NOT NULL,
-    UNIQUE (experiment_id, candidate_id),
-    CHECK (
-        (outcome = 'PASS' AND required_action IS NULL)
-        OR (outcome = 'ERROR' AND required_action = 'FIX_TECHNICAL')
-    ),
-    FOREIGN KEY (experiment_id) REFERENCES experiments(experiment_id)
 );
 CREATE TABLE IF NOT EXISTS campaigns (
     campaign_id TEXT PRIMARY KEY,
@@ -327,7 +309,6 @@ _IMMUTABLE_TABLES: Final = (
     "verdicts",
     "errors",
     "stage_results",
-    "signal_parity_results",
     "campaigns",
     "campaign_trials",
     "robustness_results",
@@ -465,35 +446,11 @@ class StrategyLoopPaths:
 @dataclass(frozen=True, slots=True)
 class StageRecord:
     experiment_id: str
-    stage: Literal["PyBroker completed", "Research screened", "Nautilus replayed"]
+    stage: Literal["Candidate specified", "Research screened", "Nautilus evaluated"]
     outcome: Literal["PASSED", "REJECTED", "ERROR"]
     reason_code: str
     artifact_path: str
     artifact_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class SignalParityRecord:
-    experiment_id: str
-    candidate_id: str
-    evaluation_context_id: str
-    data_snapshot_id: str
-    outcome: Literal["PASS", "ERROR"]
-    reason_code: str
-    required_action: Literal["FIX_TECHNICAL"] | None
-    artifact_path: str
-    artifact_sha256: str
-    decisions: tuple[FamilyDecision, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _ProcessResult:
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-    stdout_truncated: bool
-    stderr_truncated: bool
-    timed_out: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1034,26 +991,6 @@ def _error_record_id(record: ErrorRecord) -> str:
     return sha256(_canonical_json(values)).hexdigest()
 
 
-def _signal_parity_record_id(record: SignalParityRecord) -> str:
-    values: dict[str, JsonValue] = {
-        "artifact_path": _identifier(record.artifact_path, "artifact_path"),
-        "artifact_sha256": _content_id(record.artifact_sha256, "artifact_sha256"),
-        "candidate_id": _content_id(record.candidate_id, "candidate_id"),
-        "data_snapshot_id": _content_id(record.data_snapshot_id, "data_snapshot_id"),
-        "evaluation_context_id": _content_id(
-            record.evaluation_context_id,
-            "evaluation_context_id",
-        ),
-        "experiment_id": _content_id(record.experiment_id, "experiment_id"),
-        "outcome": record.outcome,
-        "reason_code": _identifier(record.reason_code, "reason_code"),
-        "required_action": record.required_action,
-    }
-    if (record.outcome == "PASS") != (record.required_action is None):
-        raise StrategyLabError("invalid signal parity outcome/action pairing")
-    return sha256(_canonical_json(values)).hexdigest()
-
-
 def _execute_schema(connection: sqlite3.Connection) -> None:
     statement = ""
     for line in _SCHEMA.splitlines(keepends=True):
@@ -1221,33 +1158,6 @@ class StrategyLedger:
                         )
                 _execute_schema(connection)
                 migrated_robustness_lineage = _migrate_legacy_robustness_lineage(connection)
-                stage_schema = connection.execute(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stage_results'",
-                ).fetchone()
-                if stage_schema is not None and "'ERROR'" not in stage_schema[0]:
-                    connection.execute("DROP TRIGGER IF EXISTS stage_results_immutable_update")
-                    connection.execute("DROP TRIGGER IF EXISTS stage_results_immutable_delete")
-                    connection.execute("ALTER TABLE stage_results RENAME TO legacy_stage_results")
-                    connection.execute(
-                        """CREATE TABLE stage_results (
-                            experiment_id TEXT NOT NULL,
-                            strategy_id TEXT NOT NULL,
-                            stage TEXT NOT NULL CHECK (stage IN (
-                                'PyBroker completed', 'Research screened', 'Nautilus replayed'
-                            )),
-                            outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED', 'ERROR')),
-                            reason_code TEXT NOT NULL,
-                            artifact_path TEXT NOT NULL,
-                            artifact_sha256 TEXT NOT NULL,
-                            PRIMARY KEY (experiment_id, stage),
-                            FOREIGN KEY (experiment_id, strategy_id)
-                                REFERENCES experiments(experiment_id, strategy_id)
-                        )""",
-                    )
-                    connection.execute(
-                        "INSERT INTO stage_results SELECT * FROM legacy_stage_results",
-                    )
-                    connection.execute("DROP TABLE legacy_stage_results")
                 for table in _IMMUTABLE_TABLES:
                     for action in ("UPDATE", "DELETE"):
                         connection.execute(
@@ -1393,17 +1303,13 @@ class StrategyLedger:
             ).fetchone()[0]
             nautilus_count = connection.execute(
                 """SELECT COUNT(*) FROM stage_results
-                WHERE experiment_id = ? AND stage = 'Nautilus replayed'""",
+                WHERE experiment_id = ? AND stage = 'Nautilus evaluated'""",
                 (experiment_id,),
             ).fetchone()[0]
-            parity_count = connection.execute(
-                "SELECT COUNT(*) FROM signal_parity_results WHERE experiment_id = ?",
-                (experiment_id,),
-            ).fetchone()[0]
-            pybroker = connection.execute(
+            candidate_stage = connection.execute(
                 """SELECT outcome, reason_code, artifact_path, artifact_sha256
                 FROM stage_results
-                WHERE experiment_id = ? AND stage = 'PyBroker completed'""",
+                WHERE experiment_id = ? AND stage = 'Candidate specified'""",
                 (experiment_id,),
             ).fetchone()
             screen = connection.execute(
@@ -1412,10 +1318,6 @@ class StrategyLedger:
                 WHERE experiment_id = ? AND stage = 'Research screened'""",
                 (experiment_id,),
             ).fetchone()
-            stage_count = connection.execute(
-                "SELECT COUNT(*) FROM stage_results WHERE experiment_id = ?",
-                (experiment_id,),
-            ).fetchone()[0]
             campaign = connection.execute(
                 """SELECT document_json, screen_policy_id, data_as_of_ns, data_source_id
                 FROM campaigns WHERE campaign_id = ?""",
@@ -1429,24 +1331,15 @@ class StrategyLedger:
         if hypothesis_row is None or hypothesis_row[2] != "strategy-id-v2":
             raise StrategyLabError("campaign trial has an invalid terminal chain")
         if evidence.terminal_status is TerminalStatus.SCREEN_REJECTED:
-            if (
-                verdict_rows
-                or error_count != 0
-                or nautilus_count != 0
-                or parity_count != 0
-                or stage_count != 2
-                or pybroker is None
-                or pybroker[0:2] != ("PASSED", "PYBROKER_COMPLETED")
-                or screen is None
-                or screen[0] != "REJECTED"
-            ):
-                raise StrategyLabError("campaign trial has an invalid terminal chain")
-        elif (
+            raise StrategyLabError(
+                "provisional screen rejection is retired; "
+                "Nautilus-only trials cannot reject before evaluation"
+            )
+        if (
             len(verdict_rows) != 1
             or error_count != 0
             or nautilus_count != 1
-            or parity_count != 1
-            or pybroker is None
+            or candidate_stage is None
             or screen is None
         ):
             raise StrategyLabError("campaign trial has an invalid terminal chain")
@@ -1467,21 +1360,14 @@ class StrategyLedger:
                 raise StrategyLabError("campaign document is not canonical")
             _verified_artifact(Path(str(hypothesis_row[0])), str(hypothesis_row[1]))
             stored_hypothesis = load_strategy_hypothesis(Path(str(hypothesis_row[0])))
-            raw_path = Path(str(pybroker[2]))
-            raw_payload = _verified_artifact(raw_path, str(pybroker[3]))
-            result = load_research_result_v2(raw_payload)
-            candidate_path = raw_path.with_name("candidate.json")
-            _verified_artifact(candidate_path, result.candidate_id)
-            candidate, candidate_id = load_pybroker_candidate(candidate_path)
-            screen_payload = _verified_artifact(Path(str(screen[2])), str(screen[3]))
-            screen_document = load_screen_result_v1(screen_payload)
+            candidate_path = Path(str(candidate_stage[2]))
+            _verified_artifact(candidate_path, str(candidate_stage[3]))
+            candidate, candidate_id = load_strategy_candidate(candidate_path)
         except StrategyLabError:
             raise
         except (
             IndexError,
             OSError,
-            CandidateBacktestError,
-            StrategyCampaignError,
             TypeError,
             ValueError,
         ) as error:
@@ -1497,15 +1383,19 @@ class StrategyLedger:
         )
         candidate_source = candidate.get("source")
         evaluation_context_id = candidate.get("evaluation_context_id")
-        screen_policy_id = screen_document.get("screen_policy_id")
+        screen_policy_id = str(campaign[1])
         if (
             stored_hypothesis.hypothesis_id != experiment[0]
             or stored_hypothesis.strategy_id != experiment[1]
             or not isinstance(candidate_source, dict)
             or not isinstance(evaluation_context_id, str)
-            or not isinstance(screen_policy_id, str)
             or experiment[6] is None
             or experiment[7] is None
+            or candidate_stage[0:2] != ("PASSED", "CANDIDATE_SPECIFIED")
+            or candidate_stage[3] != candidate_id
+            or screen[0:2] != ("PASSED", "SCREEN_PASSED")
+            or screen[2] != str(candidate_path)
+            or screen[3] != candidate_id
             or campaign_document.get("family_id") != stored_hypothesis.family_id
             or campaign_document.get("family_version") != stored_hypothesis.family_version
             or campaign_document.get("approved_instruments") != [_INSTRUMENT_ID]
@@ -1515,9 +1405,6 @@ class StrategyLedger:
             or campaign[3] != identity.data_source_id
             or experiment[7] != campaign[2]
             or candidate_source.get("data_as_of_ns") != campaign[2]
-            or screen_document.get("candidate_id") != candidate_id
-            or screen_policy_id != campaign[1]
-            or candidate_id != result.candidate_id
             or candidate_id != evidence.candidate_id
         ):
             raise StrategyLabError("campaign terminal candidate immutable identity mismatch")
@@ -1532,45 +1419,6 @@ class StrategyLedger:
             screen_policy_id=screen_policy_id,
             code_commit=_code_commit() if validate_current_context else None,
         )
-        if evidence.terminal_status is TerminalStatus.SCREEN_REJECTED:
-            if (
-                verdict_rows
-                or error_count != 0
-                or nautilus_count != 0
-                or parity_count != 0
-                or stage_count != 2
-                or pybroker is None
-                or pybroker[0:2] != ("PASSED", "PYBROKER_COMPLETED")
-                or screen is None
-                or screen[0] != "REJECTED"
-                or screen_document.get("screen_outcome") != "SCREEN_REJECTED"
-            ):
-                raise StrategyLabError("campaign trial has an invalid terminal chain")
-            reasons = tuple(reason for reason in evidence.reason_codes if reason != "REUSED_EXECUTION")
-            expected_metrics = {
-                "max_drawdown": result.metrics.max_drawdown,
-                "signal_count": result.metrics.signal_count,
-                "total_return": result.metrics.total_return,
-                "trade_count": result.metrics.trade_count,
-                "turnover": result.metrics.turnover,
-            }
-            candidate_signals = candidate.get("signals")
-            if (
-                not isinstance(candidate_signals, list)
-                or len(candidate_signals) != result.metrics.signal_count
-                or screen_document.get("provisional_metrics") != expected_metrics
-                or screen_document.get("screen_reason_codes") != list(reasons)
-                or screen[1] != reasons[0]
-            ):
-                raise StrategyLabError("campaign trial has an invalid terminal chain")
-            return
-        if (
-            len(verdict_rows) != 1
-            or error_count != 0
-            or nautilus_count != 1
-            or parity_count != 1
-        ):
-            raise StrategyLabError("campaign trial has an invalid terminal chain")
         verdict = verdict_rows[0]
         record = VerdictRecord(
             experiment_id,
@@ -1579,7 +1427,7 @@ class StrategyLedger:
             str(verdict[3]),
             str(verdict[4]),
         )
-        document = self.validated_verdict_document(record)
+        document = self.validated_verdict_document(record, screen_policy_id=screen_policy_id)
         if document is None or document.get("candidate_id") != evidence.candidate_id:
             raise StrategyLabError("campaign trial has an invalid terminal chain")
 
@@ -1847,17 +1695,12 @@ class StrategyLedger:
                 ORDER BY error_id LIMIT 1""",
                 (experiment_id,),
             ).fetchone()
-            pybroker_artifact = connection.execute(
-                """SELECT outcome, reason_code, artifact_path FROM stage_results
-                WHERE experiment_id = ? AND stage = 'PyBroker completed'""",
+            candidate_stage = connection.execute(
+                """SELECT outcome, reason_code, artifact_path, artifact_sha256
+                FROM stage_results
+                WHERE experiment_id = ? AND stage = 'Candidate specified'""",
                 (experiment_id,),
             ).fetchone()
-            parity_rows = connection.execute(
-                """SELECT candidate_id, evaluation_context_id, data_snapshot_id,
-                outcome, reason_code, required_action, artifact_path, artifact_sha256
-                FROM signal_parity_results WHERE experiment_id = ?""",
-                (experiment_id,),
-            ).fetchall()
         self.require_terminal_consistency(experiment_id)
         if prepared is not None and prepared.identity != identity:
             raise StrategyLabError("cached execution prepared identity mismatch")
@@ -1866,22 +1709,15 @@ class StrategyLedger:
         self.verify_experiment_artifacts(experiment_id)
         candidate_id: str | None = None
         candidate_document: dict[str, JsonValue] | None = None
-        research_result = None
-        if pybroker_artifact is not None and pybroker_artifact[0] == "PASSED":
-            raw_path = Path(str(pybroker_artifact[2]))
-            research_result = load_research_result_v2(raw_path.read_bytes())
-            candidate_path = raw_path.with_name("candidate.json")
-            _verified_artifact(candidate_path, research_result.candidate_id)
-            candidate, candidate_id = load_pybroker_candidate(candidate_path)
+        candidate_path: Path | None = None
+        if candidate_stage is not None and candidate_stage[0] == "PASSED":
+            candidate_path = Path(str(candidate_stage[2]))
+            _verified_artifact(candidate_path, str(candidate_stage[3]))
+            try:
+                candidate, candidate_id = load_strategy_candidate(candidate_path)
+            except (OSError, ValueError) as error:
+                raise StrategyLabError("cached candidate artifact is invalid") from error
             candidate_document = candidate
-            if candidate_id != research_result.candidate_id:
-                raise StrategyLabError("cached research candidate_id mismatch")
-            signals = candidate.get("signals")
-            if (
-                not isinstance(signals, list)
-                or research_result.metrics.signal_count != len(signals)
-            ):
-                raise StrategyLabError("cached research signal_count mismatch")
             if hypothesis is not None and prepared is not None:
                 _candidate_matches_hypothesis(
                     candidate_document,
@@ -1889,40 +1725,11 @@ class StrategyLedger:
                     prepared.evaluation_context_id,
                     prepared.identity.data_snapshot_id,
                     prepared.data_as_of_ns,
-                    prepared.runtime_id,
                 )
-        if len(parity_rows) > 1:
-            raise StrategyLabError("cached execution has ambiguous signal parity evidence")
-        parity = parity_rows[0] if parity_rows else None
-        if parity is not None:
-            if candidate_document is None or candidate_id is None:
-                raise StrategyLabError("cached signal parity has no validated candidate")
-            source = candidate_document.get("source")
-            evaluation_context_id = candidate_document.get("evaluation_context_id")
-            if (
-                not isinstance(source, dict)
-                or parity[0] != candidate_id
-                or parity[1] != evaluation_context_id
-                or parity[2] != source.get("data_snapshot_id")
-            ):
-                raise StrategyLabError("cached signal parity evidence is inconsistent")
-            try:
-                parity_payload = _verified_artifact(Path(str(parity[6])), str(parity[7]))
-                loaded_parity = load_signal_parity_result(
-                    parity_payload,
-                    candidate_id=candidate_id,
-                    candidate_signal_count=len(signals),
-                    recomputed_decisions=candidate_signal_decisions(candidate_document),
-                    artifact_sha256=str(parity[7]),
-                )
-            except (CandidateBacktestError, TypeError, ValueError) as error:
-                raise StrategyLabError("cached signal parity evidence is inconsistent") from error
-            if (
-                loaded_parity.outcome != parity[3]
-                or loaded_parity.reason_code != parity[4]
-                or loaded_parity.required_action != parity[5]
-            ):
-                raise StrategyLabError("cached signal parity evidence is inconsistent")
+        if (verdict is not None or screen is not None or error is not None) and (
+            candidate_stage is None
+        ):
+            raise StrategyLabError("cached terminal execution has no candidate stage")
         if error is not None:
             error_document = _load_canonical_json(Path(str(error[2])))
             if (
@@ -1943,50 +1750,22 @@ class StrategyLedger:
                 or screen[3] != error[3]
             ):
                 raise StrategyLabError("cached research error evidence is inconsistent")
-        elif screen is not None:
-            if screen_policy is None or research_result is None:
-                raise StrategyLabError("cached screen artifact requires frozen policy and result")
-            try:
-                screen_document = load_screen_result_v1(Path(str(screen[2])).read_bytes())
-            except (OSError, StrategyCampaignError) as error:
-                raise StrategyLabError(
-                    "cached screen artifact does not match frozen policy",
-                ) from error
-            decision = screen_research_result(research_result, screen_policy)
-            expected_document = screened_result_document(
-                research_result,
-                decision,
-                screen_policy,
-            )
-            expected_outcome = (
-                "REJECTED" if decision.outcome == "SCREEN_REJECTED" else "PASSED"
-            )
-            expected_reason = (
-                decision.reason_codes[0]
-                if decision.reason_codes
-                else "SCREEN_PASSED"
-            )
+        elif screen is not None and screen[0] == "PASSED":
             if (
-                screen_document != expected_document
-                or screen[0] != expected_outcome
-                or screen[1] != expected_reason
+                screen[1] != "SCREEN_PASSED"
+                or candidate_id is None
+                or candidate_path is None
+                or screen[2] != str(candidate_path)
+                or screen[3] != candidate_id
             ):
-                raise StrategyLabError("cached screen artifact does not match frozen policy")
-        started = pybroker_artifact is not None and not (
-            pybroker_artifact[0] == "ERROR"
-            and pybroker_artifact[1] == "PYBROKER_PROCESS_LAUNCH_FAILED"
-        )
-        requires_pass_parity = (
-            verdict is not None
-            or (screen is not None and screen[0] == "PASSED")
-            or (error is not None and error[0] == "NAUTILUS")
-        )
-        if requires_pass_parity and (
-            parity is None or parity[3] != "PASS" or parity[5] is not None
-        ):
-            raise StrategyLabError("cached terminal execution has no PASS parity evidence")
-        if screen is not None and screen[0] == "REJECTED" and parity is not None:
-            raise StrategyLabError("cached rejected screen has unexpected parity evidence")
+                raise StrategyLabError("cached screen artifact does not match candidate")
+        started = candidate_stage is not None
+        if verdict is not None or (screen is not None and screen[0] == "PASSED"):
+            if candidate_stage is None or candidate_stage[0:2] != (
+                "PASSED",
+                "CANDIDATE_SPECIFIED",
+            ):
+                raise StrategyLabError("cached terminal execution has no specified candidate")
         if verdict is not None:
             if error is not None or candidate_id is None or screen is None or screen[0] != "PASSED":
                 raise StrategyLabError("cached verdict has no validated candidate")
@@ -1999,7 +1778,12 @@ class StrategyLedger:
             )
             if verdict[0] != _verdict_record_id(record):
                 raise StrategyLabError("cached Nautilus verdict identity is inconsistent")
-            self.validated_verdict_document(record, hypothesis=hypothesis, prepared=prepared)
+            self.validated_verdict_document(
+                record,
+                hypothesis=hypothesis,
+                prepared=prepared,
+                screen_policy_id=screen_policy.policy_id if screen_policy is not None else None,
+            )
             return TrialEvidence(
                 TerminalStatus.SURVIVED,
                 started,
@@ -2008,14 +1792,9 @@ class StrategyLedger:
                 candidate_id,
             )
         if screen is not None and screen[0] == "REJECTED":
-            assert research_result is not None
-            decision = screen_research_result(research_result, screen_policy)
-            return TrialEvidence(
-                TerminalStatus.SCREEN_REJECTED,
-                started,
-                decision.reason_codes,
-                experiment_id,
-                candidate_id,
+            raise StrategyLabError(
+                "provisional screen rejection is retired; "
+                "Nautilus-only trials cannot reject before evaluation"
             )
         if error is not None:
             return TrialEvidence(
@@ -2034,12 +1813,12 @@ class StrategyLedger:
             connection.execute("PRAGMA foreign_keys = ON")
             return _record_experiment_row(connection, hypothesis_id, identity)
 
-    def record_verdict(self, record: VerdictRecord) -> str:
+    def record_verdict(self, record: VerdictRecord, *, screen_policy_id: str | None = None) -> str:
         _verified_artifact(
             Path(_identifier(record.artifact_path, "artifact_path")),
             _content_id(record.artifact_sha256, "artifact_sha256"),
         )
-        self.validated_verdict_document(record)
+        self.validated_verdict_document(record, screen_policy_id=screen_policy_id)
         verdict_id = _verdict_record_id(record)
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
@@ -2069,8 +1848,9 @@ class StrategyLedger:
         *,
         hypothesis: StrategyHypothesis | None = None,
         prepared: _PreparedExecution | None = None,
+        screen_policy_id: str | None = None,
     ) -> dict[str, JsonValue] | None:
-        """Validate the complete V2 screen→parity→Nautilus terminal chain."""
+        """Validate the complete V2 candidate→Nautilus→screen terminal chain."""
         artifact_path = Path(_identifier(record.artifact_path, "artifact_path"))
         artifact_hash = _content_id(record.artifact_sha256, "artifact_sha256")
         _verified_artifact(artifact_path, artifact_hash)
@@ -2095,13 +1875,13 @@ class StrategyLedger:
             nautilus = connection.execute(
                 """SELECT outcome, reason_code, artifact_path, artifact_sha256
                 FROM stage_results
-                WHERE experiment_id = ? AND stage = 'Nautilus replayed'""",
+                WHERE experiment_id = ? AND stage = 'Nautilus evaluated'""",
                 (record.experiment_id,),
             ).fetchone()
-            pybroker = connection.execute(
+            candidate_stage = connection.execute(
                 """SELECT outcome, reason_code, artifact_path, artifact_sha256
                 FROM stage_results
-                WHERE experiment_id = ? AND stage = 'PyBroker completed'""",
+                WHERE experiment_id = ? AND stage = 'Candidate specified'""",
                 (record.experiment_id,),
             ).fetchone()
             screen = connection.execute(
@@ -2110,35 +1890,22 @@ class StrategyLedger:
                 WHERE experiment_id = ? AND stage = 'Research screened'""",
                 (record.experiment_id,),
             ).fetchone()
-            parity_rows = connection.execute(
-                """SELECT candidate_id, evaluation_context_id, data_snapshot_id,
-                outcome, reason_code, required_action, artifact_path, artifact_sha256
-                FROM signal_parity_results WHERE experiment_id = ?""",
-                (record.experiment_id,),
-            ).fetchall()
         if nautilus is None:
-            raise StrategyLabError("Nautilus replay stage is missing for verdict")
+            raise StrategyLabError("Nautilus evaluated stage is missing for verdict")
         if nautilus != (
             "PASSED",
-            "NAUTILUS_REPLAY_COMPLETED",
+            "NAUTILUS_EVALUATED",
             record.artifact_path,
             record.artifact_sha256,
         ):
-            raise StrategyLabError("Nautilus replay stage does not match verdict")
-        if pybroker is None or pybroker[0:2] != ("PASSED", "PYBROKER_COMPLETED"):
-            raise StrategyLabError("Nautilus verdict has no passed PyBroker stage")
-        if screen is None or screen[0] != "PASSED":
+            raise StrategyLabError("Nautilus evaluated stage does not match verdict")
+        if candidate_stage is None or candidate_stage[0:2] != ("PASSED", "CANDIDATE_SPECIFIED"):
+            raise StrategyLabError("Nautilus verdict has no specified candidate stage")
+        if screen is None or screen[0] != "PASSED" or screen[1] != "SCREEN_PASSED":
             raise StrategyLabError("Nautilus verdict has no passed research screen")
-        if len(parity_rows) != 1:
-            raise StrategyLabError("Nautilus verdict has ambiguous signal parity evidence")
-        parity = parity_rows[0]
-        if parity[3:6] != ("PASS", "SIGNAL_PARITY_MATCH", None):
-            raise StrategyLabError("Nautilus verdict has no PASS parity evidence")
         try:
             document = load_candidate_backtest_verdict(artifact_path.read_bytes())
-            screen_payload = _verified_artifact(Path(str(screen[2])), str(screen[3]))
-            screen_document = load_screen_result_v1(screen_payload)
-        except (OSError, CandidateBacktestError, StrategyCampaignError) as error:
+        except (OSError, CandidateBacktestError) as error:
             raise StrategyLabError("Nautilus verdict terminal artifact is invalid") from error
 
         _verified_artifact(Path(str(experiment[6])), str(experiment[7]))
@@ -2166,39 +1933,37 @@ class StrategyLedger:
         if prepared is not None and prepared.identity != identity:
             raise StrategyLabError("Nautilus verdict prepared identity mismatch")
 
-        raw_path = Path(str(pybroker[2]))
-        _verified_artifact(raw_path, str(pybroker[3]))
+        candidate_path = Path(str(candidate_stage[2]))
+        _verified_artifact(candidate_path, str(candidate_stage[3]))
         try:
-            research_result = load_research_result_v2(raw_path.read_bytes())
-        except (OSError, StrategyCampaignError) as error:
-            raise StrategyLabError("Nautilus verdict research result is invalid") from error
-        candidate_path = raw_path.with_name("candidate.json")
-        _verified_artifact(candidate_path, research_result.candidate_id)
-        candidate, candidate_id = load_pybroker_candidate(candidate_path)
-        if candidate_id != research_result.candidate_id or candidate_id != parity[0]:
-            raise StrategyLabError("Nautilus verdict candidate identity is inconsistent")
+            candidate, candidate_id = load_strategy_candidate(candidate_path)
+        except (OSError, ValueError) as error:
+            raise StrategyLabError("Nautilus verdict candidate artifact is invalid") from error
         candidate_source = candidate.get("source")
-        candidate_runtime = candidate.get("runtime")
-        if not isinstance(candidate_source, dict) or not isinstance(candidate_runtime, dict):
+        if not isinstance(candidate_source, dict):
             raise StrategyLabError("Nautilus verdict candidate evidence is invalid")
         if (
-            candidate.get("evaluation_context_id") != parity[1]
-            or candidate_source.get("data_snapshot_id") != parity[2]
-            or screen_document.get("candidate_id") != candidate_id
-            or screen_document.get("screen_outcome") != "PASSED"
+            screen[2] != str(candidate_path)
+            or screen[3] != candidate_id
+            or candidate_stage[3] != candidate_id
         ):
             raise StrategyLabError("Nautilus verdict candidate context is inconsistent")
         evaluation_context_id = candidate.get("evaluation_context_id")
-        screen_policy_id = screen_document.get("screen_policy_id")
         code_commit = document.get("code_commit")
         if (
             not isinstance(evaluation_context_id, str)
             or experiment[9] is None
             or experiment[10] is None
-            or not isinstance(screen_policy_id, str)
             or not isinstance(code_commit, str)
         ):
             raise StrategyLabError("Nautilus verdict candidate identity is incomplete")
+        effective_policy_id = screen_policy_id
+        if (
+            effective_policy_id is None
+            and prepared is not None
+            and prepared.screen_policy is not None
+        ):
+            effective_policy_id = prepared.screen_policy.policy_id
         _candidate_matches_persisted_identity(
             candidate,
             stored_hypothesis,
@@ -2207,34 +1972,12 @@ class StrategyLedger:
             evaluation_context_id=evaluation_context_id,
             data_snapshot_id=str(experiment[9]),
             data_as_of_ns=int(experiment[10]),
-            screen_policy_id=screen_policy_id,
+            screen_policy_id=effective_policy_id,
             code_commit=code_commit,
         )
-        try:
-            candidate_signals = candidate.get("signals")
-            if not isinstance(candidate_signals, list):
-                raise CandidateBacktestError("candidate signals are invalid")
-            parity_payload = _verified_artifact(Path(str(parity[6])), str(parity[7]))
-            loaded_parity = load_signal_parity_result(
-                parity_payload,
-                candidate_id=candidate_id,
-                candidate_signal_count=len(candidate_signals),
-                recomputed_decisions=candidate_signal_decisions(candidate),
-                artifact_sha256=str(parity[7]),
-            )
-        except (CandidateBacktestError, TypeError, ValueError) as error:
-            raise StrategyLabError("Nautilus verdict signal parity artifact is invalid") from error
-        if (
-            loaded_parity.outcome != parity[3]
-            or loaded_parity.reason_code != parity[4]
-            or loaded_parity.required_action != parity[5]
-        ):
-            raise StrategyLabError("Nautilus verdict signal parity evidence is inconsistent")
-
         reason_codes = document["reason_codes"]
         source = document["source"]
         versions = document["runtime_versions"]
-        signal_parity = document.get("signal_parity")
         expected_outcome = (
             "SUCCESS" if document["decision"] == "RETAIN_FOR_RESEARCH" else "REJECTION"
         )
@@ -2255,14 +1998,10 @@ class StrategyLedger:
                 "sha256": candidate_source.get("sha256"),
             }
             or not isinstance(versions, dict)
-            or versions.get("pybroker") != candidate_runtime.get("pybroker_version")
-            or versions.get("research_python") != candidate_runtime.get("python_version")
-            or versions.get("nautilus_python") != platform.python_version()
-            or signal_parity
+            or versions
             != {
-                "artifact_sha256": parity[7],
-                "outcome": parity[3],
-                "reason_code": parity[4],
+                "nautilus_trader": nautilus_trader.__version__,
+                "nautilus_python": platform.python_version(),
             }
         ):
             raise StrategyLabError("Nautilus verdict artifact identity is inconsistent")
@@ -2461,8 +2200,7 @@ class StrategyLedger:
                 experiments.data_source_id, experiments.policy_id,
                 experiments.engine_id, experiments.runtime_id,
                 experiment_sources.data_snapshot_id, experiment_sources.data_as_of_ns,
-                pybroker.artifact_path, parity.evaluation_context_id,
-                parity.data_snapshot_id, parity.outcome, parity.required_action,
+                candidate_stage.artifact_path, candidate_stage.artifact_sha256,
                 verdicts.verdict_id, verdicts.outcome, verdicts.reason_code, verdicts.artifact_path,
                 verdicts.artifact_sha256, hypotheses.artifact_path,
                 hypotheses.artifact_sha256, campaigns.data_source_id,
@@ -2472,13 +2210,10 @@ class StrategyLedger:
                 JOIN experiments USING (experiment_id, strategy_id)
                 JOIN experiment_sources USING (experiment_id)
                 JOIN hypotheses USING (hypothesis_id, strategy_id)
-                JOIN stage_results AS pybroker ON
-                    pybroker.experiment_id = experiments.experiment_id
-                    AND pybroker.stage = 'PyBroker completed'
-                    AND pybroker.outcome = 'PASSED'
-                JOIN signal_parity_results AS parity ON
-                    parity.experiment_id = experiments.experiment_id
-                    AND parity.candidate_id = campaign_trials.candidate_id
+                JOIN stage_results AS candidate_stage ON
+                    candidate_stage.experiment_id = experiments.experiment_id
+                    AND candidate_stage.stage = 'Candidate specified'
+                    AND candidate_stage.outcome = 'PASSED'
                 JOIN verdicts ON verdicts.experiment_id = experiments.experiment_id
                     AND verdicts.strategy_id = experiments.strategy_id
                 WHERE campaign_trials.campaign_id = ?
@@ -2503,11 +2238,8 @@ class StrategyLedger:
             runtime_id,
             data_snapshot_id,
             data_as_of_ns,
-            pybroker_path,
-            evaluation_context_id,
-            parity_snapshot_id,
-            parity_outcome,
-            parity_action,
+            candidate_artifact_path,
+            candidate_artifact_sha256,
             historical_verdict_id,
             historical_outcome,
             historical_reason,
@@ -2528,34 +2260,34 @@ class StrategyLedger:
             (historical_policy_id, "policy_id"),
             (runtime_id, "runtime_id"),
             (data_snapshot_id, "data_snapshot_id"),
-            (evaluation_context_id, "evaluation_context_id"),
+            (candidate_artifact_sha256, "artifact_sha256"),
         ):
             _content_id(str(value), field)
         if (
-            parity_snapshot_id != data_snapshot_id
-            or parity_outcome != "PASS"
-            or parity_action is not None
-            or historical_outcome != "SUCCESS"
+            historical_outcome != "SUCCESS"
             or campaign_source_id != data_source_id
             or campaign_as_of_ns != data_as_of_ns
         ):
             raise StrategyLabError("persisted robustness survivor chain is incomplete")
-        candidate_path = Path(str(pybroker_path)).with_name("candidate.json")
+        candidate_path = Path(str(candidate_artifact_path))
         _verified_artifact(Path(str(hypothesis_path)), str(hypothesis_sha256))
         _verified_artifact(candidate_path, str(stored_candidate_id))
+        if str(candidate_artifact_sha256) != str(stored_candidate_id):
+            raise StrategyLabError("persisted robustness survivor candidate stage is inconsistent")
         try:
-            candidate, loaded_candidate_id = load_pybroker_candidate(candidate_path)
+            candidate, loaded_candidate_id = load_strategy_candidate(candidate_path)
             historical_document = load_candidate_backtest_verdict(
                 _verified_artifact(Path(str(historical_path)), str(historical_sha256)),
             )
         except (CandidateBacktestError, OSError, TypeError, ValueError) as error:
             raise StrategyLabError("persisted robustness survivor artifact is invalid") from error
+        evaluation_context_id = candidate.get("evaluation_context_id")
         source = candidate.get("source")
         historical_source = historical_document.get("source")
         code_commit = historical_document.get("code_commit")
         if (
             loaded_candidate_id != stored_candidate_id
-            or candidate.get("evaluation_context_id") != evaluation_context_id
+            or not isinstance(evaluation_context_id, str)
             or not isinstance(source, dict)
             or source.get("data_snapshot_id") != data_snapshot_id
             or source.get("data_as_of_ns") != data_as_of_ns
@@ -3110,65 +2842,6 @@ class StrategyLedger:
             raise StrategyLabError("stage record conflict")
         _verified_artifact(Path(stored[2]), stored[3])
 
-    def record_signal_parity(self, record: SignalParityRecord) -> str:
-        artifact_path = Path(_identifier(record.artifact_path, "artifact_path"))
-        artifact_hash = _content_id(record.artifact_sha256, "artifact_sha256")
-        payload = _verified_artifact(
-            artifact_path,
-            artifact_hash,
-        )
-        try:
-            loaded = load_signal_parity_result(
-                payload,
-                candidate_id=record.candidate_id,
-                candidate_signal_count=len(record.decisions),
-                recomputed_decisions=record.decisions,
-                artifact_sha256=artifact_hash,
-            )
-        except CandidateBacktestError as error:
-            raise StrategyLabError("signal parity artifact does not match record") from error
-        if (
-            loaded.outcome != record.outcome
-            or loaded.reason_code != record.reason_code
-            or loaded.required_action != record.required_action
-        ):
-            raise StrategyLabError("signal parity artifact does not match record")
-        parity_result_id = _signal_parity_record_id(record)
-        expected = (
-            record.experiment_id,
-            record.candidate_id,
-            record.evaluation_context_id,
-            record.data_snapshot_id,
-            record.outcome,
-            record.reason_code,
-            record.required_action,
-            record.artifact_path,
-            record.artifact_sha256,
-        )
-        with closing(sqlite3.connect(self.path)) as connection, connection:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(
-                """INSERT INTO signal_parity_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT DO NOTHING""",
-                (parity_result_id, *expected),
-            )
-            stored = connection.execute(
-                """SELECT experiment_id, candidate_id, evaluation_context_id,
-                data_snapshot_id, outcome, reason_code, required_action,
-                artifact_path, artifact_sha256
-                FROM signal_parity_results WHERE parity_result_id = ?""",
-                (parity_result_id,),
-            ).fetchone()
-            duplicate = connection.execute(
-                """SELECT parity_result_id FROM signal_parity_results
-                WHERE experiment_id = ? AND candidate_id = ?""",
-                (record.experiment_id, record.candidate_id),
-            ).fetchone()
-        if stored != expected or duplicate != (parity_result_id,):
-            raise StrategyLabError("parity record conflict")
-        _verified_artifact(Path(stored[7]), stored[8])
-        return parity_result_id
-
     def require_terminal_consistency(self, experiment_id: str | None = None) -> None:
         """Fail closed on contradictory or duplicated legacy terminal evidence."""
         parameters: tuple[str, ...] = ()
@@ -3202,9 +2875,6 @@ class StrategyLedger:
                 """SELECT artifact_path, artifact_sha256 FROM stage_results
                 WHERE experiment_id = ?
                 UNION ALL
-                SELECT artifact_path, artifact_sha256 FROM signal_parity_results
-                WHERE experiment_id = ?
-                UNION ALL
                 SELECT artifact_path, artifact_sha256 FROM verdicts
                 WHERE experiment_id = ?
                 UNION ALL
@@ -3226,11 +2896,112 @@ class StrategyLedger:
                     experiment_id,
                     experiment_id,
                     experiment_id,
-                    experiment_id,
                 ),
             ).fetchall()
         for artifact_path, artifact_hash in rows:
             _verified_artifact(Path(artifact_path), artifact_hash)
+
+    def paper_admission(
+        self,
+        robustness_verdict_id: str,
+        *,
+        code_commit: str,
+        runtime_id: str,
+        instrument_metadata_id: str,
+    ) -> dict[str, object]:
+        """Derive a Paper freeze admission only from an immutable ADVANCE chain."""
+        robustness_verdict_id = _content_id(
+            robustness_verdict_id,
+            "robustness_verdict_id",
+        )
+        if not isinstance(code_commit, str) or re.fullmatch(r"[0-9a-f]{40}", code_commit) is None:
+            raise StrategyLabError("Paper admission code_commit must be a full Git commit")
+        runtime_id = _content_id(runtime_id, "runtime_id")
+        instrument_metadata_id = _content_id(
+            instrument_metadata_id,
+            "instrument_metadata_id",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            rows = connection.execute(
+                """SELECT verdict_path, verdict_sha256, action_path, action_sha256
+                FROM robustness_results""",
+            ).fetchall()
+        matches: list[tuple[dict[str, object], dict[str, object]]] = []
+        # ponytail: bounded linear scan; add a verdict-id column only if cohort volume warrants migration.
+        for verdict_path, verdict_hash, action_path, action_hash in rows:
+            verdict = load_robustness_verdict_v2(
+                _verified_artifact(Path(verdict_path), str(verdict_hash)),
+            )
+            if verdict.get("robustness_verdict_id") != robustness_verdict_id:
+                continue
+            action = load_action_v1(
+                _verified_artifact(Path(action_path), str(action_hash)),
+            )
+            matches.append((verdict, action))
+        if len(matches) != 1:
+            raise StrategyLabError("Paper admission requires one persisted robustness verdict")
+        verdict, action = matches[0]
+        if (
+            verdict.get("technical_status") != "PASS"
+            or verdict.get("economic_status") != "PASS"
+            or action.get("action") != "ADVANCE"
+            or action.get("robustness_verdict_id") != robustness_verdict_id
+        ):
+            raise StrategyLabError("Paper admission requires a persisted robustness ADVANCE")
+        campaign_id = _content_id(action.get("campaign_id"), "campaign_id")
+        candidate_id = _content_id(verdict.get("candidate_id"), "candidate_id")
+        survivor = self.robustness_survivor_context(campaign_id, candidate_id)
+        expected = {
+            "candidate_id": survivor.candidate_id,
+            "code_commit": survivor.code_commit,
+            "data_as_of_ns": survivor.base_identity.data_as_of_ns,
+            "data_snapshot_id": survivor.base_identity.data_snapshot_id,
+            "hypothesis_id": survivor.hypothesis_id,
+            "strategy_id": survivor.strategy_id,
+        }
+        if any(verdict.get(field) != value for field, value in expected.items()):
+            raise StrategyLabError("Paper admission robustness identity mismatch")
+        hypothesis = load_strategy_hypothesis(survivor.hypothesis_path)
+        candidate, loaded_candidate_id = load_strategy_candidate(survivor.candidate_path)
+        strategy = candidate.get("strategy")
+        if loaded_candidate_id != candidate_id or not isinstance(strategy, dict):
+            raise StrategyLabError("Paper admission candidate identity mismatch")
+        if (
+            hypothesis.hypothesis_id != survivor.hypothesis_id
+            or hypothesis.strategy_id != survivor.strategy_id
+            or candidate.get("instrument_id") != _INSTRUMENT_ID
+            or candidate.get("bar_type") != _BAR_TYPE
+            or strategy.get("family_id") != hypothesis.family_id
+            or strategy.get("family_version") != hypothesis.family_version
+            or strategy.get("parameters") != hypothesis.parameters.values
+        ):
+            raise StrategyLabError("Paper admission strategy identity mismatch")
+        kernel_hash = _content_id(strategy.get("kernel_hash"), "kernel_hash")
+        kernel_version = _identifier(strategy.get("kernel_version"), "kernel_version")
+        data_as_of_ns = survivor.base_identity.data_as_of_ns
+        data_snapshot_id = survivor.base_identity.data_snapshot_id
+        if data_as_of_ns is None or data_snapshot_id is None:
+            raise StrategyLabError("Paper admission source identity is incomplete")
+        return {
+            "bar_type": _BAR_TYPE,
+            "candidate_id": candidate_id,
+            "code_commit": code_commit,
+            "data_as_of_ns": data_as_of_ns,
+            "data_snapshot_id": data_snapshot_id,
+            "family_id": hypothesis.family_id,
+            "family_version": hypothesis.family_version,
+            "historical_verdict_id": survivor.historical_verdict_id,
+            "hypothesis_id": survivor.hypothesis_id,
+            "instrument_id": _INSTRUMENT_ID,
+            "instrument_metadata_id": instrument_metadata_id,
+            "kernel_hash": kernel_hash,
+            "kernel_version": kernel_version,
+            "parameters": dict(hypothesis.parameters.values),
+            "robustness_action": "ADVANCE",
+            "robustness_verdict_id": robustness_verdict_id,
+            "runtime_id": runtime_id,
+            "strategy_id": survivor.strategy_id,
+        }
 
     def robustness_funnel(self) -> dict[str, int]:
         """Return robustness funnel counts derived solely from immutable ledger rows."""
@@ -3285,8 +3056,8 @@ class _ControllerRun:
 
 @dataclass(frozen=True, slots=True)
 class _TechnicalFailure:
-    stage_label: Literal["PyBroker completed", "Research screened", "Nautilus replayed"]
-    failed_stage: Literal["PYBROKER", "RESEARCH", "NAUTILUS"]
+    stage_label: Literal["Candidate specified", "Research screened", "Nautilus evaluated"]
+    failed_stage: Literal["CANDIDATE", "RESEARCH", "NAUTILUS"]
     status: Literal["ERROR", "BLOCKED"]
     reason_code: str
     artifact_name: str
@@ -3347,21 +3118,18 @@ def _policy_identity(path: Path) -> tuple[str, str]:
 
 
 def _runtime_identity() -> str:
-    try:
-        return research_runtime_identity(_REPO_ROOT)
-    except (OSError, ValueError) as error:
-        raise StrategyLabError(str(error)) from error
+    """Attest the Nautilus-only root runtime (Nautilus/Python/kernel)."""
+    return root_runtime_identity()
 
 
 def _engine_identity() -> str:
     root_python = platform.python_version()
     digest = sha256(f"{nautilus_trader.__version__}\0{root_python}".encode())
     for path in (
-        _REPO_ROOT / "research/pybroker_research.py",
         _REPO_ROOT / "src/nautilus_quant/candidate_backtest.py",
         _REPO_ROOT / "src/nautilus_quant/funding_observation.py",
-        _REPO_ROOT / "src/nautilus_quant/pybroker_candidate.py",
         _REPO_ROOT / "src/nautilus_quant/runtime_attestation.py",
+        _REPO_ROOT / "src/nautilus_quant/strategy_candidate.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_campaign.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_families.py",
         _REPO_ROOT / "src/nautilus_quant/strategy_robustness.py",
@@ -3496,6 +3264,80 @@ def _require_execution_snapshot(
 ) -> None:
     if _prepare_execution(hypothesis, paths) != prepared:
         raise StrategyLabError("execution data or runtime snapshot changed")
+
+
+def _build_strategy_candidate(
+    hypothesis: StrategyHypothesis,
+    paths: StrategyLoopPaths,
+    prepared: _PreparedExecution,
+    candidate_path: Path,
+) -> tuple[dict[str, JsonValue], str]:
+    """Derive one Nautilus-native strategy candidate directly from hypothesis and catalog.
+
+    No second engine runs: the candidate is a plain specification (family,
+    parameters, source window, evaluation context). The Nautilus historical
+    evaluator derives decisions from it with the shared family kernel.
+    """
+    catalog = ParquetDataCatalog(str(paths.catalog_path))
+    bars = catalog.query_bars([_BAR_TYPE])
+    timestamps = [bar.ts_event for bar in bars]
+    if not timestamps or timestamps != sorted(set(timestamps)):
+        raise StrategyLabError("candidate bar cohort is empty or not strictly ordered")
+    data_snapshot_id = _catalog_digest(paths.catalog_path, _BAR_TYPE)
+    data_as_of_ns = int(timestamps[-1])
+    if hypothesis.identity_schema == "strategy-id-v2":
+        if (
+            prepared.identity.data_snapshot_id != data_snapshot_id
+            or prepared.data_as_of_ns != data_as_of_ns
+        ):
+            raise StrategyLabError("candidate source snapshot changed during execution")
+    evaluation_context_id = prepared.evaluation_context_id
+    if evaluation_context_id is None:
+        evaluation_context_id = _evaluation_context_id(
+            hypothesis,
+            data_source_id=prepared.identity.data_source_id,
+            data_snapshot_id=data_snapshot_id,
+            data_as_of_ns=data_as_of_ns,
+            policy_id=prepared.identity.policy_id,
+            engine_id=prepared.base_engine_id,
+            runtime_id=prepared.runtime_id,
+            code_commit=prepared.code_commit,
+            screen_policy_id=(
+                prepared.screen_policy.policy_id if prepared.screen_policy is not None else None
+            ),
+        )
+    document: dict[str, JsonValue] = {
+        "bar_type": _BAR_TYPE,
+        "evaluation_context_id": evaluation_context_id,
+        "instrument_id": _INSTRUMENT_ID,
+        "runtime": {
+            "nautilus_trader": nautilus_trader.__version__,
+            "python_version": platform.python_version(),
+        },
+        "schema_version": "strategy-candidate-v1",
+        "source": {
+            "data_as_of_ns": data_as_of_ns,
+            "data_snapshot_id": data_snapshot_id,
+            "first_ts_event_ns": int(timestamps[0]),
+            "last_ts_event_ns": data_as_of_ns,
+            "row_count": len(bars),
+            "sha256": data_snapshot_id,
+        },
+        "strategy": {
+            "decision_timing": "bar-close; effective no earlier than next event",
+            "family_id": hypothesis.family_id,
+            "family_version": hypothesis.family_version,
+            "kernel_hash": KERNEL_HASH,
+            "kernel_version": KERNEL_VERSION,
+            "parameters": dict(hypothesis.parameters.values),
+        },
+        "truth_status": "provisional",
+    }
+    payload = canonical_candidate_bytes(document)
+    candidate_id = sha256(payload).hexdigest()
+    if _atomic_publish(candidate_path, payload) != candidate_id:
+        raise StrategyLabError("candidate artifact hash mismatch")
+    return document, candidate_id
 
 
 def _code_commit() -> str:
@@ -3713,182 +3555,12 @@ def _finish_failure(
     return feedback
 
 
-def _drain_bounded(stream: IO[bytes]) -> tuple[bytes, bool]:
-    captured = bytearray()
-    truncated = False
-    while chunk := stream.read(8_192):
-        remaining = PROCESS_OUTPUT_LIMIT - len(captured)
-        if remaining > 0:
-            captured.extend(chunk[:remaining])
-        truncated = truncated or len(chunk) > remaining
-    return bytes(captured), truncated
-
-
-_PROCESS_CLEANUP_TIMEOUT_SECONDS: Final = 1.0
-
-
-def _sanitized_process_environment() -> dict[str, str]:
-    """Return the only environment a research child is allowed to inherit."""
-    return {
-        "LANG": "C",
-        "LC_ALL": "C",
-        "PATH": os.defpath,
-        "PYTHONHASHSEED": "0",
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONUNBUFFERED": "1",
-    }
-
-
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Terminate, kill, and boundedly reap one process group."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError, TypeError):
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except (OSError, ProcessLookupError):
-                pass
-    try:
-        process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS / 2)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError, TypeError):
-        try:
-            process.kill()
-        except (OSError, ProcessLookupError):
-            pass
-    try:
-        process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS / 2)
-    except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS / 2)
-        except subprocess.TimeoutExpired:
-            pass
-
-
-def _run_bounded_process(
-    argv: Sequence[str],
-    *,
-    cwd: Path,
-    timeout: int,
-) -> _ProcessResult:
-    process = subprocess.Popen(
-        argv,
-        cwd=cwd,
-        env=_sanitized_process_environment(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    executor: ThreadPoolExecutor | None = None
-    stdout_future = None
-    stderr_future = None
-    stdout: bytes = b""
-    stderr: bytes = b""
-    stdout_truncated = False
-    stderr_truncated = False
-    timed_out = False
-    drained = False
-    try:
-        if process.stdout is None or process.stderr is None:
-            raise StrategyLabError("PyBroker process pipes were not created")
-        executor = ThreadPoolExecutor(max_workers=2)
-        stdout_future = executor.submit(_drain_bounded, process.stdout)
-        stderr_future = executor.submit(_drain_bounded, process.stderr)
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process_group(process)
-        try:
-            stdout, stdout_truncated = stdout_future.result(
-                timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS,
-            )
-            stderr, stderr_truncated = stderr_future.result(
-                timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS,
-            )
-        except FuturesTimeoutError:
-            _terminate_process_group(process)
-            stdout, stdout_truncated = stdout_future.result(
-                timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS,
-            )
-            stderr, stderr_truncated = stderr_future.result(
-                timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS,
-            )
-        drained = True
-        return _ProcessResult(
-            process.returncode if process.returncode is not None else -1,
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-            timed_out,
-        )
-    except BaseException:
-        if process is not None:
-            _terminate_process_group(process)
-        raise
-    finally:
-        if process is not None and not drained:
-            _terminate_process_group(process)
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except BaseException:
-                    pass
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-
-
-def _research_result(payload: bytes) -> dict[str, JsonValue]:
-    try:
-        value: JsonValue = json.loads(
-            payload,
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise StrategyLabError("PyBroker stdout must be one JSON result") from error
-    root = _mapping(
-        value,
-        frozenset({"candidate_id", "provisional_metrics"})
-        if not isinstance(value, dict) or value.get("schema_version") != "research-result-v2"
-        else frozenset({"candidate_id", "provisional_metrics", "schema_version", "truth_status"}),
-        "research result",
-    )
-    if root.get("schema_version") == "research-result-v2":
-        load_research_result_v2(payload)
-        return root
-    _content_id(_nonempty_text(root["candidate_id"], "candidate_id"), "candidate_id")
-    metrics = _mapping(
-        root["provisional_metrics"],
-        frozenset({"orders", "signals"}),
-        "provisional_metrics",
-    )
-    for field in ("orders", "signals"):
-        metric = metrics[field]
-        if isinstance(metric, bool) or not isinstance(metric, int) or metric < 0:
-            raise StrategyLabError(f"provisional_metrics.{field} must be non-negative")
-    return root
-
-
 def _candidate_matches_hypothesis(
     candidate: dict[str, JsonValue],
     hypothesis: StrategyHypothesis,
     evaluation_context_id: str | None,
     data_snapshot_id: str | None,
     data_as_of_ns: int | None,
-    runtime_id: str,
 ) -> None:
     strategy = candidate.get("strategy")
     if not isinstance(strategy, dict):
@@ -3896,6 +3568,13 @@ def _candidate_matches_hypothesis(
     parameters = strategy.get("parameters")
     if not isinstance(parameters, dict):
         raise StrategyLabError("validated candidate parameters are invalid")
+    runtime = candidate.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("nautilus_trader") != nautilus_trader.__version__
+        or runtime.get("python_version") != platform.python_version()
+    ):
+        raise StrategyLabError("candidate runtime does not match root runtime")
     common_mismatch = (
         candidate.get("instrument_id") != _INSTRUMENT_ID
         or candidate.get("bar_type") != _BAR_TYPE
@@ -3903,21 +3582,18 @@ def _candidate_matches_hypothesis(
     )
     if hypothesis.identity_schema == "strategy-id-v1":
         mismatch = (
-            candidate.get("schema_version") != "pybroker-candidate-v1"
-            or strategy.get("name") != hypothesis.family_id
+            candidate.get("schema_version") != "strategy-candidate-v1"
+            or strategy.get("family_id") != hypothesis.family_id
             or common_mismatch
         )
     else:
         source = candidate.get("source")
-        runtime = candidate.get("runtime")
         mismatch = (
-            candidate.get("schema_version") != "pybroker-candidate-v2"
+            candidate.get("schema_version") != "strategy-candidate-v1"
             or candidate.get("evaluation_context_id") != evaluation_context_id
             or not isinstance(source, dict)
             or source.get("data_snapshot_id") != data_snapshot_id
             or source.get("data_as_of_ns") != data_as_of_ns
-            or not isinstance(runtime, dict)
-            or runtime.get("environment_id") != runtime_id
             or strategy.get("family_id") != hypothesis.family_id
             or strategy.get("family_version") != hypothesis.family_version
             or strategy.get("kernel_version") != KERNEL_VERSION
@@ -3937,10 +3613,10 @@ def _candidate_matches_persisted_identity(
     evaluation_context_id: str,
     data_snapshot_id: str,
     data_as_of_ns: int,
-    screen_policy_id: str,
+    screen_policy_id: str | None,
     code_commit: str | None,
 ) -> None:
-    """Bind one provisional candidate to persisted execution identity."""
+    """Bind one strategy candidate to persisted execution identity."""
     source = candidate.get("source")
     runtime = candidate.get("runtime")
     base_engine_id, separator, embedded_context_id = identity.engine_id.rpartition(
@@ -3953,7 +3629,6 @@ def _candidate_matches_persisted_identity(
             evaluation_context_id,
             data_snapshot_id,
             data_as_of_ns,
-            identity.runtime_id,
         )
         if (
             _experiment_id(identity) != experiment_id
@@ -3961,7 +3636,6 @@ def _candidate_matches_persisted_identity(
             or not isinstance(runtime, dict)
             or identity.data_snapshot_id != data_snapshot_id
             or source.get("data_snapshot_id") != data_snapshot_id
-            or runtime.get("environment_id") != identity.runtime_id
             or separator != "-evaluation-"
             or not base_engine_id
             or embedded_context_id != evaluation_context_id
@@ -4267,7 +3941,7 @@ def _campaign_execute(
                 candidate_path = paths.state_path / "runs" / experiment_id / "candidate.json"
                 if candidate_path.is_file():
                     try:
-                        _candidate, candidate_id = load_pybroker_candidate(candidate_path)
+                        _candidate, candidate_id = load_strategy_candidate(candidate_path)
                     except (OSError, ValueError):
                         candidate_id = None
         raise CampaignTechnicalError(
@@ -4287,9 +3961,13 @@ def run_strategy_campaign(
     expand_campaign(spec)
     resolved_paths = paths or DEFAULT_LOOP_PATHS
     resolved_paths.state_path.mkdir(parents=True, exist_ok=True)
-    # ponytail: one campaign-level flock serializes immutable census formation;
-    # run_strategy_loop also claims each experiment against standalone callers.
-    with (resolved_paths.state_path / "campaign.lock").open("a+b") as campaign_lock:
+    # Freeze canonical data for the whole cohort while the campaign census is formed.
+    # Inner strategy runs acquire their own shared fd; releasing them does not release
+    # this outer shared lock, while the existing sync writer remains EX|NB (BUSY).
+    with (
+        _hold_data_snapshot_shared(),
+        (resolved_paths.state_path / "campaign.lock").open("a+b") as campaign_lock,
+    ):
         fcntl.flock(campaign_lock, fcntl.LOCK_EX)
         ledger = StrategyLedger(resolved_paths.state_path / "ledger.sqlite3")
         ledger.initialize()
@@ -4403,28 +4081,29 @@ def run_strategy_loop(
     _claim: _ExecutionClaim | None = None,
     _require_prepared: Callable[[_PreparedExecution], None] | None = None,
 ) -> dict[str, JsonValue]:
-    """Run or deterministically reuse one claimed PyBroker-to-Nautilus experiment."""
-    source_hypothesis = load_strategy_hypothesis(Path(hypothesis_path))
-    initial = _prepare_execution(source_hypothesis, paths)
-    experiment_id = _experiment_id(initial.identity)
-    lock_directory = paths.state_path / "experiment-locks"
-    lock_directory.mkdir(parents=True, exist_ok=True)
-    with (lock_directory / f"{experiment_id}.lock").open("a+b") as experiment_lock:
-        fcntl.flock(experiment_lock, fcntl.LOCK_EX)
-        prepared = _prepare_execution(source_hypothesis, paths)
-        if prepared != initial:
-            raise StrategyLabError("execution identity changed before claim")
-        if _claim is not None:
-            _claim.prepared = prepared
-        if _require_prepared is not None:
-            _require_prepared(prepared)
-        return _run_strategy_loop_locked(
-            Path(hypothesis_path),
-            paths,
-            source_hypothesis,
-            prepared,
-            _claim,
-        )
+    """Run or deterministically reuse one claimed Nautilus historical experiment."""
+    with _hold_data_snapshot_shared():
+        source_hypothesis = load_strategy_hypothesis(Path(hypothesis_path))
+        initial = _prepare_execution(source_hypothesis, paths)
+        experiment_id = _experiment_id(initial.identity)
+        lock_directory = paths.state_path / "experiment-locks"
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        with (lock_directory / f"{experiment_id}.lock").open("a+b") as experiment_lock:
+            fcntl.flock(experiment_lock, fcntl.LOCK_EX)
+            prepared = _prepare_execution(source_hypothesis, paths)
+            if prepared != initial:
+                raise StrategyLabError("execution identity changed before claim")
+            if _claim is not None:
+                _claim.prepared = prepared
+            if _require_prepared is not None:
+                _require_prepared(prepared)
+            return _run_strategy_loop_locked(
+                Path(hypothesis_path),
+                paths,
+                source_hypothesis,
+                prepared,
+                _claim,
+            )
 
 
 def _run_strategy_loop_locked(
@@ -4439,7 +4118,6 @@ def _run_strategy_loop_locked(
     experiment_id = _experiment_id(identity)
     evaluation_context_id = prepared.evaluation_context_id
     screen_policy = prepared.screen_policy
-    runtime_id = prepared.runtime_id
     code_commit = prepared.code_commit
     ledger = StrategyLedger(paths.state_path / "ledger.sqlite3")
     ledger.initialize()
@@ -4467,139 +4145,49 @@ def _run_strategy_loop_locked(
         raise _ExistingNonterminalExperiment("existing experiment is non-terminal")
 
     candidate_path = directory / "candidate.json"
-    argv = [
-        *_PYBROKER_COMMAND,
-        "--hypothesis",
-        str(hypothesis_artifact),
-        "--catalog",
-        str(paths.catalog_path),
-        "--output",
-        str(candidate_path),
-    ]
-    if evaluation_context_id is not None:
-        argv.extend(
-            [
-                "--evaluation-context-id",
-                evaluation_context_id,
-                "--environment-id",
-                runtime_id,
-            ],
-        )
     if claim is not None:
         claim.launched = True
     try:
-        completed = _run_bounded_process(
-            argv,
-            cwd=_REPO_ROOT,
-            timeout=PYBROKER_TIMEOUT_SECONDS,
+        candidate_document, candidate_id = _build_strategy_candidate(
+            hypothesis,
+            paths,
+            prepared,
+            candidate_path,
         )
-    except OSError as error:
+    except (OSError, RuntimeError, ValueError) as error:
         return _finish_failure(
             run,
             _TechnicalFailure(
-                "PyBroker completed",
-                "PYBROKER",
+                "Candidate specified",
+                "CANDIDATE",
                 "ERROR",
-                "PYBROKER_PROCESS_LAUNCH_FAILED",
-                "pybroker-error.json",
-                {
-                    "argv": argv,
-                    "detail": str(error),
-                    "exit_code": None,
-                    "stderr": "",
-                    "stderr_truncated": False,
-                    "stdout": "",
-                    "stdout_truncated": False,
-                },
+                "CANDIDATE_SPECIFICATION_FAILED",
+                "candidate-error.json",
+                {"detail": str(error)},
             ),
         )
-
-    stdout = completed.stdout.decode("utf-8", errors="replace")
-    stderr = completed.stderr.decode("utf-8", errors="replace")
-    process_evidence: dict[str, JsonValue] = {
-        "argv": argv,
-        "exit_code": completed.returncode,
-        "stderr": stderr,
-        "stderr_truncated": completed.stderr_truncated,
-        "stdout": stdout,
-        "stdout_truncated": completed.stdout_truncated,
-    }
-    if completed.timed_out:
-        return _finish_failure(
-            run,
-            _TechnicalFailure(
-                "PyBroker completed",
-                "PYBROKER",
-                "ERROR",
-                "PYBROKER_PROCESS_TIMEOUT",
-                "pybroker-error.json",
-                process_evidence,
-            ),
-        )
-    if completed.returncode != 0:
-        return _finish_failure(
-            run,
-            _TechnicalFailure(
-                "PyBroker completed",
-                "PYBROKER",
-                "ERROR",
-                "PYBROKER_PROCESS_FAILED",
-                "pybroker-error.json",
-                process_evidence,
-            ),
-        )
-    try:
-        research_result = _research_result(completed.stdout)
-    except (StrategyCampaignError, StrategyLabError) as error:
-        return _finish_failure(
-            run,
-            _TechnicalFailure(
-                "PyBroker completed",
-                "PYBROKER",
-                "ERROR",
-                "PYBROKER_RESULT_INVALID",
-                "pybroker-error.json",
-                {**process_evidence, "detail": str(error)},
-            ),
-        )
-    is_v2 = hypothesis.identity_schema == "strategy-id-v2"
-    raw_research_path = directory / (
-        "research-result-v2-raw.json" if is_v2 else "research-result.json"
-    )
-    research_path = directory / (
-        "research-screen-result-v1.json" if is_v2 else "research-result.json"
-    )
-    research_hash = _publish_json(raw_research_path, research_result)
     ledger.record_stage(
         StageRecord(
             experiment_id,
-            "PyBroker completed",
+            "Candidate specified",
             "PASSED",
-            "PYBROKER_COMPLETED",
-            str(raw_research_path),
-            research_hash,
+            "CANDIDATE_SPECIFIED",
+            str(candidate_path),
+            candidate_id,
         ),
     )
-
     try:
-        _candidate, candidate_id = load_pybroker_candidate(candidate_path)
-        if research_result["candidate_id"] != candidate_id:
-            raise StrategyLabError("research result candidate_id mismatch")
-        candidate_document = _load_canonical_json(candidate_path)
-        if not isinstance(candidate_document, dict):
-            raise StrategyLabError("validated candidate must be an object")
         _candidate_matches_hypothesis(
             candidate_document,
             hypothesis,
             evaluation_context_id,
             prepared.identity.data_snapshot_id,
             prepared.data_as_of_ns,
-            runtime_id,
         )
         if hypothesis.identity_schema == "strategy-id-v2":
             validated_candidate_source_bars(candidate_document, paths.catalog_path)
             _require_execution_snapshot(hypothesis, paths, prepared)
-    except (OSError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         return _finish_failure(
             run,
             _TechnicalFailure(
@@ -4611,153 +4199,6 @@ def _run_strategy_loop_locked(
                 {"detail": str(error)},
             ),
         )
-    candidate_hash = candidate_id
-    _verified_artifact(candidate_path, candidate_hash)
-    research_screen_recorded = False
-    screen_decision = None
-    screen_artifact_hash: str | None = None
-    if screen_policy is not None:
-        try:
-            parsed_result = load_research_result_v2(completed.stdout)
-            if parsed_result.candidate_id != candidate_id:
-                raise StrategyLabError("research result candidate_id mismatch")
-            candidate_signals = candidate_document.get("signals")
-            if (
-                not isinstance(candidate_signals, list)
-                or parsed_result.metrics.signal_count != len(candidate_signals)
-            ):
-                raise StrategyLabError("research result signal_count mismatch")
-            screen_decision = screen_research_result(parsed_result, screen_policy)
-            screen_document = screened_result_document(
-                parsed_result,
-                screen_decision,
-                screen_policy,
-            )
-            screen_artifact_hash = _publish_json(research_path, screen_document)
-        except (StrategyCampaignError, StrategyLabError) as error:
-            return _finish_failure(
-                run,
-                _TechnicalFailure(
-                    "Research screened",
-                    "RESEARCH",
-                    "ERROR",
-                    "RESEARCH_RESULT_INVALID",
-                    "research-error.json",
-                    {"detail": str(error)},
-                ),
-            )
-        if screen_decision.outcome == "SCREEN_REJECTED":
-            ledger.record_stage(
-                StageRecord(
-                    experiment_id,
-                    "Research screened",
-                    "REJECTED",
-                    screen_decision.reason_codes[0],
-                    str(research_path),
-                    screen_artifact_hash,
-                ),
-            )
-            feedback = {
-                **_feedback_base(run),
-                "error_id": None,
-                "failed_stage": "RESEARCH",
-                "reason_codes": list(screen_decision.reason_codes),
-                "status": "SCREEN_REJECTED",
-                "verdict_id": None,
-            }
-            _publish_json(_feedback_path(run), feedback)
-            return feedback
-    signal_parity: SignalParityResult | None = None
-    if evaluation_context_id is not None:
-        try:
-            signal_parity = run_signal_parity_gate(candidate_path, paths.catalog_path)
-            parity_document = json.loads(signal_parity.canonical_bytes)
-            if (
-                not isinstance(parity_document, dict)
-                or not isinstance(candidate_signals, list)
-                or parity_document.get("candidate_signal_count") != len(candidate_signals)
-                or parity_document.get("recomputed_signal_count") != len(candidate_signals)
-            ):
-                raise StrategyLabError("signal parity counts do not match candidate")
-            parity_path = directory / "signal-parity-result.json"
-            parity_hash = _atomic_publish(parity_path, signal_parity.canonical_bytes)
-            if parity_hash != signal_parity.artifact_sha256:
-                raise StrategyLabError("signal parity artifact hash mismatch")
-            source = candidate_document.get("source")
-            if not isinstance(source, dict):
-                raise StrategyLabError("validated candidate source is invalid")
-            data_snapshot_id = source.get("data_snapshot_id")
-            if not isinstance(data_snapshot_id, str):
-                raise StrategyLabError("validated candidate data snapshot is invalid")
-            parity_record = SignalParityRecord(
-                experiment_id=experiment_id,
-                candidate_id=candidate_id,
-                evaluation_context_id=evaluation_context_id,
-                data_snapshot_id=data_snapshot_id,
-                outcome=signal_parity.outcome,
-                reason_code=signal_parity.reason_code,
-                required_action=signal_parity.required_action,
-                artifact_path=str(parity_path),
-                artifact_sha256=parity_hash,
-                decisions=signal_parity.decisions,
-            )
-            parity_result_id = ledger.record_signal_parity(parity_record)
-        except (ArithmeticError, LookupError, OSError, RuntimeError, ValueError) as error:
-            return _finish_failure(
-                run,
-                _TechnicalFailure(
-                    "Research screened",
-                    "RESEARCH",
-                    "ERROR",
-                    "SIGNAL_PARITY_GATE_FAILED",
-                    "research-error.json",
-                    {
-                        "detail": str(error),
-                        "required_action": "FIX_TECHNICAL",
-                    },
-                ),
-            )
-        if signal_parity.outcome != "PASS":
-            return _finish_failure(
-                run,
-                _TechnicalFailure(
-                    "Research screened",
-                    "RESEARCH",
-                    "ERROR",
-                    signal_parity.reason_code,
-                    "research-error.json",
-                    {
-                        "parity_artifact_path": str(parity_path),
-                        "parity_artifact_sha256": parity_hash,
-                        "parity_result_id": parity_result_id,
-                        "required_action": "FIX_TECHNICAL",
-                    },
-                ),
-            )
-    if screen_policy is not None and screen_decision is not None and screen_artifact_hash is not None:
-        ledger.record_stage(
-            StageRecord(
-                experiment_id,
-                "Research screened",
-                "PASSED",
-                "SCREEN_PASSED",
-                str(research_path),
-                screen_artifact_hash,
-            ),
-        )
-        research_screen_recorded = True
-    if not research_screen_recorded:
-        ledger.record_stage(
-            StageRecord(
-                experiment_id,
-                "Research screened",
-                "PASSED",
-                "RESEARCH_SCREEN_PASSED",
-                str(candidate_path),
-                candidate_hash,
-            ),
-        )
-
     try:
         request_bounds: dict[str, object] = {}
         if prepared.evaluation_context_id is not None and prepared.data_as_of_ns is not None:
@@ -4795,7 +4236,6 @@ def _run_strategy_loop_locked(
                 experiment_id=experiment_id,
                 code_commit=code_commit,
                 **request_bounds,
-                signal_parity=signal_parity,
             ),
         )
         if hypothesis.identity_schema == "strategy-id-v2":
@@ -4804,7 +4244,7 @@ def _run_strategy_loop_locked(
         return _finish_failure(
             run,
             _TechnicalFailure(
-                "Nautilus replayed",
+                "Nautilus evaluated",
                 "NAUTILUS",
                 "BLOCKED",
                 "NAUTILUS_EVALUATION_FAILED",
@@ -4850,14 +4290,27 @@ def _run_strategy_loop_locked(
     ledger.record_stage(
         StageRecord(
             experiment_id,
-            "Nautilus replayed",
+            "Nautilus evaluated",
             "PASSED",
-            "NAUTILUS_REPLAY_COMPLETED",
+            "NAUTILUS_EVALUATED",
             str(verdict_path),
             verdict_hash,
         ),
     )
-    ledger.record_verdict(verdict_record)
+    ledger.record_stage(
+        StageRecord(
+            experiment_id,
+            "Research screened",
+            "PASSED",
+            "SCREEN_PASSED",
+            str(candidate_path),
+            candidate_id,
+        ),
+    )
+    ledger.record_verdict(
+        verdict_record,
+        screen_policy_id=screen_policy.policy_id if screen_policy is not None else None,
+    )
     return feedback
 
 
@@ -5023,9 +4476,9 @@ def write_funnel_reports(
     stage_counts = [
         (int(proposed), int(proposed), 0),
         (int(proposed), int(contract_valid), int(proposed) - int(contract_valid)),
-        operational["PyBroker completed"],
+        operational["Candidate specified"],
         operational["Research screened"],
-        operational["Nautilus replayed"],
+        operational["Nautilus evaluated"],
         (
             len({str(row[0]) for row in robustness_rows}),
             len({str(row[0]) for row in robustness_rows if row[1] == "ADVANCE"}),

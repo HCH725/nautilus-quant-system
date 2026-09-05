@@ -1,0 +1,1 @@
+{"allow_gaps":false,"allow_revised_bars":false,"bounded_smoke_completed_bars":2,"bounded_smoke_timeout_seconds":7500,"minimum_completed_bars":24,"minimum_restart_count":1,"minimum_wall_clock_seconds":86400,"require_fee_metadata":true,"require_instrument_metadata":true,"require_mark_price_metadata":true,"require_reconciliation":true,"schema_version":"strategy-paper-policy-v1"}

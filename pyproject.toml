@@ -15,6 +15,7 @@ Documentation = "https://nautilustrader.io/docs/"
 [project.scripts]
 nautilus-data = "nautilus_quant.cli:main"
 nautilus-research = "nautilus_quant.strategy_lab:main"
+nautilus-paper = "nautilus_quant.paper_runtime:main"
 
 [build-system]
 requires = ["hatchling"]

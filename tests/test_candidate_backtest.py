@@ -1,7 +1,7 @@
 # noqa: E501  # noqa: SIZE_OK — Task C keeps its fixture and acceptance points together.
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+import nautilus_trader
 from nautilus_trader.model import (
     CryptoPerpetual,
     Currency,
@@ -26,16 +27,14 @@ from nautilus_quant.candidate_backtest import (
     CandidateBacktestRequest,
     load_candidate_backtest_verdict,
     run_candidate_backtest,
-    run_signal_parity_gate,
 )
 from nautilus_quant.funding_observation import migrate_funding_observations
 from nautilus_quant.nautilus_io import make_bar
-from nautilus_quant.pybroker_candidate import load_pybroker_candidate
+from nautilus_quant.strategy_candidate import load_strategy_candidate
 from nautilus_quant.strategy_families import (
     ClosedBar,
     KERNEL_HASH,
     KERNEL_VERSION,
-    derive_signal_id,
     evaluate_batch,
 )
 
@@ -47,6 +46,8 @@ HOUR_MS = 60 * 60 * 1_000
 HOUR_NS = HOUR_MS * 1_000_000
 USDT = Currency.from_str("USDT")
 BTC = Currency.from_str("BTC")
+PARAMETERS = {"entry_threshold": 0.0, "lookback_bars": 2}
+CLOSES = [1000, 1000, 1010, 1010, 1000, 1000, 1010, 1010, 1010, 1010]
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
@@ -112,7 +113,7 @@ class _FundingClient:
         return [
             {
                 "symbol": symbol,
-                "fundingTime": 4 * HOUR_MS,
+                "fundingTime": 5 * HOUR_MS,
                 "fundingRate": "0.01",
                 "markPrice": None if self.modeled_first else "1000",
             },
@@ -120,7 +121,7 @@ class _FundingClient:
                 "symbol": symbol,
                 "fundingTime": 12 * HOUR_MS,
                 "fundingRate": "0.01",
-                "markPrice": "1000",
+                "markPrice": "1010",
             },
         ]
 
@@ -142,14 +143,14 @@ class CandidateBacktestTests(unittest.TestCase):
                     price_type="LAST",
                     price_precision=2,
                     size_precision=3,
-                    open_="1000",
-                    high="1000",
-                    low="1000",
-                    close="1000",
+                    open_=str(close),
+                    high=str(close),
+                    low=str(close),
+                    close=str(close),
                     volume="10",
                     close_ms=hour * HOUR_MS,
                 )
-                for hour in range(1, 11)
+                for hour, close in zip(range(1, 11), CLOSES, strict=True)
             ],
         )
         self.funding_path = self._write_funding("funding", modeled_first=False)
@@ -178,77 +179,27 @@ class CandidateBacktestTests(unittest.TestCase):
             client=_FundingClient(modeled_first=modeled_first),
             funding_path=path,
             symbols=symbols,
-            start_ms=4 * HOUR_MS,
+            start_ms=5 * HOUR_MS,
             end_ms=13 * HOUR_MS,
         )
         return path
 
-    def _candidate(self) -> dict[str, JsonValue]:
-        return {
-            "bar_type": BAR_TYPE,
-            "instrument_id": INSTRUMENT_ID,
-            "runtime": {
-                "pybroker_version": "1.2.14",
-                "python_version": "3.12.13",
-                "seed": 42,
-            },
-            "schema_version": "pybroker-candidate-v1",
-            "signals": [
-                {"intent": "LONG", "score": 0.1, "ts_event_ns": 1 * HOUR_NS},
-                {"intent": "LONG", "score": 0.2, "ts_event_ns": 2 * HOUR_NS},
-                {"intent": "FLAT", "score": -0.1, "ts_event_ns": 4 * HOUR_NS},
-                {"intent": "FLAT", "score": -0.2, "ts_event_ns": 5 * HOUR_NS},
-                {"intent": "LONG", "score": 0.1, "ts_event_ns": 7 * HOUR_NS},
-            ],
-            "source": {
-                "first_ts_event_ns": 1 * HOUR_NS,
-                "last_ts_event_ns": 10 * HOUR_NS,
-                "row_count": 10,
-                "sha256": _catalog_digest(self.catalog_path),
-            },
-            "strategy": {
-                "decision_timing": "bar-close; effective no earlier than next event",
-                "name": "lookback-momentum-long-flat",
-                "parameters": {"entry_threshold": 0.0, "lookback_bars": 2},
-            },
-            "truth_status": "provisional",
-        }
-
-    def _candidate_v2(self) -> dict[str, JsonValue]:
-        parameters: dict[str, JsonValue] = {
-            "entry_threshold": 0.0,
-            "lookback_bars": 2,
-        }
-        bars = [
-            ClosedBar(
-                ts_event_ns=hour * HOUR_NS,
-                open=1000,
-                high=1000,
-                low=1000,
-                close=1000,
-                volume=10,
-            )
-            for hour in range(1, 11)
-        ]
-        decisions = evaluate_batch(
-            family_id="lookback-momentum-long-flat",
-            family_version="lookback-momentum-long-flat-v1",
-            parameters=parameters,
-            bars=bars,
-        )
+    def _candidate(
+        self,
+        *,
+        parameters: dict[str, JsonValue] | None = None,
+        evaluation_context_id: str = "e" * 64,
+    ) -> dict[str, JsonValue]:
         source_hash = _catalog_digest(self.catalog_path)
         return {
             "bar_type": BAR_TYPE,
-            "evaluation_context_id": "e" * 64,
+            "evaluation_context_id": evaluation_context_id,
             "instrument_id": INSTRUMENT_ID,
             "runtime": {
-                "environment_id": "d" * 64,
-                "pybroker_version": "1.2.14",
-                "python_version": "3.12.13",
-                "seed": 42,
+                "nautilus_trader": nautilus_trader.__version__,
+                "python_version": platform.python_version(),
             },
-            "schema_version": "pybroker-candidate-v2",
-            "signals": [asdict(item) for item in decisions],
+            "schema_version": "strategy-candidate-v1",
             "source": {
                 "data_as_of_ns": 10 * HOUR_NS,
                 "data_snapshot_id": source_hash,
@@ -263,7 +214,7 @@ class CandidateBacktestTests(unittest.TestCase):
                 "family_version": "lookback-momentum-long-flat-v1",
                 "kernel_hash": KERNEL_HASH,
                 "kernel_version": KERNEL_VERSION,
-                "parameters": parameters,
+                "parameters": dict(PARAMETERS) if parameters is None else parameters,
             },
             "truth_status": "provisional",
         }
@@ -286,10 +237,10 @@ class CandidateBacktestTests(unittest.TestCase):
             if item.is_file()
         }
 
-    def test_formal_loader_is_called_and_actual_source_identity_fails_closed(self) -> None:
+    def test_strategy_loader_is_called_and_actual_source_identity_fails_closed(self) -> None:
         with patch(
-            "nautilus_quant.candidate_backtest.load_pybroker_candidate",
-            wraps=load_pybroker_candidate,
+            "nautilus_quant.candidate_backtest.load_strategy_candidate",
+            wraps=load_strategy_candidate,
         ) as loader:
             run_candidate_backtest(self.request)
 
@@ -303,18 +254,24 @@ class CandidateBacktestTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 candidate = self._candidate()
-                candidate["source"] = {**candidate["source"], field: value}
+                source = dict(candidate["source"])
+                source[field] = value
+                if field == "sha256":
+                    source["data_snapshot_id"] = value
+                if field == "last_ts_event_ns":
+                    source["data_as_of_ns"] = value
+                candidate["source"] = source
                 self._write_candidate(candidate)
                 with self.assertRaisesRegex(RuntimeError, f"source {field} mismatch"):
                     run_candidate_backtest(self.request)
 
-    def test_real_engine_acts_on_next_event_dedupes_and_flattens_boundary(self) -> None:
+    def test_kernel_decisions_drive_next_event_dedupes_and_boundary(self) -> None:
         result = run_candidate_backtest(self.request)
 
         execution = result.verdict["execution"]
         fills = execution["fills"]
-        self.assertEqual(execution["deduped_signal_count"], 2)
-        self.assertEqual(execution["boundary_flattened"], True)
+        self.assertEqual(execution["deduped_signal_count"], 4)
+        self.assertEqual(execution["boundary_flattened"], False)
         self.assertEqual(execution["order_count"], 4)
         self.assertEqual(execution["fill_count"], 4)
         self.assertEqual(execution["trade_count"], 2)
@@ -324,22 +281,96 @@ class CandidateBacktestTests(unittest.TestCase):
                 for fill in fills
             ],
             [
-                (1 * HOUR_NS, 2 * HOUR_NS),
+                (3 * HOUR_NS, 4 * HOUR_NS),
                 (4 * HOUR_NS, 5 * HOUR_NS),
                 (7 * HOUR_NS, 8 * HOUR_NS),
-                (None, 10 * HOUR_NS),
+                (8 * HOUR_NS, 9 * HOUR_NS),
             ],
         )
         self.assertTrue(
             all(
                 fill["source_signal_ts_event_ns"] < fill["action_ts_event_ns"]
                 for fill in fills
-                if fill["source_signal_ts_event_ns"] is not None
             ),
         )
         self.assertTrue(all(fill["quantity"] == "0.001" for fill in fills))
         self.assertEqual(result.verdict["ending_position"], "FLAT")
         self.assertEqual(result.verdict["open_position_count"], 0)
+
+    def test_candidate_id_is_generic_content_identity_without_signals(self) -> None:
+        candidate = self._candidate()
+        self.assertNotIn("signals", candidate)
+        self._write_candidate(candidate)
+
+        result = run_candidate_backtest(self.request)
+
+        self.assertEqual(result.verdict["candidate_id"], sha256(self.candidate_path.read_bytes()).hexdigest())
+        self.assertNotIn("signal_parity", result.verdict)
+
+    def test_strategy_parameters_override_stresses_params_through_nautilus(self) -> None:
+        base = run_candidate_backtest(self.request).verdict
+        stressed = run_candidate_backtest(
+            replace(
+                self.request,
+                code_commit="a" * 40,
+                evaluation_start_utc="1970-01-01T00:00:00Z",
+                evaluation_end_utc="1970-01-01T10:00:00Z",
+                data_as_of_ns=10 * HOUR_NS,
+                evaluation_context_id="e" * 64,
+                strategy_parameters_override={"entry_threshold": 0.0, "lookback_bars": 3},
+            ),
+        ).verdict
+
+        self.assertEqual(stressed["candidate_id"], base["candidate_id"])
+        self.assertEqual(stressed["status"], "EVALUATED")
+        self.assertNotEqual(
+            [
+                (fill["source_signal_ts_event_ns"], fill["action_ts_event_ns"])
+                for fill in stressed["execution"]["fills"]
+            ],
+            [
+                (fill["source_signal_ts_event_ns"], fill["action_ts_event_ns"])
+                for fill in base["execution"]["fills"]
+            ],
+        )
+        self.assertEqual(
+            [
+                (fill["source_signal_ts_event_ns"], fill["action_ts_event_ns"])
+                for fill in stressed["execution"]["fills"]
+            ],
+            [
+                (3 * HOUR_NS, 4 * HOUR_NS),
+                (5 * HOUR_NS, 6 * HOUR_NS),
+                (7 * HOUR_NS, 8 * HOUR_NS),
+                (9 * HOUR_NS, 10 * HOUR_NS),
+            ],
+        )
+
+    def test_tampered_candidate_schema_fails_before_engine_construction(self) -> None:
+        candidate = self._candidate()
+        candidate["schema_version"] = "strategy-candidate-v999"
+        self._write_candidate(candidate)
+
+        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
+            with self.assertRaisesRegex(ValueError, "candidate|schema|encoding"):
+                run_candidate_backtest(self.request)
+
+        engine.assert_not_called()
+
+    def test_tampered_candidate_parameters_change_identity_and_replay(self) -> None:
+        base = run_candidate_backtest(self.request).verdict
+        candidate = self._candidate(
+            parameters={"entry_threshold": 0.0, "lookback_bars": 3},
+        )
+        self._write_candidate(candidate)
+
+        stressed = run_candidate_backtest(self.request).verdict
+
+        self.assertNotEqual(stressed["candidate_id"], base["candidate_id"])
+        self.assertNotEqual(
+            stressed["execution"]["fills"],
+            base["execution"]["fills"],
+        )
 
     def test_replay_starts_at_the_configured_historical_boundary(self) -> None:
         request = replace(
@@ -384,13 +415,15 @@ class CandidateBacktestTests(unittest.TestCase):
                 for bar in fixture["bars"]
             ],
         )
+        source_hash = _catalog_digest(catalog_path)
         candidate = self._candidate()
-        candidate["signals"] = fixture["signals"]
         candidate["source"] = {
+            "data_as_of_ns": fixture["bars"][-1]["ts_event_ns"],
+            "data_snapshot_id": source_hash,
             "first_ts_event_ns": fixture["bars"][0]["ts_event_ns"],
             "last_ts_event_ns": fixture["bars"][-1]["ts_event_ns"],
             "row_count": len(fixture["bars"]),
-            "sha256": _catalog_digest(catalog_path),
+            "sha256": source_hash,
         }
         candidate_path = self.root / "bearish-candidate.json"
         candidate_path.write_bytes(_canonical(candidate))
@@ -407,6 +440,30 @@ class CandidateBacktestTests(unittest.TestCase):
             start_ms=fixture["funding"][0]["fundingTime"],
             end_ms=fixture["funding"][-1]["fundingTime"] + 1,
         )
+        decisions = evaluate_batch(
+            family_id="lookback-momentum-long-flat",
+            family_version="lookback-momentum-long-flat-v1",
+            parameters=dict(PARAMETERS),
+            bars=[
+                ClosedBar(
+                    ts_event_ns=bar["ts_event_ns"],
+                    open=float(bar["open"]),
+                    high=float(bar["high"]),
+                    low=float(bar["low"]),
+                    close=float(bar["close"]),
+                    volume=float(bar["volume"]),
+                )
+                for bar in fixture["bars"]
+            ],
+        )
+        first_changed = next(
+            item for item in decisions if item.target_intent == "LONG"
+        )
+        expected_action_ns = next(
+            bar["ts_event_ns"]
+            for bar in fixture["bars"]
+            if bar["ts_event_ns"] > first_changed.ts_event_ns
+        )
 
         result = run_candidate_backtest(
             replace(
@@ -418,13 +475,8 @@ class CandidateBacktestTests(unittest.TestCase):
         )
 
         fills = result.verdict["execution"]["fills"]
-        first_signal_ns = fixture["signals"][0]["ts_event_ns"]
-        expected_action_ns = next(
-            bar["ts_event_ns"]
-            for bar in fixture["bars"]
-            if bar["ts_event_ns"] > first_signal_ns
-        )
-        self.assertEqual(fills[0]["source_signal_ts_event_ns"], first_signal_ns)
+        self.assertGreater(len(fills), 0)
+        self.assertEqual(fills[0]["source_signal_ts_event_ns"], first_changed.ts_event_ns)
         self.assertEqual(fills[0]["action_ts_event_ns"], expected_action_ns)
         self.assertEqual(fills[0]["fill_ts_event_ns"], expected_action_ns)
 
@@ -434,12 +486,12 @@ class CandidateBacktestTests(unittest.TestCase):
         verdict = result.verdict
         self.assertEqual(verdict["fees"]["source"], "nautilus_instrument_metadata")
         self.assertEqual(verdict["fees"]["taker_rate"], "0.001")
-        self.assertEqual(verdict["fees"]["total"], "-0.00400000")
+        self.assertEqual(verdict["fees"]["total"], "-0.00403000")
         self.assertEqual(verdict["funding"]["total"], "-0.01000000")
-        self.assertEqual(verdict["gross_trading_result"], "0.00000000")
-        self.assertEqual(verdict["net_account_delta"], "-0.01400000")
+        self.assertEqual(verdict["gross_trading_result"], "-0.01000000")
+        self.assertEqual(verdict["net_account_delta"], "-0.02403000")
         self.assertEqual(verdict["starting_balance"], "10000.00000000")
-        self.assertEqual(verdict["ending_balance"], "9999.98600000")
+        self.assertEqual(verdict["ending_balance"], "9999.97597000")
         self.assertTrue(verdict["accounting_reconciled"])
 
     def test_official_funding_marks_before_rate_settles_once_and_store_is_read_only(self) -> None:
@@ -463,7 +515,7 @@ class CandidateBacktestTests(unittest.TestCase):
                     "price_source": "binance_funding_history_mark_price",
                     "rate": "0.01",
                     "truth_status": "official",
-                    "ts_event_ns": 4 * HOUR_NS,
+                    "ts_event_ns": 5 * HOUR_NS,
                 },
             ],
         )
@@ -490,10 +542,11 @@ class CandidateBacktestTests(unittest.TestCase):
             {"missing_mark": 1, "modeled_funding": 1, "official": 0},
         )
         self.assertEqual(funding["events"][0]["price_source"], "bar_close_fallback")
-        self.assertEqual(funding["events"][0]["mark_price"], "1000.00")
+        self.assertEqual(funding["events"][0]["mark_price"], "1010.00")
         self.assertFalse(result.verdict["performance_claimable"])
 
     def test_modeled_funding_fallback_cannot_look_at_the_same_timestamp_bar(self) -> None:
+        closes = [1000, 1000, 1010, 2000, 1000, 1000, 1010, 1010, 1010, 1010]
         catalog_path = self.root / "changing-catalog"
         catalog_path.mkdir()
         catalog = ParquetDataCatalog(str(catalog_path))
@@ -506,20 +559,25 @@ class CandidateBacktestTests(unittest.TestCase):
                     price_type="LAST",
                     price_precision=2,
                     size_precision=3,
-                    open_=str(2000 if hour == 4 else 1000),
-                    high=str(2000 if hour == 4 else 1000),
-                    low=str(2000 if hour == 4 else 1000),
-                    close=str(2000 if hour == 4 else 1000),
+                    open_=str(close),
+                    high=str(close),
+                    low=str(close),
+                    close=str(close),
                     volume="10",
                     close_ms=hour * HOUR_MS,
                 )
-                for hour in range(1, 11)
+                for hour, close in zip(range(1, 11), closes, strict=True)
             ],
         )
         candidate = self._candidate()
+        source_hash = _catalog_digest(catalog_path)
         candidate["source"] = {
-            **candidate["source"],
-            "sha256": _catalog_digest(catalog_path),
+            "data_as_of_ns": 10 * HOUR_NS,
+            "data_snapshot_id": source_hash,
+            "first_ts_event_ns": HOUR_NS,
+            "last_ts_event_ns": 10 * HOUR_NS,
+            "row_count": 10,
+            "sha256": source_hash,
         }
         candidate_path = self.root / "changing-candidate.json"
         candidate_path.write_bytes(_canonical(candidate))
@@ -535,20 +593,16 @@ class CandidateBacktestTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(result.verdict["funding"]["events"][0]["mark_price"], "1000.00")
+        self.assertEqual(result.verdict["funding"]["events"][0]["mark_price"], "2000.00")
 
     def test_bounded_replay_excludes_first_bar_funding_while_flat(self) -> None:
-        candidate = self._candidate_v2()
-        self._write_candidate(candidate)
-        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
         modeled_path = self._write_funding("bounded-modeled-funding", modeled_first=True)
 
         result = run_candidate_backtest(
             replace(
                 self.request,
                 funding_path=modeled_path,
-                signal_parity=parity,
-                evaluation_start_utc="1970-01-01T04:00:00Z",
+                evaluation_start_utc="1970-01-01T06:00:00Z",
                 evaluation_end_utc="1970-01-01T10:00:00Z",
                 data_as_of_ns=10 * HOUR_NS,
                 evaluation_context_id="f" * 64,
@@ -560,95 +614,9 @@ class CandidateBacktestTests(unittest.TestCase):
         self.assertEqual(result.verdict["funding"]["total"], "0.00000000")
         self.assertEqual(
             result.verdict["evaluation_windows"]["actual_first_ts_event_ns"],
-            4 * HOUR_NS,
+            6 * HOUR_NS,
         )
-
-    def test_v2_parity_pass_recomputes_signals_before_nautilus_accounting(self) -> None:
-        candidate = self._candidate_v2()
-        self._write_candidate(candidate)
-
-        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
-        result = run_candidate_backtest(replace(self.request, signal_parity=parity))
-
-        self.assertEqual(parity.outcome, "PASS")
-        self.assertEqual(parity.reason_code, "SIGNAL_PARITY_MATCH")
-        self.assertIsNone(parity.required_action)
-        self.assertEqual(
-            [asdict(item) for item in parity.decisions],
-            candidate["signals"],
-        )
-        self.assertEqual(result.verdict["candidate_id"], parity.candidate_id)
-        self.assertEqual(
-            result.verdict["signal_parity"],
-            {
-                "artifact_sha256": parity.artifact_sha256,
-                "outcome": "PASS",
-                "reason_code": "SIGNAL_PARITY_MATCH",
-            },
-        )
-
-    def test_v2_rejects_forged_pass_decisions_before_engine_construction(self) -> None:
-        self._write_candidate(self._candidate_v2())
-        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
-        first = parity.decisions[0]
-        forged = replace(
-            parity,
-            decisions=(
-                replace(
-                    first,
-                    target_intent="FLAT" if first.target_intent == "LONG" else "LONG",
-                ),
-                *parity.decisions[1:],
-            ),
-        )
-
-        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
-            with self.assertRaisesRegex(RuntimeError, "signal parity artifact content mismatch"):
-                run_candidate_backtest(replace(self.request, signal_parity=forged))
-
-        engine.assert_not_called()
-
-    def test_v2_parity_mismatch_is_fix_technical_and_engine_never_starts(self) -> None:
-        candidate = self._candidate_v2()
-        strategy = candidate["strategy"]
-        signals = candidate["signals"]
-        self.assertIsInstance(strategy, dict)
-        self.assertIsInstance(signals, list)
-        signal = signals[0]
-        self.assertIsInstance(signal, dict)
-        signal["score"] = "0.000000000001"
-        signal["signal_id"] = derive_signal_id(
-            family_id=strategy["family_id"],
-            family_version=strategy["family_version"],
-            kernel_hash=strategy["kernel_hash"],
-            kernel_version=strategy["kernel_version"],
-            parameters=strategy["parameters"],
-            reason=signal["reason"],
-            score=signal["score"],
-            target_intent=signal["target_intent"],
-            ts_event_ns=signal["ts_event_ns"],
-        )
-        self._write_candidate(candidate)
-
-        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
-        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
-            with self.assertRaisesRegex(RuntimeError, "signal parity gate did not pass"):
-                run_candidate_backtest(replace(self.request, signal_parity=parity))
-
-        self.assertEqual(parity.outcome, "ERROR")
-        self.assertEqual(parity.reason_code, "SIGNAL_PARITY_MISMATCH")
-        self.assertEqual(parity.required_action, "FIX_TECHNICAL")
-        self.assertEqual(parity.mismatch_index, 0)
-        engine.assert_not_called()
-
-    def test_v2_without_gate_pass_fails_before_engine_construction(self) -> None:
-        self._write_candidate(self._candidate_v2())
-
-        with patch("nautilus_quant.candidate_backtest.BacktestEngine") as engine:
-            with self.assertRaisesRegex(RuntimeError, "requires a passed signal parity gate"):
-                run_candidate_backtest(self.request)
-
-        engine.assert_not_called()
+        self.assertEqual(result.verdict["execution"]["fill_count"], 2)
 
     def test_technical_engine_error_raises_instead_of_returning_revise(self) -> None:
         with patch(
@@ -676,21 +644,13 @@ class CandidateBacktestTests(unittest.TestCase):
         self.assertEqual(first.verdict_id, sha256(first.canonical_bytes).hexdigest())
         self.assertEqual(first.canonical_bytes, _canonical(first.verdict))
 
-    def test_v2_verdict_binds_research_and_root_python_separately(self) -> None:
-        candidate = self._candidate_v2()
-        self._write_candidate(candidate)
-        parity = run_signal_parity_gate(self.candidate_path, self.catalog_path)
-
-        result = run_candidate_backtest(replace(self.request, signal_parity=parity))
+    def test_verdict_binds_root_nautilus_and_python_versions(self) -> None:
+        result = run_candidate_backtest(self.request)
 
         versions = result.verdict["runtime_versions"]
-        self.assertEqual(
-            set(versions),
-            {"nautilus_trader", "nautilus_python", "pybroker", "research_python"},
-        )
-        self.assertEqual(versions["research_python"], candidate["runtime"]["python_version"])
+        self.assertEqual(set(versions), {"nautilus_trader", "nautilus_python"})
+        self.assertEqual(versions["nautilus_trader"], nautilus_trader.__version__)
         self.assertEqual(versions["nautilus_python"], platform.python_version())
-        self.assertNotEqual(versions["research_python"], versions["nautilus_python"])
 
     def test_verdict_loader_rejects_an_economically_impossible_balance_delta(self) -> None:
         result = run_candidate_backtest(replace(self.request, code_commit="a" * 40))
@@ -824,10 +784,10 @@ class CandidateBacktestTests(unittest.TestCase):
                 for fill in result.verdict["execution"]["fills"]
             ],
             [
-                (1 * HOUR_NS, 3 * HOUR_NS),
+                (3 * HOUR_NS, 5 * HOUR_NS),
                 (4 * HOUR_NS, 6 * HOUR_NS),
                 (7 * HOUR_NS, 9 * HOUR_NS),
-                (None, 10 * HOUR_NS),
+                (8 * HOUR_NS, 10 * HOUR_NS),
             ],
         )
 

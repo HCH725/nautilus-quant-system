@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.nautilus.quant.paper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>/Users/hong/.local/share/uv/python/cpython-3.13-macos-aarch64-none/bin/python3.13</string>
+    <string>-s</string>
+    <string>-P</string>
+    <string>-m</string>
+    <string>nautilus_quant.paper_runtime</string>
+    <string>--risk-policy</string>
+    <string>/Volumes/ExpansionDrive/nautilus-system/config/strategy_risk_execution_policy.json</string>
+    <string>--completed-bars</string>
+    <string>24</string>
+    <string>--timeout-seconds</string>
+    <string>90000</string>
+    <string>--output-directory</string>
+    <string>/Volumes/ExpansionDrive/nautilus-system/var/strategy-paper/smokes</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Volumes/ExpansionDrive/nautilus-system</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/hong/Library/Logs/NautilusQuant/paper.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hong/Library/Logs/NautilusQuant/paper.error.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Volumes/ExpansionDrive/nautilus-system/src:/Volumes/ExpansionDrive/nautilus-system/.venv/lib/python3.13/site-packages</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>

@@ -233,7 +233,7 @@ class ScreenPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ProvisionalMetrics:
-    """Finite PyBroker-only metrics; none are Nautilus accounting truth."""
+    """Finite research-only metrics; none are Nautilus accounting truth."""
 
     trade_count: int
     signal_count: int
@@ -244,7 +244,7 @@ class ProvisionalMetrics:
 
 @dataclass(frozen=True, slots=True)
 class ResearchResultV2:
-    """Validated provisional result emitted by the isolated research runtime."""
+    """Validated provisional result emitted by the Nautilus-native research step."""
 
     candidate_id: str
     metrics: ProvisionalMetrics

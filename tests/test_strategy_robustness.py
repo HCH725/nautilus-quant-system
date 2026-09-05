@@ -175,10 +175,6 @@ def _seed_persisted_mutation_source(
     candidate_path = run_directory / "candidate.json"
     candidate_path.write_bytes(canonical_json(candidate))
     candidate_id = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
-    pybroker_path = run_directory / "pybroker-result.json"
-    pybroker_path.write_bytes(canonical_json({"candidate_id": candidate_id}))
-    parity_path = run_directory / "signal-parity.json"
-    parity_path.write_bytes(canonical_json({"outcome": "PASS"}))
     historical_path = run_directory / "nautilus-verdict.json"
     historical_path.write_bytes(canonical_json({"status": "EVALUATED"}))
     base_identity = strategy_lab.ExperimentIdentity(
@@ -232,26 +228,13 @@ def _seed_persisted_mutation_source(
             ),
         )
         connection.execute(
-            "INSERT INTO stage_results VALUES (?, ?, 'PyBroker completed', 'PASSED', ?, ?, ?)",
+            "INSERT INTO stage_results VALUES (?, ?, 'Candidate specified', 'PASSED', ?, ?, ?)",
             (
                 historical_experiment_id,
                 source.strategy_id,
-                "PYBROKER_PROCESS_COMPLETED",
-                str(pybroker_path),
-                hashlib.sha256(pybroker_path.read_bytes()).hexdigest(),
-            ),
-        )
-        connection.execute(
-            "INSERT INTO signal_parity_results VALUES (?, ?, ?, ?, ?, 'PASS', ?, NULL, ?, ?)",
-            (
-                "9" * 64,
-                historical_experiment_id,
-                candidate_id,
-                "7" * 64,
-                "6" * 64,
-                "SIGNAL_PARITY_PASS",
-                str(parity_path),
-                hashlib.sha256(parity_path.read_bytes()).hexdigest(),
+                "CANDIDATE_SPECIFIED",
+                str(candidate_path),
+                hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
             ),
         )
         connection.execute(
@@ -312,11 +295,11 @@ def _run_persisted_mutation(
     with (
         patch("nautilus_quant.strategy_robustness.load_robustness_policy", return_value=policy),
         patch(
-            "nautilus_quant.pybroker_candidate.load_pybroker_candidate",
+            "nautilus_quant.strategy_lab.load_strategy_candidate",
             return_value=(candidate, candidate_id),
         ),
         patch(
-            "nautilus_quant.strategy_lab.load_pybroker_candidate",
+            "nautilus_quant.strategy_candidate.load_strategy_candidate",
             return_value=(candidate, candidate_id),
         ),
         patch(
@@ -329,10 +312,6 @@ def _run_persisted_mutation(
                 SimpleNamespace(ts_event=index, close=100 + index)
                 for index in range(1, 14)
             ),
-        ),
-        patch(
-            "nautilus_quant.candidate_backtest.run_signal_parity_gate",
-            return_value=object(),
         ),
         patch(
             "nautilus_quant.candidate_backtest._load_policy",
@@ -449,7 +428,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             TemporaryDirectory() as temporary,
             patch("nautilus_quant.strategy_robustness.load_robustness_policy", return_value=policy),
             patch(
-                "nautilus_quant.pybroker_candidate.load_pybroker_candidate",
+                "nautilus_quant.strategy_candidate.load_strategy_candidate",
                 return_value=(candidate, candidate_id),
             ),
             patch(
@@ -458,10 +437,6 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                     SimpleNamespace(ts_event=index, close=100 + index)
                     for index in range(1, 14)
                 ),
-            ),
-            patch(
-                "nautilus_quant.candidate_backtest.run_signal_parity_gate",
-                return_value=object(),
             ),
             patch(
                 "nautilus_quant.candidate_backtest._load_policy",
@@ -1794,12 +1769,6 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
             candidate_path = run_directory / "candidate.json"
             candidate_path.write_bytes(candidate_payload)
             candidate_id = hashlib.sha256(candidate_payload).hexdigest()
-            pybroker_path = run_directory / "pybroker-result.json"
-            pybroker_payload = canonical_json({"fixture": "pybroker"})
-            pybroker_path.write_bytes(pybroker_payload)
-            parity_path = run_directory / "signal-parity.json"
-            parity_payload = canonical_json({"fixture": "parity"})
-            parity_path.write_bytes(parity_payload)
             historical_path = run_directory / "nautilus-verdict.json"
             historical_payload = canonical_json({"fixture": "historical"})
             historical_path.write_bytes(historical_payload)
@@ -1903,26 +1872,13 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
                     ),
                 )
                 connection.execute(
-                    "INSERT INTO stage_results VALUES (?, ?, 'PyBroker completed', 'PASSED', ?, ?, ?)",
+                    "INSERT INTO stage_results VALUES (?, ?, 'Candidate specified', 'PASSED', ?, ?, ?)",
                     (
                         historical_experiment_id,
                         strategy_id,
-                        "PYBROKER_PROCESS_COMPLETED",
-                        str(pybroker_path),
-                        hashlib.sha256(pybroker_payload).hexdigest(),
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO signal_parity_results VALUES (?, ?, ?, ?, ?, 'PASS', ?, NULL, ?, ?)",
-                    (
-                        "9" * 64,
-                        historical_experiment_id,
-                        candidate_id,
-                        evaluation_context_id,
-                        data_snapshot_id,
-                        "SIGNAL_PARITY_PASS",
-                        str(parity_path),
-                        hashlib.sha256(parity_payload).hexdigest(),
+                        "CANDIDATE_SPECIFIED",
+                        str(candidate_path),
+                        hashlib.sha256(candidate_payload).hexdigest(),
                     ),
                 )
                 connection.execute(
@@ -1939,7 +1895,7 @@ class StrategyRobustnessPolicyTests(unittest.TestCase):
 
             with (
                 patch(
-                    "nautilus_quant.strategy_lab.load_pybroker_candidate",
+                    "nautilus_quant.strategy_lab.load_strategy_candidate",
                     return_value=(candidate_document, candidate_id),
                 ),
                 patch(

@@ -3,73 +3,62 @@
 [English](README.md) | **繁體中文**
 
 > [!IMPORTANT]
-> 這是建立於官方 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) runtime 之上的獨立專案，並非 NautilusTrader 官方 fork，也不隸屬於、未受贊助或背書於 Nautech Systems。完整出處與第三方授權見 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+> 本專案建立於官方 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) runtime 之上，並非 NautilusTrader 官方 fork，與 Nautech Systems 無隸屬、贊助或背書關係。完整 attribution 與第三方授權邊界見 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
-獨立、deterministic 的 Binance USD-M Futures 資料核心，使用 NautilusTrader `2.0.0rc2`。
+以 NautilusTrader `2.0.0rc2` 為核心的獨立、確定性 Binance USD-M Futures 研究、驗證與執行系統。
 
-## 從研究到驗證的工作流
+## Canonical 研究到執行流程
 
-本 repository 是更完整策略研究工作流中的下游驗證與執行層。外部 alpha 策略的探索先進入 [`alpha-strategy-research`](https://github.com/HCH725/alpha-strategy-research)：公開來源中的策略想法會被整理成可直接供 Hermes Wiki Brain 吸收、保留來源與研究邊界的標準化紀錄，再由 ChatGPT review 後直接寫入 Hermes Wiki Brain。
-
-通過 review 的知識可再由 Hermes 組合、推演成可測試假說，並進入本 repository 做正式研究與驗證：
+外部 alpha discovery 先進入 [`alpha-strategy-research`](https://github.com/HCH725/alpha-strategy-research)。Review 通過的知識可進 Hermes Wiki Brain，由 Hermes 形成可證偽策略假說與 bounded parameter campaign。從這個邊界開始，本 repository **只使用 NautilusTrader 作為回測、accounting 與 execution engine**。
 
 ```text
-外部公開來源
+外部研究 / alpha-strategy-research
         ↓
-Antigravity 研究
+ChatGPT review → Hermes Wiki Brain
         ↓
-alpha-strategy-research
-（標準化、保留來源的研究紀錄）
+Hermes hypothesis / strategy family
         ↓
-ChatGPT review
+Deterministic campaign expansion
         ↓
-Hermes Wiki Brain
+strategy-candidate-v1 specification
         ↓
-Hermes hypothesis / synthesis — Loop A (low-frequency; one thesis/family iteration → bounded meaningful branches → experiment spec)
+Nautilus historical evaluation
+(fills / fees / funding / positions / PnL / accounting)
         ↓
-PyBroker Experiment & Attrition Loop — Loop B (deterministic N provisional candidates → batch screens/attrition; no LLM per candidate)
+Nautilus robustness matrix
+(walk-forward / regimes / cost & delay stress)
         ↓
-Signal-Parity Gate (fail-closed)
+Strategy freeze
         ↓
-NautilusTrader high-fidelity historical verdict (survivors only)
+Nautilus Shadow / Paper
         ↓
-feedback / lineage / reuse — evidence-based outer feedback
+Venue qualification / Demo-Testnet（啟用時）
         ↓
-後續經 gate 進入 Paper → Binance Demo/Testnet → Live
+════════ 人類 / LIVE POLICY 邊界 ════════
+        ↓
+另行授權 Live
 ```
 
-Quant Research Pipeline — Three Layers, Two Loops, One Gate（正典模型）：
+### 研究控制模型
 
-- **Data foundation**：Nautilus canonical market-data truth（bars / Funding / D-1）。
-- **Loop A — Hermes Research Loop（low-frequency, theory/evidence-driven）**：Wiki Brain / reviewed strategy intake → falsifiable research thesis / strategy family → bounded meaningful hypothesis branches → experiment specification。外層迭代單位是**一個研究假說／策略族**，不是單一參數組合；Hermes 可產生有限個有意義分支（LLM tokens 決定 *what* to test）。
-- **Loop B — PyBroker Experiment & Attrition Loop（high-throughput, deterministic）**：experiment specification → deterministic campaign expansion → N provisional candidates → batch backtests/screens → dedupe / invalid / reject / pass 記帳 → attrition funnel。**No LLM call per candidate**；machine compute 跑大量實驗。淘汰者不進入 Nautilus。
-- **Gate — Formal signal parity / promotion gate（fail-closed）**：對 canonical data 獨立重算、要求 parity 才可晉升。
-- **Nautilus High-Fidelity Validation（authoritative, scarce）**：僅 parity-passed survivors → historical accounting（含 fills/fees/funding/PnL）→ walk-forward / regime / cost robustness → strategy freeze → Shadow/Paper → Demo/Testnet → human/live boundary。
-- **Outer feedback**：Hermes 檢視 survivor summaries、failure taxonomy 與 information gain，再 evidence-based 決定 stop / refine / open new batch；不編碼固定次數的 machine backtests。Kanban / reasoning iteration ≠ 單一 backtest run。
+- **Hermes research loop：** 一個 thesis / strategy family 才是一個 reasoning/Kanban 單位；Hermes 決定「測什麼、為什麼」。
+- **Deterministic machine loop：** 凍結後的 campaign 展開 bounded parameter combinations；不會每個 trial 呼叫一次 LLM。每個 trial 都形成 plain strategy specification，再交給 Nautilus。
+- **Nautilus historical truth：** canonical bars 與 shared deterministic family kernel 直接驅動 historical evaluator；orders、fills、fees、funding、positions 與 reconciled account result 都由 Nautilus 負責。
+- **Robustness：** survivors 進入 Nautilus-native windows、parameter neighborhood、delay/slippage stress 與 regime 檢查。Technical invalidity 與 economic rejection 永遠分開。
+- **Prospective validation：** 策略要先累積新的 Shadow/Paper evidence，再做 venue qualification；真實資金不會自動 promotion。
+- **Append-only evidence：** hypotheses、experiments、candidates、verdicts、errors、campaign membership、robustness results、runtime evidence 都採 content-addressed 或 hash-verified 管理。
 
-因此兩個 repository 的責任不同：`alpha-strategy-research` 是 public-safe 的上游策略研究與知識交接層；`nautilus-quant-system` 則是受控的策略驗證、accounting、execution research 與未來 deployment 層。策略出現在上游只代表**研究素材**，不代表已驗證，更不代表已具備交易資格。
+Canonical pipeline 沒有第二套 research backtester，也沒有 cross-engine translation/parity handoff。`strategy-candidate-v1` 只是 plain JSON 策略規格，不是另一個 engine 的回測結果。
 
-## PyBroker 策略發源地
+Canonical 文件：
 
-PyBroker 是隔離的上游策略研究前端：唯讀使用既有市場資料，實跑研究策略並輸出純資料 candidate；NautilusTrader 保持 canonical data、正式回測、fills、fees、Funding、positions、PnL 與 accounting 的唯一真值。
-
-- PyBroker 只存在於獨立 `research/` environment，不加入正式 root runtime。
-- Research 不改寫 canonical catalog／Funding、不持有 credentials 或訂單權限。
-- Candidate 是 canonical JSON，不含 framework object、cache、pickle 或可執行 payload。
-- PyBroker 結果一律是 provisional；Shadow、Paper、Binance Demo／Testnet 與 live 不在 v1 實作範圍。
-- V1 已實跑 **Two Loops + One Gate** 研究閉環（**Loop A Hermes thesis/branches low-frequency → Loop B PyBroker N-candidate deterministic attrition high-throughput，無 LLM per candidate → Gate signal-parity fail-closed → 僅 survivors 進 Nautilus historical verdict**），並將 lineage、成功與失敗寫入 append-only SQLite ledger。單一 Hermes 推理迭代對應**一個研究假說／策略族**，由 Loop B deterministic 展開為 N 個 machine experiments；Kanban iteration ≠ 單一 backtest run。
-- 長期操作模型允許 Hermes 自主新增 strategy family／公式，並要求 trading-eligible 候選通過 Paper 與 Binance Demo／Testnet；Live 仍是獨立授權。
-
-計畫、責任邊界與 contracts：
-
-- [`docs/plans/pybroker-nautilus-adoption.md`](docs/plans/pybroker-nautilus-adoption.md)
-- [`docs/plans/2026-08-14-strategy-loop-v1.md`](docs/plans/2026-08-14-strategy-loop-v1.md)
-- [`docs/architecture/hybrid-pybroker-nautilus.md`](docs/architecture/hybrid-pybroker-nautilus.md)
 - [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)
-- [`docs/contracts/pybroker-candidate-v1.md`](docs/contracts/pybroker-candidate-v1.md)
 - [`docs/contracts/strategy-loop-v1.md`](docs/contracts/strategy-loop-v1.md)
+- [`docs/contracts/strategy-candidate-v1.md`](docs/contracts/strategy-candidate-v1.md)
+- [`docs/contracts/strategy-campaign-v1.md`](docs/contracts/strategy-campaign-v1.md)
+- [`docs/contracts/strategy-evidence-envelope-v2.md`](docs/contracts/strategy-evidence-envelope-v2.md)
 
-隔離 runner 與 lock rebuild 指令見 [`research/README.md`](research/README.md)。Runtime candidates、verdicts 與 ledger state 保留在被忽略的 `var/` 下；root `nautilus-research` CLI 負責正式 Nautilus 歷史評估、feedback、reuse 與 funnel projection。
+Root `nautilus-research` CLI 負責 historical research、campaign execution、immutable evidence、robustness handoff、feedback、reuse 與 funnel projection。Runtime evidence 僅存放在 ignored `var/` 路徑，不會成為 canonical market-data input。
 
 ## 範圍
 
@@ -146,13 +135,13 @@ uv sync --dev
 
 維護者機器已安裝 `ai.nautilus.quant.data-sync` LaunchAgent；它在 `RunAtLoad` 與本機每日 `10:15` 執行正式 `config/market_data.json`，核心資料同步不需要 Hermes 存活。Launchd stdout／stderr 位於 `~/Library/Logs/NautilusQuant/`，domain run evidence 仍原子寫入 ignored `var/runs/`。
 
-本次上線已驗證 RunAtLoad、自然 `10:15` calendar slot 與立即重跑皆可完成；最新健康狀態仍以 `nautilus-data status`、launchctl exit code 與 `var/runs/` readback 為準。PyBroker 研究前端不修改或重驗此 OS 排程。
+本次上線已驗證 RunAtLoad、自然 `10:15` calendar slot 與立即重跑皆可完成；最新健康狀態仍以 `nautilus-data status`、launchctl exit code 與 `var/runs/` readback 為準。Nautilus 研究 pipeline 不修改或重驗此 OS 排程。
 
 安裝／重載、Removable Volumes 權限、failure recovery 與 evidence 檢查見 [`ops/RUNBOOK.md`](ops/RUNBOOK.md)。
 
 ## 安全邊界
 
-目前已有隔離的 **Two Loops + One Gate** 歷史策略閉環（Loop B PyBroker attrition 為 high-throughput deterministic；僅 parity-passed survivors 進 Nautilus high-fidelity accounting），但尚無 shared live Strategy、Paper／Demo execution client、API key 或真實資金路徑。資料 smoke、歷史閉環或模擬環境通過都不代表 production trading ready；長期驗證與自主權邊界見 [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)。
+目前 canonical research path 為 Nautilus-only：deterministic strategy-family specification 直接由 Nautilus 做 historical accounting，再進 robustness 與 prospective Paper evidence。Repository 已包含 shared strategy/Paper runtime 元件，但真實資金 Live 仍需獨立授權，venue execution 也必須另行通過 bounded qualification。歷史或 Paper 測試通過不代表 Live 已獲授權；詳見 [`docs/architecture/strategy-loop-operating-model.md`](docs/architecture/strategy-loop-operating-model.md)。
 
 API key、token、憑證與個人資料不得寫入 repository；應放在受保護的環境檔或作業系統 Keychain，程式只讀環境變數。Repository 以三層降低誤傳風險：敏感檔 `.gitignore`、版本化的 pre-commit／pre-push fail-closed 掃描，以及 GitHub secret scanning／push protection。Clone 後啟用本機 hooks：
 

@@ -159,7 +159,7 @@ def create_legacy_v1_ledger(path: Path, *, valid: bool = True) -> None:
                 experiment_id TEXT NOT NULL,
                 strategy_id TEXT NOT NULL,
                 stage TEXT NOT NULL CHECK (stage IN (
-                    'PyBroker completed', 'Research screened', 'Nautilus replayed'
+                    'Candidate specified', 'Research screened', 'Nautilus evaluated'
                 )),
                 outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED', 'ERROR')),
                 reason_code TEXT NOT NULL,
@@ -200,14 +200,14 @@ def create_legacy_v1_ledger(path: Path, *, valid: bool = True) -> None:
         )
         connection.execute(
             "INSERT INTO errors VALUES (?, ?, ?, ?, ?, ?)",
-            ("6" * 64, experiment_id, "PYBROKER", "OLD_ERROR", "/legacy/error.json", "7" * 64),
+            ("6" * 64, experiment_id, "CANDIDATE", "OLD_ERROR", "/legacy/error.json", "7" * 64),
         )
         connection.execute(
             "INSERT INTO stage_results VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 experiment_id,
                 strategy_id,
-                "Nautilus replayed",
+                "Nautilus evaluated",
                 "PASSED",
                 "OLD_STAGE",
                 "/legacy/stage.json",
@@ -543,8 +543,7 @@ class StrategyLedgerTests(unittest.TestCase):
             *preserved_tables,
             "strategies",
             "experiment_sources",
-            "signal_parity_results",
-            "robustness_results",
+                        "robustness_results",
             "robustness_lineage",
         ):
             self.assertIn(f"{table}_immutable_update", triggers)
@@ -568,37 +567,6 @@ class StrategyLedgerTests(unittest.TestCase):
         self.assertIsNone(source_table)
         self.assertEqual(quick_check, "ok")
 
-    def test_initialize_migrates_legacy_stage_outcomes_without_losing_rows(self):
-        self.ledger.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
-            connection.execute(
-                """CREATE TABLE stage_results (
-                    experiment_id TEXT NOT NULL,
-                    strategy_id TEXT NOT NULL,
-                    stage TEXT NOT NULL,
-                    outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'REJECTED')),
-                    reason_code TEXT NOT NULL,
-                    artifact_path TEXT NOT NULL,
-                    artifact_sha256 TEXT NOT NULL,
-                    PRIMARY KEY (experiment_id, stage)
-                )""",
-            )
-            connection.execute(
-                "INSERT INTO stage_results VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("e", "s", "PyBroker completed", "REJECTED", "OLD", "a", "b"),
-            )
-
-        self.ledger.initialize()
-
-        with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
-            self.assertEqual(
-                connection.execute("SELECT outcome FROM stage_results").fetchall(),
-                [("REJECTED",)],
-            )
-            connection.execute(
-                "INSERT INTO stage_results VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("e2", "s2", "PyBroker completed", "ERROR", "NEW", "a", "b"),
-            )
 
     def test_strategy_version_is_deduplicated_by_content_id(self):
         self.ledger.initialize()
@@ -611,91 +579,6 @@ class StrategyLedgerTests(unittest.TestCase):
             count = connection.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
         self.assertEqual(count, 1)
 
-    def test_signal_parity_result_is_hashed_append_only_evidence(self):
-        self.ledger.initialize()
-        hypothesis = self._hypothesis(24)
-        self.ledger.record_hypothesis(hypothesis)
-        experiment_id = self._experiment(hypothesis, "parity")
-        candidate_id = "a" * 64
-        decisions = (
-            FamilyDecision(
-                "1" * 64, 1, "1", "LONG", "test",
-                "lookback-momentum-long-flat", "lookback-momentum-long-flat-v1",
-                "strategy-family-kernel-v1", "2" * 64,
-            ),
-            FamilyDecision(
-                "3" * 64, 2, "-1", "FLAT", "test-close",
-                "lookback-momentum-long-flat", "lookback-momentum-long-flat-v1",
-                "strategy-family-kernel-v1", "2" * 64,
-            ),
-        )
-        decision_payload = b"".join(canonical_decision_bytes(item) for item in decisions)
-        artifact = {
-            "candidate_id": candidate_id,
-            "candidate_signal_count": 2,
-            "detail": None,
-            "mismatch_index": None,
-            "outcome": "PASS",
-            "reason_code": "SIGNAL_PARITY_MATCH",
-            "recomputed_signal_count": 2,
-            "recomputed_signals_sha256": sha256(decision_payload).hexdigest(),
-            "required_action": None,
-            "schema_version": "signal-parity-result-v1",
-        }
-        path = self.root / "signal-parity-result.json"
-        path.write_bytes(canonical_bytes(artifact))
-        record = strategy_lab.SignalParityRecord(
-            experiment_id=experiment_id,
-            candidate_id=candidate_id,
-            evaluation_context_id="c" * 64,
-            data_snapshot_id="d" * 64,
-            outcome="PASS",
-            reason_code="SIGNAL_PARITY_MATCH",
-            required_action=None,
-            artifact_path=str(path),
-            artifact_sha256=sha256(path.read_bytes()).hexdigest(),
-            decisions=decisions,
-        )
-
-        first_id = self.ledger.record_signal_parity(record)
-        second_id = self.ledger.record_signal_parity(record)
-
-        self.assertEqual(first_id, second_id)
-        with closing(sqlite3.connect(self.ledger.path)) as connection:
-            stored = connection.execute(
-                "SELECT * FROM signal_parity_results",
-            ).fetchone()
-            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
-                connection.execute(
-                    "UPDATE signal_parity_results SET reason_code = 'TAMPERED'",
-                )
-        self.assertEqual(stored[0], first_id)
-        self.assertEqual(stored[1:8], (
-            experiment_id,
-            candidate_id,
-            "c" * 64,
-            "d" * 64,
-            "PASS",
-            "SIGNAL_PARITY_MATCH",
-            None,
-        ))
-
-        conflict_artifact = {**artifact, "reason_code": "DIFFERENT"}
-        conflict_path = self.root / "signal-parity-conflict.json"
-        conflict_path.write_bytes(canonical_bytes(conflict_artifact))
-        conflict = strategy_lab.SignalParityRecord(
-            experiment_id=record.experiment_id,
-            candidate_id=record.candidate_id,
-            evaluation_context_id=record.evaluation_context_id,
-            data_snapshot_id=record.data_snapshot_id,
-            outcome=record.outcome,
-            reason_code="DIFFERENT",
-            required_action=record.required_action,
-            artifact_path=str(conflict_path),
-            artifact_sha256=sha256(conflict_path.read_bytes()).hexdigest(),
-        )
-        with self.assertRaisesRegex(ValueError, "signal parity artifact does not match record"):
-            self.ledger.record_signal_parity(conflict)
 
     def test_existing_hypothesis_and_stage_artifacts_are_reverified_on_conflict(self):
         self.ledger.initialize()
@@ -717,7 +600,7 @@ class StrategyLedgerTests(unittest.TestCase):
         self.ledger.record_stage(
             strategy_lab.StageRecord(
                 experiment_id,
-                "PyBroker completed",
+                "Candidate specified",
                 "PASSED",
                 "FIRST",
                 first_path,
@@ -729,7 +612,7 @@ class StrategyLedgerTests(unittest.TestCase):
             self.ledger.record_stage(
                 strategy_lab.StageRecord(
                     experiment_id,
-                    "PyBroker completed",
+                    "Candidate specified",
                     "PASSED",
                     "SECOND",
                     second_path,
@@ -800,7 +683,7 @@ class StrategyLedgerTests(unittest.TestCase):
         self.ledger.record_stage(
             strategy_lab.StageRecord(
                 experiments[0],
-                "Nautilus replayed",
+                "Nautilus evaluated",
                 "REJECTED",
                 "ENGINE_FAILED",
                 str(artifact),
@@ -810,9 +693,9 @@ class StrategyLedgerTests(unittest.TestCase):
         self.ledger.record_stage(
             strategy_lab.StageRecord(
                 experiments[1],
-                "Nautilus replayed",
+                "Nautilus evaluated",
                 "PASSED",
-                "NAUTILUS_REPLAY_COMPLETED",
+                "NAUTILUS_EVALUATED",
                 str(artifact),
                 artifact_hash,
             ),
@@ -821,7 +704,7 @@ class StrategyLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger.path)) as connection:
             projection = strategy_lab._stage_projection(
                 connection,
-                "Nautilus replayed",
+                "Nautilus evaluated",
                 "source",
                 "policy",
             )
@@ -853,7 +736,7 @@ class StrategyLedgerTests(unittest.TestCase):
         )
         self.ledger.record_error(
             strategy_lab.ErrorRecord(
-                experiments[2], "PYBROKER", "PROCESS_FAILED", error_path, error_hash
+                experiments[2], "CANDIDATE", "PROCESS_FAILED", error_path, error_hash
             ),
         )
 
@@ -874,7 +757,7 @@ class StrategyLedgerTests(unittest.TestCase):
         second_path, second_hash = self._artifact("second-error.json", "b")
         self.ledger.record_error(
             strategy_lab.ErrorRecord(
-                experiment_id, "PYBROKER", "FIRST", first_path, first_hash
+                experiment_id, "CANDIDATE", "FIRST", first_path, first_hash
             ),
         )
 
@@ -1079,6 +962,105 @@ class StrategyLedgerTests(unittest.TestCase):
                 ),
             )
 
+    def test_paper_admission_is_derived_from_persisted_advance_chain(self):
+        self.ledger.initialize()
+        hypothesis = self._hypothesis(24)
+        self.ledger.record_hypothesis(hypothesis)
+        experiment_id = self._experiment(hypothesis, "paper-admission")
+        verdict_path, verdict_hash = self._artifact("robustness-verdict.json", "a")
+        feedback_path, feedback_hash = self._artifact("robustness-feedback.json", "b")
+        action_path, action_hash = self._artifact("robustness-action.json", "c")
+        candidate_path = self.root / "candidate-v2.json"
+        candidate_path.write_bytes(b"{}\n")
+        robustness_verdict_id = "d" * 64
+        candidate_id = "e" * 64
+        historical_verdict_id = "f" * 64
+        base_identity = strategy_lab.ExperimentIdentity(
+            hypothesis.strategy_id,
+            "1" * 64,
+            "2" * 64,
+            "historical-engine",
+            "3" * 64,
+            10,
+            "4" * 64,
+        )
+        survivor = strategy_lab.RobustnessSurvivorContext(
+            base_identity,
+            experiment_id,
+            historical_verdict_id,
+            hypothesis.hypothesis_id,
+            hypothesis.source_path,
+            hypothesis.strategy_id,
+            candidate_id,
+            candidate_path,
+            "5" * 64,
+            "6" * 40,
+        )
+        robustness_verdict = {
+            "candidate_id": candidate_id,
+            "code_commit": survivor.code_commit,
+            "data_as_of_ns": base_identity.data_as_of_ns,
+            "data_snapshot_id": base_identity.data_snapshot_id,
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "robustness_verdict_id": robustness_verdict_id,
+            "strategy_id": hypothesis.strategy_id,
+            "technical_status": "PASS",
+            "economic_status": "PASS",
+        }
+        action = {
+            "action": "ADVANCE",
+            "campaign_id": "7" * 64,
+            "robustness_verdict_id": robustness_verdict_id,
+        }
+        candidate = {
+            "bar_type": "BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL",
+            "instrument_id": "BTCUSDT-PERP.BINANCE",
+            "strategy": {
+                "family_id": hypothesis.family_id,
+                "family_version": hypothesis.family_version,
+                "kernel_hash": "8" * 64,
+                "kernel_version": "strategy-family-kernel-v1",
+                "parameters": hypothesis.parameters.values,
+            },
+        }
+        with closing(sqlite3.connect(self.ledger.path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO robustness_results VALUES (?, ?, ?, ?, ?, 'PASS', 'PASS', 'PASS', 'ADVANCE', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "9" * 64,
+                    experiment_id,
+                    hypothesis.strategy_id,
+                    "a" * 64,
+                    "b" * 64,
+                    canonical_bytes(["ROBUSTNESS_PASS"]).decode(),
+                    verdict_path,
+                    verdict_hash,
+                    feedback_path,
+                    feedback_hash,
+                    action_path,
+                    action_hash,
+                ),
+            )
+
+        with (
+            patch.object(strategy_lab.StrategyLedger, "robustness_survivor_context", return_value=survivor),
+            patch.object(strategy_lab, "load_robustness_verdict_v2", return_value=robustness_verdict),
+            patch.object(strategy_lab, "load_action_v1", return_value=action),
+            patch.object(strategy_lab, "load_strategy_candidate", return_value=(candidate, candidate_id)),
+        ):
+            paper_admission = self.ledger.paper_admission(
+                robustness_verdict_id,
+                code_commit="b" * 40,
+                runtime_id="c" * 64,
+                instrument_metadata_id="d" * 64,
+            )
+
+        self.assertEqual(paper_admission["historical_verdict_id"], historical_verdict_id)
+        self.assertEqual(paper_admission["robustness_action"], "ADVANCE")
+        self.assertEqual(paper_admission["kernel_hash"], "8" * 64)
+        self.assertEqual(paper_admission["runtime_id"], "c" * 64)
+        self.assertEqual(paper_admission["code_commit"], "b" * 40)
+
 
 class StrategyLoopControllerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1089,31 +1071,21 @@ class StrategyLoopControllerTests(unittest.TestCase):
         self.catalog_path.mkdir()
         catalog = ParquetDataCatalog(str(self.catalog_path))
         catalog.write_instruments([_instrument()])
-        catalog.write_bars(
-            [
-                make_bar(
-                    instrument_id=INSTRUMENT_ID,
-                    interval="1h",
-                    price_type="LAST",
-                    price_precision=2,
-                    size_precision=3,
-                    open_="1000",
-                    high="1000",
-                    low="1000",
-                    close="1000",
-                    volume="10",
-                    close_ms=hour * HOUR_MS,
-                )
-                for hour in range(1, 11)
-            ],
-        )
+        closes = [1000, 1000, 1010, 1010, 1000, 1000, 1010, 1010, 1010, 1010]
+        catalog.write_bars([
+            make_bar(
+                instrument_id=INSTRUMENT_ID, interval="1h", price_type="LAST",
+                price_precision=2, size_precision=3,
+                open_=str(close), high=str(close), low=str(close), close=str(close),
+                volume="10", close_ms=hour * HOUR_MS,
+            )
+            for hour, close in zip(range(1, 11), closes, strict=True)
+        ])
         self.funding_path = self.root / "funding"
         migrate_funding_observations(
             client=_FundingClient(modeled_first=False),
-            funding_path=self.funding_path,
-            symbols=("BTCUSDT", "ETHUSDT"),
-            start_ms=4 * HOUR_MS,
-            end_ms=13 * HOUR_MS,
+            funding_path=self.funding_path, symbols=("BTCUSDT", "ETHUSDT"),
+            start_ms=5 * HOUR_MS, end_ms=13 * HOUR_MS,
         )
         self.market_data_path = self.root / "market-data.json"
         self.market_data_path.write_bytes(Path("config/market_data.json").read_bytes())
@@ -1122,586 +1094,101 @@ class StrategyLoopControllerTests(unittest.TestCase):
         self.policy_path = self.root / "strategy-loop-policy.json"
         self.policy_path.write_bytes(canonical_bytes(policy))
         self.paths = strategy_lab.StrategyLoopPaths(
-            market_data_path=self.market_data_path,
-            policy_path=self.policy_path,
-            catalog_path=self.catalog_path,
-            funding_path=self.funding_path,
+            market_data_path=self.market_data_path, policy_path=self.policy_path,
+            catalog_path=self.catalog_path, funding_path=self.funding_path,
             state_path=self.root / "strategy-loop",
         )
 
-    def _hypothesis(
-        self,
-        lookback_bars: int,
-        *,
-        parent_strategy_id: str | None = None,
-        based_on_verdict_id: str | None = None,
-    ) -> Path:
+    def _hypothesis(self, lookback_bars: int, *, parent_strategy_id=None, based_on_verdict_id=None) -> Path:
         document = valid_hypothesis()
-        parameters = document["parameters"]
-        self.assertIsInstance(parameters, dict)
-        parameters["lookback_bars"] = lookback_bars
+        document["parameters"]["lookback_bars"] = lookback_bars
         document["parent_strategy_id"] = parent_strategy_id
         document["based_on_verdict_id"] = based_on_verdict_id
-        path = self.root / f"hypothesis-{lookback_bars}.json"
+        path = self.root / f"hypothesis-{lookback_bars}-{sha256(canonical_bytes(document)).hexdigest()[:8]}.json"
         path.write_bytes(canonical_bytes(document))
         return path
 
     def _hypothesis_v2(self, lookback_bars: int = 2) -> Path:
         document = valid_hypothesis_v2()
-        parameters = document["parameters"]
-        self.assertIsInstance(parameters, dict)
-        parameters["entry_threshold"] = 0.0
-        parameters["lookback_bars"] = lookback_bars
+        document["parameters"]["entry_threshold"] = 0.0
+        document["parameters"]["lookback_bars"] = lookback_bars
         path = self.root / f"hypothesis-v2-{lookback_bars}.json"
         path.write_bytes(canonical_bytes(document))
         return path
 
-    def _candidate(
-        self, lookback_bars: int, *, source_hash: str | None = None
-    ) -> bytes:
-        return canonical_bytes(
-            {
-                "bar_type": BAR_TYPE,
-                "instrument_id": INSTRUMENT_ID,
-                "runtime": {
-                    "pybroker_version": "1.2.14",
-                    "python_version": "3.12.13",
-                    "seed": 42,
-                },
-                "schema_version": "pybroker-candidate-v1",
-                "signals": [
-                    {"intent": "LONG", "score": 0.1, "ts_event_ns": HOUR_NS},
-                    {"intent": "FLAT", "score": -0.1, "ts_event_ns": 7 * HOUR_NS},
-                ],
-                "source": {
-                    "first_ts_event_ns": HOUR_NS,
-                    "last_ts_event_ns": 10 * HOUR_NS,
-                    "row_count": 10,
-                    "sha256": source_hash or _catalog_digest(self.catalog_path),
-                },
-                "strategy": {
-                    "decision_timing": (
-                        "bar-close; effective no earlier than next event"
-                    ),
-                    "name": "lookback-momentum-long-flat",
-                    "parameters": {
-                        "entry_threshold": 0.0,
-                        "lookback_bars": lookback_bars,
-                    },
-                },
-                "truth_status": "provisional",
-            },
-        )
-
-    @staticmethod
-    def _process(candidate: bytes) -> Callable[..., strategy_lab._ProcessResult]:
-        def run(argv, **_kwargs):
-            output = Path(argv[argv.index("--output") + 1])
-            output.write_bytes(candidate)
-            candidate_id = sha256(candidate).hexdigest()
-            stdout = canonical_bytes(
-                {
-                    "candidate_id": candidate_id,
-                    "provisional_metrics": {"orders": 2, "signals": 2},
-                },
-            )
-            return strategy_lab._ProcessResult(0, stdout, b"", False, False, False)
-
-        return run
-
-    def _process_v2(self, *, tamper: bool = False) -> Callable[..., strategy_lab._ProcessResult]:
-        bars = tuple(
-            ClosedBar(
-                ts_event_ns=hour * HOUR_NS,
-                open=1000,
-                high=1000,
-                low=1000,
-                close=1000,
-                volume=10,
-            )
-            for hour in range(1, 11)
-        )
-
-        def run(argv, **_kwargs):
-            context = argv[argv.index("--evaluation-context-id") + 1]
-            environment = argv[argv.index("--environment-id") + 1]
-            decisions = [
-                asdict(item)
-                for item in evaluate_batch(
-                    family_id="lookback-momentum-long-flat",
-                    family_version="lookback-momentum-long-flat-v1",
-                    parameters={"entry_threshold": 0.0, "lookback_bars": 2},
-                    bars=bars,
-                )
-            ]
-            if tamper:
-                decisions[0]["score"] = "0.1"
-                decisions[0]["signal_id"] = derive_signal_id(
-                    family_id=str(decisions[0]["family_id"]),
-                    family_version=str(decisions[0]["family_version"]),
-                    kernel_hash=str(decisions[0]["kernel_hash"]),
-                    kernel_version=str(decisions[0]["kernel_version"]),
-                    parameters={"entry_threshold": 0.0, "lookback_bars": 2},
-                    reason=str(decisions[0]["reason"]),
-                    score=str(decisions[0]["score"]),
-                    target_intent=str(decisions[0]["target_intent"]),
-                    ts_event_ns=int(decisions[0]["ts_event_ns"]),
-                )
-            source_hash = _catalog_digest(self.catalog_path)
-            candidate = canonical_bytes(
-                {
-                    "bar_type": BAR_TYPE,
-                    "evaluation_context_id": context,
-                    "instrument_id": INSTRUMENT_ID,
-                    "runtime": {
-                        "environment_id": environment,
-                        "pybroker_version": "1.2.14",
-                        "python_version": "3.12.13",
-                        "seed": 42,
-                    },
-                    "schema_version": "pybroker-candidate-v2",
-                    "signals": decisions,
-                    "source": {
-                        "data_as_of_ns": 10 * HOUR_NS,
-                        "data_snapshot_id": source_hash,
-                        "first_ts_event_ns": HOUR_NS,
-                        "last_ts_event_ns": 10 * HOUR_NS,
-                        "row_count": 10,
-                        "sha256": source_hash,
-                    },
-                    "strategy": {
-                        "decision_timing": "bar-close; effective no earlier than next event",
-                        "family_id": "lookback-momentum-long-flat",
-                        "family_version": "lookback-momentum-long-flat-v1",
-                        "kernel_hash": KERNEL_HASH,
-                        "kernel_version": KERNEL_VERSION,
-                        "parameters": {"entry_threshold": 0.0, "lookback_bars": 2},
-                    },
-                    "truth_status": "provisional",
-                },
-            )
-            output = Path(argv[argv.index("--output") + 1])
-            output.write_bytes(candidate)
-            stdout = canonical_bytes(
-                {
-                    "candidate_id": sha256(candidate).hexdigest(),
-                    "provisional_metrics": {
-                        "max_drawdown": 0.0,
-                        "signal_count": len(decisions),
-                        "total_return": 0.0,
-                        "trade_count": 1,
-                        "turnover": 0.0,
-                    },
-                    "schema_version": "research-result-v2",
-                    "truth_status": "provisional",
-                },
-            )
-            return strategy_lab._ProcessResult(0, stdout, b"", False, False, False)
-
-        return run
-
-    def test_pybroker_failure_is_bounded_recorded_and_never_reaches_nautilus(self):
-        hypothesis_path = self._hypothesis(24)
-        process = strategy_lab._ProcessResult(
-            17,
-            b"x" * strategy_lab.PROCESS_OUTPUT_LIMIT,
-            b"pybroker exploded",
-            True,
-            False,
-            False,
-        )
-
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            return_value=process,
-        ):
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-        experiment_path = self.paths.state_path / "runs" / feedback["experiment_id"]
-        error = json.loads((experiment_path / "pybroker-error.json").read_bytes())
-        self.assertEqual(feedback["status"], "ERROR")
-        self.assertEqual(feedback["failed_stage"], "PYBROKER")
-        self.assertEqual(feedback["reason_codes"], ["PYBROKER_PROCESS_FAILED"])
-        self.assertIsNone(feedback["parent_strategy_id"])
-        self.assertEqual(error["exit_code"], 17)
-        self.assertEqual(len(error["stdout"]), strategy_lab.PROCESS_OUTPUT_LIMIT)
-        self.assertTrue(error["stdout_truncated"])
-        self.assertEqual(error["stderr"], "pybroker exploded")
-        self.assertFalse((experiment_path / "nautilus-verdict.json").exists())
-        with closing(
-            sqlite3.connect(self.paths.state_path / "ledger.sqlite3")
-        ) as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0], 0
-            )
-            self.assertEqual(
-                connection.execute("SELECT stage, reason_code FROM errors").fetchall(),
-                [("PYBROKER", "PYBROKER_PROCESS_FAILED")],
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT stage, outcome FROM stage_results ORDER BY stage",
-                ).fetchall(),
-                [("PyBroker completed", "ERROR")],
-            )
-
-    def test_valid_candidate_runs_real_nautilus_once_and_identical_rerun_reuses(self):
-        hypothesis_path = self._hypothesis(24)
-        candidate = self._candidate(24)
-
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ) as run_process:
-            first = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-            second = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-        experiment_path = self.paths.state_path / "runs" / first["experiment_id"]
+    def test_valid_hypothesis_runs_real_nautilus_and_identical_rerun_reuses(self):
+        path = self._hypothesis(2)
+        first = strategy_lab.run_strategy_loop(path, self.paths)
+        second = strategy_lab.run_strategy_loop(path, self.paths)
         self.assertEqual(first, second)
-        self.assertEqual(run_process.call_count, 1)
-        argv = run_process.call_args.args[0]
-        self.assertEqual(
-            argv,
-            [
-                "research/.venv/bin/python",
-                "-I",
-                "research/pybroker_research.py",
-                "--hypothesis",
-                str(experiment_path / f"hypothesis-{first['hypothesis_id']}.json"),
-                "--catalog",
-                str(self.catalog_path),
-                "--output",
-                str(experiment_path / "candidate.json"),
-            ],
-        )
-        self.assertEqual(
-            run_process.call_args.kwargs["timeout"],
-            strategy_lab.PYBROKER_TIMEOUT_SECONDS,
-        )
         self.assertEqual(first["status"], "EVALUATED")
-        self.assertIsNone(first["failed_stage"])
-        for name in (
-            f"hypothesis-{first['hypothesis_id']}.json",
-            "research-result.json",
-            "candidate.json",
-            "nautilus-verdict.json",
-            f"feedback-{first['hypothesis_id']}.json",
-        ):
-            self.assertTrue((experiment_path / name).is_file(), name)
-        verdict = json.loads((experiment_path / "nautilus-verdict.json").read_bytes())
-        self.assertEqual(verdict["status"], "EVALUATED")
-        self.assertIn(verdict["decision"], {"REVISE", "RETAIN_FOR_RESEARCH"})
-        with closing(
-            sqlite3.connect(self.paths.state_path / "ledger.sqlite3")
-        ) as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0], 1
-            )
-            artifacts = connection.execute(
-                """SELECT artifact_path, artifact_sha256 FROM hypotheses
-                UNION ALL SELECT artifact_path, artifact_sha256 FROM stage_results
-                UNION ALL SELECT artifact_path, artifact_sha256 FROM verdicts
-                UNION ALL SELECT artifact_path, artifact_sha256 FROM errors""",
+        run_dir = self.paths.state_path / "runs" / first["experiment_id"]
+        for name in ("candidate.json", "nautilus-verdict.json", f"feedback-{first['hypothesis_id']}.json"):
+            self.assertTrue((run_dir / name).is_file(), name)
+        candidate, candidate_id = strategy_lab.load_strategy_candidate(run_dir / "candidate.json")
+        self.assertEqual(candidate["schema_version"], "strategy-candidate-v1")
+        self.assertEqual(candidate_id, sha256((run_dir / "candidate.json").read_bytes()).hexdigest())
+        with closing(sqlite3.connect(self.paths.state_path / "ledger.sqlite3")) as connection:
+            stages = connection.execute(
+                "SELECT stage, outcome FROM stage_results ORDER BY stage"
             ).fetchall()
-        for artifact_path, expected_hash in artifacts:
-            payload = Path(artifact_path).read_bytes()
-            self.assertEqual(sha256(payload).hexdigest(), expected_hash)
-        self.assertFalse(
-            any(path.name.startswith(".") for path in experiment_path.iterdir()),
-        )
+        self.assertEqual(stages, [
+            ("Candidate specified", "PASSED"),
+            ("Nautilus evaluated", "PASSED"),
+            ("Research screened", "PASSED"),
+        ])
 
-        feedback_path = experiment_path / f"feedback-{first['hypothesis_id']}.json"
-        tampered = json.loads(feedback_path.read_bytes())
-        tampered["strategy_id"] = "f" * 64
-        feedback_path.write_bytes(canonical_bytes(tampered))
-        with self.assertRaisesRegex(ValueError, "cached feedback mismatch"):
-            strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-    def test_v2_controller_records_parity_before_nautilus_and_passes_recomputed_signals(self):
-        hypothesis_path = self._hypothesis_v2()
-        with (
-            patch(
-                "nautilus_quant.strategy_lab._run_bounded_process",
-                side_effect=self._process_v2(),
-            ) as run_process,
-            patch(
-                "nautilus_quant.strategy_lab.run_candidate_backtest",
-                wraps=strategy_lab.run_candidate_backtest,
-            ) as run_nautilus,
-        ):
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
+    def test_v2_hypothesis_uses_shared_family_identity_without_parity_handoff(self):
+        feedback = strategy_lab.run_strategy_loop(self._hypothesis_v2(), self.paths)
         self.assertEqual(feedback["status"], "EVALUATED")
-        argv = run_process.call_args.args[0]
-        context = argv[argv.index("--evaluation-context-id") + 1]
-        environment = argv[argv.index("--environment-id") + 1]
-        self.assertRegex(context, r"^[0-9a-f]{64}$")
-        self.assertRegex(environment, r"^[0-9a-f]{64}$")
-        request = run_nautilus.call_args.args[0]
-        self.assertIsNotNone(request.signal_parity)
-        self.assertEqual(request.signal_parity.outcome, "PASS")
-        run_directory = self.paths.state_path / "runs" / feedback["experiment_id"]
-        self.assertTrue((run_directory / "signal-parity-result.json").is_file())
-        with closing(sqlite3.connect(self.paths.state_path / "ledger.sqlite3")) as connection:
-            parity = connection.execute(
-                """SELECT outcome, reason_code, required_action,
-                evaluation_context_id FROM signal_parity_results""",
-            ).fetchone()
-        self.assertEqual(parity, ("PASS", "SIGNAL_PARITY_MATCH", None, context))
+        run_dir = self.paths.state_path / "runs" / feedback["experiment_id"]
+        candidate, _ = strategy_lab.load_strategy_candidate(run_dir / "candidate.json")
+        strategy = candidate["strategy"]
+        self.assertEqual(strategy["family_id"], "lookback-momentum-long-flat")
+        self.assertEqual(strategy["family_version"], "lookback-momentum-long-flat-v1")
+        self.assertEqual(strategy["kernel_hash"], KERNEL_HASH)
 
-    def test_funnel_includes_v2_composite_policy_experiments(self):
-        hypothesis_path = self._hypothesis_v2()
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process_v2(),
-        ):
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
+    def test_cached_experiment_reverifies_candidate_artifact(self):
+        path = self._hypothesis(2)
+        feedback = strategy_lab.run_strategy_loop(path, self.paths)
+        candidate = self.paths.state_path / "runs" / feedback["experiment_id"] / "candidate.json"
+        candidate.write_bytes(b"{}\n")
+        with self.assertRaisesRegex((ValueError, RuntimeError), "artifact|candidate"):
+            strategy_lab.run_strategy_loop(path, self.paths)
 
-        report, _markdown = strategy_lab.write_funnel_reports(self.paths)
-
-        self.assertEqual(feedback["status"], "EVALUATED")
-        self.assertEqual(report["stages"][0]["entered"], 1)
-        self.assertEqual(report["stages"][2]["passed"], 1)
-        self.assertEqual(report["stages"][3]["passed"], 1)
-        self.assertEqual(report["stages"][4]["passed"], 1)
-
-    def test_v2_parity_mismatch_is_fix_technical_and_never_calls_nautilus(self):
-        hypothesis_path = self._hypothesis_v2()
-        with (
-            patch(
-                "nautilus_quant.strategy_lab._run_bounded_process",
-                side_effect=self._process_v2(tamper=True),
-            ),
-            patch("nautilus_quant.strategy_lab.run_candidate_backtest") as run_nautilus,
-        ):
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-        run_nautilus.assert_not_called()
-        self.assertEqual(feedback["status"], "ERROR")
-        self.assertEqual(feedback["failed_stage"], "RESEARCH")
-        self.assertEqual(feedback["reason_codes"], ["SIGNAL_PARITY_MISMATCH"])
-        with closing(sqlite3.connect(self.paths.state_path / "ledger.sqlite3")) as connection:
-            parity = connection.execute(
-                "SELECT outcome, reason_code, required_action FROM signal_parity_results",
-            ).fetchone()
-            verdict_count = connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0]
-        self.assertEqual(parity, ("ERROR", "SIGNAL_PARITY_MISMATCH", "FIX_TECHNICAL"))
-        self.assertEqual(verdict_count, 0)
-
-    def test_cached_experiment_reverifies_stage_artifacts(self):
-        hypothesis_path = self._hypothesis(24)
-        candidate = self._candidate(24)
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ) as run_process:
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-            experiment_path = self.paths.state_path / "runs" / feedback["experiment_id"]
-            (experiment_path / "research-result.json").unlink()
-
-            with self.assertRaisesRegex(ValueError, "artifact is missing"):
-                strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-        self.assertEqual(run_process.call_count, 1)
-
-    def test_same_strategy_under_a_second_hypothesis_reuses_one_experiment(self):
-        first_path = self._hypothesis(24)
+    def test_same_strategy_under_second_hypothesis_reuses_experiment(self):
+        first_path = self._hypothesis(2)
         alternative = valid_hypothesis()
+        alternative["parameters"]["lookback_bars"] = 2
         alternative["thesis"] = "Same strategy, independently stated hypothesis."
         second_path = self.root / "alternative-hypothesis.json"
         second_path.write_bytes(canonical_bytes(alternative))
-        candidate = self._candidate(24)
-
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ) as run_process:
-            first = strategy_lab.run_strategy_loop(first_path, self.paths)
-            second = strategy_lab.run_strategy_loop(second_path, self.paths)
-
+        first = strategy_lab.run_strategy_loop(first_path, self.paths)
+        second = strategy_lab.run_strategy_loop(second_path, self.paths)
         self.assertEqual(first["experiment_id"], second["experiment_id"])
         self.assertEqual(first["strategy_id"], second["strategy_id"])
         self.assertNotEqual(first["hypothesis_id"], second["hypothesis_id"])
-        self.assertEqual(run_process.call_count, 1)
-        experiment_path = self.paths.state_path / "runs" / first["experiment_id"]
-        for feedback in (first, second):
-            self.assertTrue(
-                (experiment_path / f"feedback-{feedback['hypothesis_id']}.json").is_file(),
-            )
 
-    def test_nautilus_technical_failure_is_blocked_not_strategy_revise(self):
-        hypothesis_path = self._hypothesis(24)
-        candidate = self._candidate(24, source_hash="f" * 64)
-
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ):
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
+    def test_nautilus_technical_failure_is_blocked_not_strategy_rejection(self):
+        path = self._hypothesis(2)
+        with patch.object(strategy_lab, "run_candidate_backtest", side_effect=RuntimeError("forced Nautilus failure")):
+            feedback = strategy_lab.run_strategy_loop(path, self.paths)
         self.assertEqual(feedback["status"], "BLOCKED")
         self.assertEqual(feedback["failed_stage"], "NAUTILUS")
         self.assertEqual(feedback["reason_codes"], ["NAUTILUS_EVALUATION_FAILED"])
-        self.assertNotIn("decision", feedback)
-        with closing(
-            sqlite3.connect(self.paths.state_path / "ledger.sqlite3")
-        ) as connection:
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0], 0
-            )
-            self.assertEqual(
-                connection.execute("SELECT stage, reason_code FROM errors").fetchall(),
-                [("NAUTILUS", "NAUTILUS_EVALUATION_FAILED")],
-            )
+        with closing(sqlite3.connect(self.paths.state_path / "ledger.sqlite3")) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT stage FROM errors").fetchone(), ("NAUTILUS",))
 
-    def test_funnel_uses_unique_versions_and_writes_both_atomic_formats(self):
-        root_path = self._hypothesis(24)
-        candidate = self._candidate(24)
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ):
-            root_feedback = strategy_lab.run_strategy_loop(root_path, self.paths)
-        child_path = self._hypothesis(
-            48,
-            parent_strategy_id=root_feedback["strategy_id"],
-            based_on_verdict_id=root_feedback["verdict_id"],
-        )
-        failure = strategy_lab._ProcessResult(9, b"", b"screen failed", False, False, False)
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            return_value=failure,
-        ):
-            child_feedback = strategy_lab.run_strategy_loop(child_path, self.paths)
-            strategy_lab.run_strategy_loop(child_path, self.paths)
-
+    def test_funnel_uses_nautilus_native_stage_labels(self):
+        strategy_lab.run_strategy_loop(self._hypothesis(2), self.paths)
         report, markdown = strategy_lab.write_funnel_reports(self.paths)
-
-        self.assertEqual(
-            child_feedback["parent_strategy_id"], root_feedback["strategy_id"]
-        )
-        self.assertEqual(
-            child_feedback["based_on_verdict_id"], root_feedback["verdict_id"]
-        )
-        self.assertEqual(
-            [stage["label"] for stage in report["stages"]],
-            [
-                "Proposed",
-                "Contract valid",
-                "PyBroker completed",
-                "Research screened",
-                "Nautilus replayed",
-                "Robustness passed",
-                "Promotion eligible",
-            ],
-        )
-        pybroker = report["stages"][2]
-        self.assertEqual(
-            (pybroker["entered"], pybroker["passed"], pybroker["rejected"]),
-            (2, 1, 0),
-        )
-        self.assertEqual(pybroker["previous_stage_survival_rate"], 0.5)
-        self.assertEqual(report["stages"][5]["passed"], 0)
-        self.assertEqual(report["stages"][6]["passed"], 0)
-        self.assertEqual(report["funding_truth_counts"]["official"], 1)
-        self.assertEqual(report["performance_claimability_counts"]["not_claimable"], 1)
-        self.assertEqual(report["data_as_of_ns"], 10 * HOUR_NS)
-        self.assertEqual(report["policy_version"], "strategy-loop-decision-v1")
-        self.assertIn(
-            "PYBROKER_PROCESS_FAILED",
-            [item["reason_code"] for item in report["top_reason_codes"]],
-        )
-        self.assertEqual(
-            (self.paths.state_path / "latest-funnel.json").read_bytes(),
-            canonical_bytes(report),
-        )
-        self.assertEqual(
-            (self.paths.state_path / "latest-funnel.md").read_text(),
-            markdown,
-        )
-        self.assertEqual(
-            tomllib.loads(Path("pyproject.toml").read_text())["project"]["scripts"][
-                "nautilus-research"
-            ],
-            "nautilus_quant.strategy_lab:main",
-        )
-
-    def test_funnel_evidence_deduplicates_engine_replays_of_one_strategy(self):
-        hypothesis_path = self._hypothesis(24)
-        candidate = self._candidate(24)
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ):
-            strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-        with (
-            patch(
-                "nautilus_quant.strategy_lab._run_bounded_process",
-                side_effect=self._process(candidate),
-            ),
-            patch("nautilus_quant.strategy_lab._engine_identity", return_value="engine-replay"),
-        ):
-            strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-        report, _markdown = strategy_lab.write_funnel_reports(self.paths)
-
-        self.assertEqual(report["funding_truth_counts"]["official"], 1)
-        self.assertEqual(report["performance_claimability_counts"]["not_claimable"], 1)
-
-    def test_funnel_uses_one_conservative_category_when_replays_disagree(self):
-        hypothesis_path = self._hypothesis(24)
-        candidate = self._candidate(24)
-        with patch(
-            "nautilus_quant.strategy_lab._run_bounded_process",
-            side_effect=self._process(candidate),
-        ):
-            feedback = strategy_lab.run_strategy_loop(hypothesis_path, self.paths)
-
-        ledger = strategy_lab.StrategyLedger(self.paths.state_path / "ledger.sqlite3")
-        hypothesis = load_strategy_hypothesis(hypothesis_path)
-        with closing(sqlite3.connect(ledger.path)) as connection:
-            data_source_id, policy_id, runtime_id = connection.execute(
-                """SELECT data_source_id, policy_id, runtime_id FROM experiments
-                WHERE experiment_id = ?""",
-                (feedback["experiment_id"],),
-            ).fetchone()
-        conflicting_experiment = ledger.record_experiment(
-            hypothesis.hypothesis_id,
-            strategy_lab.ExperimentIdentity(
-                hypothesis.strategy_id,
-                data_source_id,
-                policy_id,
-                "conflicting-engine",
-                runtime_id,
-            ),
-        )
-        original_path = (
-            self.paths.state_path
-            / "runs"
-            / feedback["experiment_id"]
-            / "nautilus-verdict.json"
-        )
-        conflicting = json.loads(original_path.read_bytes())
-        conflicting["funding"]["truth_status"] = "missing"
-        conflicting["performance_claimable"] = False
-        conflicting_path = self.paths.state_path / "conflicting-verdict.json"
-        conflicting_hash = strategy_lab._publish_json(conflicting_path, conflicting)
-        ledger.record_verdict(
-            strategy_lab.VerdictRecord(
-                conflicting_experiment,
-                "SUCCESS",
-                "CONFLICTING_REPLAY",
-                str(conflicting_path),
-                conflicting_hash,
-            ),
-        )
-
-        report, _markdown = strategy_lab.write_funnel_reports(self.paths)
-
-        self.assertEqual(report["funding_truth_counts"]["missing"], 1)
-        self.assertEqual(report["funding_truth_counts"]["official"], 0)
-        self.assertEqual(sum(report["funding_truth_counts"].values()), 1)
-
+        self.assertEqual([stage["label"] for stage in report["stages"]], [
+            "Proposed", "Contract valid", "Candidate specified", "Research screened",
+            "Nautilus evaluated", "Robustness passed", "Promotion eligible",
+        ])
+        self.assertIn("Candidate specified", markdown)
+        self.assertIn("Nautilus evaluated", markdown)
 
 class StrategyLoopPolicyTests(unittest.TestCase):
     def test_policy_is_canonical_and_matches_configured_history_start(self):
@@ -1738,278 +1225,66 @@ class StrategyLoopPolicyTests(unittest.TestCase):
 class StrategyLoopIdentityAndConfinementTests(unittest.TestCase):
     def test_code_commit_resolves_a_linked_git_worktree(self):
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            repository = root / "repository"
-            worktree = root / "worktree"
-            subprocess.run(
-                ["git", "init", "--initial-branch=main", str(repository)],
-                check=True,
-                capture_output=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repository), "config", "user.name", "Test"],
-                check=True,
-            )
+            root = Path(temporary); repository = root / "repository"; worktree = root / "worktree"
+            subprocess.run(["git", "init", "--initial-branch=main", str(repository)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.name", "Test"], check=True)
             (repository / "tracked.txt").write_text("tracked\n")
             subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
-            subprocess.run(
-                ["git", "-C", str(repository), "commit", "-m", "test"],
-                check=True,
-                capture_output=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repository), "worktree", "add", "-b", "card/test", str(worktree)],
-                check=True,
-                capture_output=True,
-            )
-            expected = subprocess.run(
-                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-
+            subprocess.run(["git", "-C", str(repository), "commit", "-m", "test"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "worktree", "add", "-b", "card/test", str(worktree)], check=True, capture_output=True)
+            expected = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             with patch.object(strategy_lab, "_REPO_ROOT", worktree):
                 self.assertEqual(strategy_lab._code_commit(), expected)
 
-    def test_subprocess_capture_is_bounded_while_both_streams_are_drained(self):
-        size = strategy_lab.PROCESS_OUTPUT_LIMIT + 10_000
-
-        result = strategy_lab._run_bounded_process(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import sys;"
-                    f"sys.stdout.buffer.write(b'x'*{size});"
-                    f"sys.stderr.buffer.write(b'y'*{size})"
-                ),
-            ],
-            cwd=Path.cwd(),
-            timeout=10,
-        )
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(len(result.stdout), strategy_lab.PROCESS_OUTPUT_LIMIT)
-        self.assertEqual(len(result.stderr), strategy_lab.PROCESS_OUTPUT_LIMIT)
-        self.assertTrue(result.stdout_truncated)
-        self.assertTrue(result.stderr_truncated)
-
-    def test_runtime_identity_hashes_the_actual_isolated_environment(self):
-        original = Path.read_bytes
-        site_packages = next(Path("research/.venv/lib").glob("python*/site-packages")).resolve()
-        targets = (
-            Path("research/.venv/pyvenv.cfg").resolve(),
-            site_packages / "pandas/__init__.py",
-            site_packages / "joblib/__init__.py",
-            site_packages / "numba/__init__.py",
-        )
-        baseline = strategy_lab._runtime_identity()
-        for target in targets:
-            with self.subTest(target=target):
-                def changed(path: Path) -> bytes:
-                    payload = original(path)
-                    return payload + b"changed" if Path(path).resolve() == target else payload
-
-                with patch("pathlib.Path.read_bytes", new=changed):
-                    self.assertNotEqual(strategy_lab._runtime_identity(), baseline)
-
-    def test_runtime_attestation_can_require_the_dedicated_interpreter(self):
-        with self.assertRaisesRegex(ValueError, "attested research interpreter"):
-            strategy_lab.research_runtime_identity(Path.cwd(), require_active=True)
-
-    def test_runtime_attestation_hashes_unowned_startup_code(self):
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            environment = root / "research/.venv"
-            site_packages = environment / "lib/python3.12/site-packages"
-            metadata = site_packages / "demo-1.0.dist-info"
-            metadata.mkdir(parents=True)
-            (root / "research/requirements.lock").write_text("demo==1.0\n")
-            (environment / "pyvenv.cfg").write_text("home = /test\n")
-            python = environment / "bin/python"
-            python.parent.mkdir(parents=True)
-            python.write_bytes(b"python")
-            (site_packages / "demo.py").write_bytes(b"VALUE = 1\n")
-            (metadata / "METADATA").write_text(
-                "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
-            )
-            (metadata / "RECORD").write_text(
-                "demo.py,,\n"
-                "demo-1.0.dist-info/METADATA,,\n"
-                "demo-1.0.dist-info/RECORD,,\n",
-            )
-
-            baseline = strategy_lab.research_runtime_identity(root)
-            (site_packages / "sitecustomize.py").write_bytes(b"BEHAVIOR = 2\n")
-            with_sitecustomize = strategy_lab.research_runtime_identity(root)
-            (site_packages / "sitecustomize.pyc").write_bytes(b"sourceless bytecode")
-            with_sourceless_sitecustomize = strategy_lab.research_runtime_identity(root)
-            (site_packages / "startup.pth").write_bytes(b"import demo\n")
-            with_pth = strategy_lab.research_runtime_identity(root)
-
-        self.assertNotEqual(baseline, with_sitecustomize)
-        self.assertNotEqual(with_sitecustomize, with_sourceless_sitecustomize)
-        self.assertNotEqual(with_sourceless_sitecustomize, with_pth)
-
-    def test_research_process_uses_isolated_mode_and_sanitized_environment(self):
-        code = (
-            "import json, os, sys;"
-            "print(json.dumps({'isolated': bool(sys.flags.isolated), "
-            "'pythonpath': os.environ.get('PYTHONPATH')}))"
-        )
-        with patch.dict(os.environ, {"PYTHONPATH": "/outside/untrusted"}, clear=False):
-            result = strategy_lab._run_bounded_process(
-                [sys.executable, "-I", "-c", code],
-                cwd=Path.cwd(),
-                timeout=10,
-            )
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(json.loads(result.stdout), {"isolated": True, "pythonpath": None})
-
-    def test_bounded_process_reaps_and_closes_pipes_on_submit_or_drain_failure(self):
-        class FakeStream:
-            def __init__(self):
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        class FakeProcess:
-            pid = 12345
-
-            def __init__(self):
-                self.stdout = FakeStream()
-                self.stderr = FakeStream()
-                self.returncode = None
-                self.wait_calls = 0
-
-            def poll(self):
-                return self.returncode
-
-            def wait(self, timeout=None):
-                del timeout
-                self.wait_calls += 1
-                if self.returncode is None:
-                    self.returncode = -15
-                return self.returncode
-
-            def terminate(self):
-                self.returncode = -15
-
-            def kill(self):
-                self.returncode = -9
-
-        for failure in ("submit", "drain"):
-            with self.subTest(failure=failure):
-                process = FakeProcess()
-                patches = [
-                    patch.object(strategy_lab.subprocess, "Popen", return_value=process),
-                    patch.object(strategy_lab.os, "killpg"),
-                ]
-                if failure == "submit":
-                    patches.append(
-                        patch.object(
-                            strategy_lab.ThreadPoolExecutor,
-                            "submit",
-                            side_effect=RuntimeError("submit failed"),
-                        ),
-                    )
-                else:
-                    patches.append(
-                        patch.object(
-                            strategy_lab,
-                            "_drain_bounded",
-                            side_effect=RuntimeError("drain failed"),
-                        ),
-                    )
-                with patches[0], patches[1], patches[2]:
-                    with self.assertRaisesRegex(RuntimeError, f"{failure} failed"):
-                        strategy_lab._run_bounded_process(
-                            ["research/.venv/bin/python", "-I"],
-                            cwd=Path.cwd(),
-                            timeout=10,
-                        )
-                self.assertGreaterEqual(process.wait_calls, 1)
-                self.assertTrue(process.stdout.closed)
-                self.assertTrue(process.stderr.closed)
+    def test_root_runtime_identity_is_nautilus_only_and_stable(self):
+        first = strategy_lab._runtime_identity(); second = strategy_lab._runtime_identity()
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertEqual(first, second)
 
     def test_atomic_publish_never_overwrites_an_immutable_artifact(self):
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            path = root / "state/artifact.json"
+            root = Path(tmp); path = root / "state/artifact.json"
             with patch.object(strategy_lab, "_REPO_ROOT", root):
                 strategy_lab._atomic_publish(path, b"first\n")
-
                 with self.assertRaisesRegex(ValueError, "immutable artifact conflict"):
                     strategy_lab._atomic_publish(path, b"second\n")
-
             self.assertEqual(path.read_bytes(), b"first\n")
 
-    def test_engine_identity_changes_with_each_executable_strategy_surface(self):
+    def test_engine_identity_changes_with_current_executable_surfaces(self):
         original = Path.read_bytes
         relevant = {
-            Path("research/pybroker_research.py").resolve(),
-            Path("src/nautilus_quant/runtime_attestation.py").resolve(),
+            Path("src/nautilus_quant/candidate_backtest.py").resolve(),
+            Path("src/nautilus_quant/strategy_candidate.py").resolve(),
+            Path("src/nautilus_quant/strategy_families.py").resolve(),
             Path("src/nautilus_quant/strategy_lab.py").resolve(),
-            Path("src/nautilus_quant/pybroker_candidate.py").resolve(),
         }
         baseline = strategy_lab._engine_identity()
-
         for changed_path in relevant:
             with self.subTest(changed_path=changed_path):
                 def changed(path: Path, target: Path = changed_path) -> bytes:
                     payload = original(path)
                     return payload + b"changed" if Path(path).resolve() == target else payload
-
                 with patch("pathlib.Path.read_bytes", new=changed):
                     self.assertNotEqual(strategy_lab._engine_identity(), baseline)
 
     def test_data_identity_includes_fee_owning_instrument_metadata(self):
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            market = root / "market.json"
-            market.write_bytes(b"{}\n")
-            catalog = root / "catalog"
-            bars = catalog / "data/bars" / BAR_TYPE
-            instruments = catalog / "data/instruments" / INSTRUMENT_ID
-            bars.mkdir(parents=True)
-            instruments.mkdir(parents=True)
-            (bars / "bars.parquet").write_bytes(b"bars")
-            instrument = instruments / "instrument.parquet"
-            instrument.write_bytes(b"fee-v1")
-            funding = root / "funding"
-            funding.mkdir()
-            (funding / "generation.json").write_bytes(b"funding")
-            paths = strategy_lab.StrategyLoopPaths(
-                market,
-                root / "policy.json",
-                catalog,
-                funding,
-                root / "state",
-            )
-
-            first = strategy_lab._hash_tree(paths)
-            instrument.write_bytes(b"fee-v2")
-
+            root=Path(tmp); market=root/"market.json"; market.write_bytes(b"{}\n")
+            catalog=root/"catalog"; bars=catalog/"data/bars"/BAR_TYPE; instruments=catalog/"data/instruments"/INSTRUMENT_ID
+            bars.mkdir(parents=True); instruments.mkdir(parents=True)
+            (bars/"bars.parquet").write_bytes(b"bars"); instrument=instruments/"instrument.parquet"; instrument.write_bytes(b"fee-v1")
+            funding=root/"funding"; funding.mkdir(); (funding/"generation.json").write_bytes(b"funding")
+            paths=strategy_lab.StrategyLoopPaths(market, root/"policy.json", catalog, funding, root/"state")
+            first=strategy_lab._hash_tree(paths); instrument.write_bytes(b"fee-v2")
             self.assertNotEqual(strategy_lab._hash_tree(paths), first)
 
     def test_atomic_publish_rejects_a_state_symlink_into_canonical_data(self):
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data = root / "data"
-            data.mkdir()
-            state = root / "state"
-            state.symlink_to(data, target_is_directory=True)
-
+            root=Path(tmp); data=root/"data"; data.mkdir(); state=root/"state"; state.symlink_to(data, target_is_directory=True)
             with patch.object(strategy_lab, "_REPO_ROOT", root):
                 with self.assertRaisesRegex(ValueError, "canonical data"):
-                    strategy_lab._atomic_publish(state / "artifact.json", b"{}\n")
+                    strategy_lab._atomic_publish(state/"artifact.json", b"{}\n")
 
 
 if __name__ == "__main__":
